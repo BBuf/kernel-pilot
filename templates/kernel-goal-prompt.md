@@ -31,10 +31,43 @@ blocker is proven. Requirements:
 4. Use references only to form hypotheses and validation methods. Do not copy
    external kernel code. Approved reference repositories include:
    - https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/main/skills/gpu-kernel-ako4all/references
+   - https://github.com/NVIDIA/cutlass
+   - https://github.com/NVIDIA/cuda-samples
+   - https://github.com/NVIDIA/cccl
+   - https://github.com/NVIDIA/CUDALibrarySamples
+   - https://github.com/NVIDIA/cudnn-frontend
+   - https://github.com/NVIDIA/nvbench
+   - https://github.com/NVIDIA/cuda-tile
+   - https://github.com/triton-lang/triton
+   - https://github.com/tile-ai/tilelang
+   - https://github.com/gpu-mode/reference-kernels
+   - https://github.com/gpu-mode/kernelbot
+   - https://github.com/gpu-mode/Triton-Puzzles
+   - https://github.com/HazyResearch/ThunderKittens
+   - https://github.com/leimao/CUDA-GEMM-Optimization
+   - https://github.com/ColfaxResearch/cutlass-kernels
+   - https://github.com/moderngpu/moderngpu
+   - https://github.com/huggingface/kernels
    - https://github.com/flashinfer-ai/flashinfer
    - https://github.com/Dao-AILab/flash-attention
    - https://github.com/Tencent/hpc-ops
    - https://github.com/deepseek-ai/DeepGEMM
+   Approved official docs and expert blogs include:
+   - https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+   - https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/
+   - https://docs.nvidia.com/cuda/parallel-thread-execution/
+   - https://docs.nvidia.com/cuda/cuda-binary-utilities/
+   - https://docs.nvidia.com/nsight-compute/ProfilingGuide/
+   - https://docs.nvidia.com/cutlass/
+   - https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
+   - https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html
+   - https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
+   - https://developer.nvidia.com/blog/tag/cuda/
+   - https://developer.nvidia.com/blog/tag/cutlass/
+   - https://research.colfax-intl.com/
+   - https://siboehm.com/articles/22/CUDA-MMM
+   - https://leimao.github.io/blog/CUDA-Programming/
+   - https://yang-yifan.github.io/blogs/reg_tile/reg_tile.html
    The target project is used for wrappers, tests, and benchmarks. Do not use
    existing target kernels as external reference implementations.
 5. If a direction fails, record the reason, data, and next decision in lineage

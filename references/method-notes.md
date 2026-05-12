@@ -56,12 +56,16 @@ For GPU-kernel work, the knowledge base should include:
 - architecture-specific material for the target GPU;
 - CUDA, Triton, CUTLASS, or CuTe references matching the implementation lane;
 - high-quality external kernel repositories selected as references only;
+- official CUDA, PTX, CUTLASS, and profiler documentation;
+- human-expert optimization blogs and competition kernels;
 - task-specific tests, benchmark shapes, and forbidden source files.
 
 The current KernelPilot catalog links to the gpu-kernel-ako4all references,
-FlashInfer, FlashAttention, Tencent hpc-ops, and DeepGEMM. The target project
-remains available for integration and validation, but not as a reference
-repository.
+NVIDIA CUTLASS/CuTe/CuTe DSL, CUDA samples, CCCL/CUB, cuDNN frontend, GPU MODE
+competition kernels, ThunderKittens, TileLang, Triton, FlashInfer,
+FlashAttention, Tencent hpc-ops, DeepGEMM, official NVIDIA docs, architecture
+tuning guides, and selected expert blogs. The target project remains available
+for integration and validation, but not as a reference repository.
 
 ## Evidence Style
 

@@ -117,13 +117,42 @@ Print the relevant reference map before editing:
 python -m kernelpilot.cli refs --lane "CUDA C++ JIT"
 ```
 
-The current catalog uses repository links only:
+The current catalog includes repository links and URL-based docs/blogs:
 
 - [BBuf/AI-Infra-Auto-Driven-SKILLS gpu-kernel-ako4all references](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/main/skills/gpu-kernel-ako4all/references)
+- [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
+- [NVIDIA/cuda-samples](https://github.com/NVIDIA/cuda-samples)
+- [NVIDIA/cccl](https://github.com/NVIDIA/cccl)
+- [NVIDIA/CUDALibrarySamples](https://github.com/NVIDIA/CUDALibrarySamples)
+- [NVIDIA/cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend)
+- [NVIDIA/nvbench](https://github.com/NVIDIA/nvbench)
+- [NVIDIA/cuda-tile](https://github.com/NVIDIA/cuda-tile)
+- [triton-lang/triton](https://github.com/triton-lang/triton)
+- [tile-ai/tilelang](https://github.com/tile-ai/tilelang)
+- [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-kernels)
+- [gpu-mode/kernelbot](https://github.com/gpu-mode/kernelbot)
+- [gpu-mode/Triton-Puzzles](https://github.com/gpu-mode/Triton-Puzzles)
+- [HazyResearch/ThunderKittens](https://github.com/HazyResearch/ThunderKittens)
+- [leimao/CUDA-GEMM-Optimization](https://github.com/leimao/CUDA-GEMM-Optimization)
+- [ColfaxResearch/cutlass-kernels](https://github.com/ColfaxResearch/cutlass-kernels)
+- [moderngpu/moderngpu](https://github.com/moderngpu/moderngpu)
+- [huggingface/kernels](https://github.com/huggingface/kernels)
 - [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
 - [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [Tencent/hpc-ops](https://github.com/Tencent/hpc-ops)
 - [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+- [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)
+- [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+- [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/)
+- [Blackwell Tuning Guide](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html)
+- [Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)
+- [Ampere Tuning Guide](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html)
+- [NVIDIA Developer Blog CUDA articles](https://developer.nvidia.com/blog/tag/cuda/)
+- [Colfax Research](https://research.colfax-intl.com/)
+- [Simon Boehm CUDA Matmul](https://siboehm.com/articles/22/CUDA-MMM)
+- [Lei Mao CUDA Programming](https://leimao.github.io/blog/CUDA-Programming/)
+- [Yifan Yang CUDA Matmul](https://yang-yifan.github.io/blogs/reg_tile/reg_tile.html)
 
 The target project is supplied per task or prompt. It is not part of the
 reference repository catalog.

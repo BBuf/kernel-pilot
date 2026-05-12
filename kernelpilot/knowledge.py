@@ -17,7 +17,12 @@ def load_catalog(path: str | Path | None = None) -> dict[str, Any]:
 def relevant_sources(catalog: dict[str, Any], *, lane: str | None = None) -> list[dict[str, Any]]:
     lane_lower = (lane or "").lower()
     rows: list[dict[str, Any]] = []
-    for source in catalog.get("reference_repositories", []):
+    sources = (
+        catalog.get("reference_repositories", [])
+        + catalog.get("official_documents", [])
+        + catalog.get("expert_blogs", [])
+    )
+    for source in sources:
         if not lane_lower:
             rows.append(source)
             continue
@@ -26,6 +31,7 @@ def relevant_sources(catalog: dict[str, Any], *, lane: str | None = None) -> lis
                 source.get("name", ""),
                 " ".join(source.get("read_when", [])),
                 " ".join(source.get("kernel_paths", [])),
+                " ".join(source.get("topics", [])),
             ]
         ).lower()
         if any(token in haystack for token in lane_lower.replace("+", " ").split()):
@@ -39,7 +45,7 @@ def render_catalog_for_prompt(catalog: dict[str, Any], *, lane: str | None = Non
         name = source.get("name") or source.get("repo")
         location = source.get("url") or source.get("repo")
         lines.append(f"- {name}: {location}")
-        paths = source.get("must_read_first") or source.get("kernel_paths") or []
+        paths = source.get("kernel_paths") or source.get("topics") or []
         for path in paths[:8]:
             lines.append(f"  - {path}")
     rejected = catalog.get("unconfirmed_or_rejected_aliases", [])

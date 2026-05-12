@@ -162,6 +162,14 @@ def test_kernel_source_catalog_lists_confirmed_and_rejected_sources() -> None:
     rendered = render_catalog_for_prompt(catalog, lane="CUDA C++ JIT")
     assert "FlashInfer" in rendered
     assert "FlashAttention" in rendered
+    assert "CUTLASS and CuTe DSL" in rendered
+    assert "GPU MODE reference kernels" in rendered
+    assert "ThunderKittens" in rendered
+    assert "cuDNN Frontend" in rendered
+    assert "CUDA C++ Programming Guide" in rendered
+    assert "Nsight Compute Profiling Guide" in rendered
+    assert "Blackwell Tuning Guide" in rendered
+    assert "Simon Boehm" in rendered
     assert "hi-ops / HPC Ops" in rendered
     assert "DeepGEMM" in rendered
     assert "https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS" in rendered
