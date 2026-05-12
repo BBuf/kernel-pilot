@@ -17,9 +17,7 @@ def load_catalog(path: str | Path | None = None) -> dict[str, Any]:
 def relevant_sources(catalog: dict[str, Any], *, lane: str | None = None) -> list[dict[str, Any]]:
     lane_lower = (lane or "").lower()
     rows: list[dict[str, Any]] = []
-    for source in catalog.get("local_references", []):
-        rows.append(source)
-    for source in catalog.get("external_repositories", []):
+    for source in catalog.get("reference_repositories", []):
         if not lane_lower:
             rows.append(source)
             continue
@@ -39,7 +37,7 @@ def render_catalog_for_prompt(catalog: dict[str, Any], *, lane: str | None = Non
     lines: list[str] = []
     for source in relevant_sources(catalog, lane=lane):
         name = source.get("name") or source.get("repo")
-        location = source.get("path") or source.get("url")
+        location = source.get("url") or source.get("repo")
         lines.append(f"- {name}: {location}")
         paths = source.get("must_read_first") or source.get("kernel_paths") or []
         for path in paths[:8]:

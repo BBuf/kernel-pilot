@@ -13,7 +13,7 @@ kernel.
 - Operator: <kernel operator name or entry point, for example rmsnorm_hf / timestep_embedding / group_norm_silu>
 - Target speedup: <for example 1.10x; every configured case must be no slower than baseline and geomean speedup must reach this target>
 - Target hardware: <optional; leave unset to let the agent use the available GPU validation environment>
-- Target repository: <optional target kernel project worktree or branch; leave unset to let the agent create or use an isolated clean worktree>
+- Target repository: <optional GitHub repository URL, worktree, or branch; leave unset to let the agent create or use an isolated clean worktree>
 - Runtime environment: <optional; user-managed shell, SSH host, CI runner, or other execution environment>
 - KernelPilot root: <path to the KernelPilot directory in the current workspace, or leave unset if already running from it>
 
@@ -29,12 +29,12 @@ blocker is proven. Requirements:
 3. Follow the KernelPilot single-lineage loop: one hypothesis at a time, a
    from-scratch candidate, correctness first, then a full benchmark.
 4. Use references only to form hypotheses and validation methods. Do not copy
-   external kernel code. Approved references include:
-   - local GPU-kernel reference docs configured by the user;
-   - FlashInfer;
-   - FlashAttention;
-   - Tencent/hpc-ops;
-   - DeepGEMM.
+   external kernel code. Approved reference repositories include:
+   - https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/main/skills/gpu-kernel-ako4all/references
+   - https://github.com/flashinfer-ai/flashinfer
+   - https://github.com/Dao-AILab/flash-attention
+   - https://github.com/Tencent/hpc-ops
+   - https://github.com/deepseek-ai/DeepGEMM
    The target project is used for wrappers, tests, and benchmarks. Do not use
    existing target kernels as external reference implementations.
 5. If a direction fails, record the reason, data, and next decision in lineage

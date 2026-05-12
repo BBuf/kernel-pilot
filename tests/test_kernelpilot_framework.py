@@ -164,4 +164,5 @@ def test_kernel_source_catalog_lists_confirmed_and_rejected_sources() -> None:
     assert "FlashAttention" in rendered
     assert "hi-ops / HPC Ops" in rendered
     assert "DeepGEMM" in rendered
-    assert "target kernel project worktree" in rendered
+    assert "https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS" in rendered
+    assert "target kernel project worktree" not in rendered

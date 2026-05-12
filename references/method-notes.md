@@ -51,15 +51,17 @@ operator until the requested speedup and no-regression gate are both proven.
 
 For GPU-kernel work, the knowledge base should include:
 
-- local `gpu-kernel-ako4all/references`;
+- repository links for GPU-kernel workflow, architecture, profiling, and
+  implementation references;
 - architecture-specific material for the target GPU;
 - CUDA, Triton, CUTLASS, or CuTe references matching the implementation lane;
 - high-quality external kernel repositories selected as references only;
 - task-specific tests, benchmark shapes, and forbidden source files.
 
-The current KernelPilot catalog includes FlashInfer, FlashAttention,
-Tencent hpc-ops, and DeepGEMM. The target project remains available for
-integration and validation, but not as an external kernel reference.
+The current KernelPilot catalog links to the gpu-kernel-ako4all references,
+FlashInfer, FlashAttention, Tencent hpc-ops, and DeepGEMM. The target project
+remains available for integration and validation, but not as a reference
+repository.
 
 ## Evidence Style
 
