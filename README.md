@@ -1,68 +1,51 @@
 # KernelPilot Knowledge Pack
 
-This repo is the GPU-kernel knowledge pack used by the
-[BBuf/humanize](https://github.com/BBuf/humanize) Codex fork.
+This repo is a GPU-kernel knowledge pack. It is no longer a Humanize fork and it
+does not provide `humanize-kernel-rlcr`.
 
-The active workflow now lives in Humanize as one Codex skill:
-`humanize-kernel-rlcr`. It is a thin wrapper around the original Humanize RLCR
-loop: it drafts/refines a plan, starts RLCR with KernelPilot mode, and injects
-KernelPilot knowledge lookup, Nsight Compute profile guidance, and plateau
-research rules. KernelPilot work has one hard implementation constraint:
-candidate kernels must be naive, hand-written CUDA C++ in `.cu` / `.cuh`.
-Triton, CuTe DSL, CUTLASS, ThunderKittens, torch.compile, library dispatch, and
-framework DSLs may be used as references or baselines, but not as candidate
-implementations.
+Use the original [PolyArch/humanize](https://github.com/PolyArch/humanize)
+Codex skills for RLCR. Use this repo only as reference material for kernel
+optimization: code-first knowledge, source catalogs, and Nsight Compute profile
+guidance.
 
-This repo remains useful as the source of:
+Hard rule for KernelPilot-style work: candidate kernels must be naive,
+hand-written CUDA C++ in `.cu` / `.cuh`. Triton, CuTe DSL, CUTLASS,
+ThunderKittens, torch.compile, library dispatch, and framework DSLs may be used
+as references or baselines, but not as candidate implementations.
 
-- `knowledge/`: code-first GPU kernel references by topic and framework.
-- `references/`: kernel source catalog for kernels, benchmarks, docs, and
-  tuning notes.
+## Install Humanize
 
-You do not need to install separate KernelPilot skills for the normal flow; the
-Humanize fork bundles the knowledge and profile guidance into
-`humanize-kernel-rlcr`.
-
-## Install
-
-Install the Humanize fork for Codex:
+Install upstream Humanize for Codex:
 
 ```bash
 tmp_dir="$(mktemp -d)"
-git clone --depth 1 https://github.com/BBuf/humanize.git "$tmp_dir/humanize"
+git clone --branch dev --depth 1 https://github.com/PolyArch/humanize.git "$tmp_dir/humanize"
 "$tmp_dir/humanize/scripts/install-skills-codex.sh"
 ```
 
 Restart Codex after installation.
 
-The installer adds:
-
-- `humanize-kernel-rlcr`
-- Humanize runtime files and Stop hook
-- bundled KernelPilot knowledge and Nsight profile references
-
 If Codex shows `hook needs review`, open **`/hooks`** and approve the Humanize
 Stop hook. Use **`/permissions`** to switch to Full Access, then continue after
 Codex shows **`Permissions updated to Full Access`**.
 
-## Use In Codex
+## Optional Knowledge Skills
 
-Open Codex in the framework repo or workspace that contains the source kernel,
-not in this knowledge-pack repo. The skill creates a clean standalone
-optimization repo automatically.
+To expose this knowledge pack as separate Codex skills:
 
-In `/skills`, select only:
-
-```text
-humanize-kernel-rlcr
+```bash
+./scripts/install-codex-skills.sh
 ```
 
-Then paste a short task prompt.
+That installs:
+
+- `kernel-knowledge`
+- `profile-evidence`
 
 ## Prompt Card
 
 ```text
-[$humanize-kernel-rlcr] I want to optimize SGLang's H100 int8_scaled_mm kernel. Use the existing CUTLASS SM90 implementation only as baseline/prior art.
+I want to optimize SGLang's H100 int8_scaled_mm kernel. Use Humanize RLCR. Use this KernelPilot knowledge pack as reference material only, and implement candidate kernels only as naive hand-written CUDA C++.
 ```
 
 ## Monitor
