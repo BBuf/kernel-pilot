@@ -12,11 +12,27 @@ as references or baselines, but not as candidate implementations.
 
 ## Install
 
+Fresh install:
+
 ```bash
+git clone https://github.com/BBuf/kernel-pilot.git
+cd kernel-pilot
 ./scripts/install-codex-skills.sh
 ```
 
-Restart Codex after installation.
+Update an existing checkout:
+
+```bash
+git pull --ff-only
+./scripts/install-codex-skills.sh
+```
+
+Restart Codex after installation, then open `/skills` and check that these
+skills are visible:
+
+- `humanize-kernel-agent-loop`
+- `kernel-knowledge`
+- `profile-evidence`
 
 If Codex shows `hook needs review`, open **`/hooks`** and approve the Humanize
 Stop hook. Use **`/permissions`** to switch to Full Access, then continue after
