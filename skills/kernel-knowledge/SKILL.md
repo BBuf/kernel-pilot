@@ -1,6 +1,6 @@
 ---
 name: kernel-knowledge
-description: Use when optimizing GPU kernels with Humanize or Codex and the agent should consult the local kernel knowledge pack before planning, choosing optimization directions, or doing plateau research. Covers code-first framework/topic lookup, source provenance, and native CUDA candidate rules.
+description: Use when optimizing GPU kernels with Humanize or Codex and the agent should consult the local kernel knowledge pack before planning, choosing optimization directions, or doing plateau research. Covers code-first framework/topic lookup, source provenance, and hard naive CUDA candidate rules.
 ---
 
 # Kernel Knowledge
@@ -42,9 +42,12 @@ Before writing a plan or choosing a kernel edit:
 
 - Prefer code, tests, benchmarks, and open PRs/issues before blogs or articles.
 - Treat external kernels as prior art. Do not copy tuned kernel bodies.
-- Unless the user asks otherwise, candidate kernels should be native CUDA C++
-  (`.cu` / `.cuh`), even when the baseline is Python, Triton, CuTe DSL, CUTLASS,
-  or framework-specific code.
+- Candidate kernels must be naive, hand-written CUDA C++ kernels in `.cu` /
+  `.cuh`, even when the baseline is Python, Triton, CuTe DSL, CUTLASS, or
+  framework-specific code.
+- Do not use Triton, CuTe DSL, CUTLASS, ThunderKittens, torch.compile, library
+  dispatch, or framework DSLs as candidate implementations. They may only be
+  used as prior art, baseline behavior, or benchmark references.
 - When optimizing a kernel from a framework repo, keep that repo read-only unless
   the user explicitly asks for an in-place patch.
 - For standalone optimization work, create a fresh git repo with its own torch

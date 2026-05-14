@@ -6,7 +6,11 @@ This repo is the GPU-kernel knowledge pack used by the
 The active workflow now lives in Humanize as one Codex skill:
 `humanize-kernel-rlcr`. It combines plan generation, plan refinement, RLCR
 startup, KernelPilot knowledge lookup, Nsight Compute profile guidance, and
-plateau research rules.
+plateau research rules. KernelPilot work has one hard implementation constraint:
+candidate kernels must be naive, hand-written CUDA C++ in `.cu` / `.cuh`.
+Triton, CuTe DSL, CUTLASS, ThunderKittens, torch.compile, library dispatch, and
+framework DSLs may be used as references or baselines, but not as candidate
+implementations.
 
 This repo remains useful as the source of:
 
