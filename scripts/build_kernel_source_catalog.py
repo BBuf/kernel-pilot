@@ -82,7 +82,7 @@ def main() -> int:
     parser.add_argument(
         "--clone-root",
         type=Path,
-        default=Path(".kernelpilot/kernel_refs"),
+        default=Path(".kernel-knowledge/kernel_refs"),
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

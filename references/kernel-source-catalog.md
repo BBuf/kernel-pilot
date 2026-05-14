@@ -1,8 +1,8 @@
 # Kernel Source Catalog
 
-This is the KernelPilot knowledge base `K` for GPU-kernel work. It tells the
-agent which repository links to inspect before proposing an iteration, and
-which sources are references rather than candidate-code inputs.
+This catalog lists repositories and documentation worth reading before proposing
+GPU-kernel optimization ideas. Use it as reference material for Humanize-driven
+kernel loops.
 
 The machine-readable version is `kernel-source-catalog.json`.
 
@@ -53,15 +53,13 @@ The machine-readable version is `kernel-source-catalog.json`.
 | Lei Mao CUDA Programming | https://leimao.github.io/blog/CUDA-Programming/ | CUDA GEMM, bank conflicts, reductions, transpose, benchmarking |
 | Yifan Yang CUDA Matmul | https://yang-yifan.github.io/blogs/reg_tile/reg_tile.html | register tiling, roofline reasoning, matmul bottlenecks |
 
-The target project is intentionally not listed as a reference repository. The
-user supplies it per task or prompt, and the agent may use it for integration,
-tests, benchmarks, and correctness oracles after a candidate exists.
-
 ## Usage Rules
 
-1. Read references to identify hypotheses, contracts, and measurement style.
+1. Read code first: production kernel paths, tests, benchmarks, and open
+   PRs/issues have priority over official docs, expert blogs, and articles.
 2. Do not copy external kernel code into a candidate.
-3. For target-project task files, `forbidden_files` cannot seed a from-scratch
-   candidate. They may be read later for integration or old-vs-new comparison.
-4. Every source-derived idea must be logged in lineage notes with the repository
-   link, source path, and exact hypothesis being tested.
+3. Target-project code is used for APIs, tests, benchmark contracts,
+   integration, and old-vs-new comparison.
+4. Every source-derived idea must be logged with repository link, source path,
+   exact hypothesis, and measured result. During plateau-driven research passes,
+   also record a do-not-reread key.
