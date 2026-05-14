@@ -29,15 +29,15 @@ If Codex shows `hook needs review`, open **`/hooks`** and approve the Humanize
 Stop hook. Use **`/permissions`** to switch to Full Access, then continue after
 Codex shows **`Permissions updated to Full Access`**.
 
-## Optional Knowledge Skills
+## Install KernelPilot Skills
 
-To expose this knowledge pack as separate Codex skills:
+Install the KernelPilot knowledge skills for Codex:
 
 ```bash
 ./scripts/install-codex-skills.sh
 ```
 
-That installs:
+This installs:
 
 - `kernel-knowledge`
 - `profile-evidence`
