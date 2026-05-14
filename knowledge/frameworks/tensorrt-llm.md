@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/NVIDIA/TensorRT-LLM>
 
+Deep reference: `knowledge/references/frameworks/tensorrt-llm.md`
+
 TensorRT-LLM ships NVIDIA's reference LLM kernels and is the closest public
 implementation of the techniques in NVIDIA's blogs (FP8, FP4, TMA + WGMMA
 attention, MoE on Hopper / Blackwell, NVLS userbuffers, multi-block decoder

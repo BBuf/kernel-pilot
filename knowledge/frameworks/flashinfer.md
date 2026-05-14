@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/flashinfer-ai/flashinfer>
 
+Deep reference: `knowledge/references/frameworks/flashinfer.md`
+
 FlashInfer is the kernel library most LLM-serving stacks (SGLang, vLLM, MLC)
 adopt for **paged attention**, **prefix-cache aware attention**, **MLA**, and
 **sampling**. Its codebase is the cleanest open reference for paged KV with

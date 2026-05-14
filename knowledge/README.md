@@ -15,6 +15,21 @@ be copied into a candidate kernel body.
 ```text
 knowledge/
 ├── index.json
+├── references/
+│   ├── index.md
+│   ├── ako4all/
+│   │   ├── ako4all-kernel-loop.md
+│   │   ├── cuda-cpp-kernel-reference.md
+│   │   ├── cutlass-cpp-kernel-reference.md
+│   │   ├── profiling-debugging-reference.md
+│   │   └── ...
+│   └── frameworks/
+│       ├── sglang.md
+│       ├── vllm.md
+│       ├── tensorrt-llm.md
+│       ├── pytorch.md
+│       ├── flashinfer.md
+│       └── cutlass.md
 ├── frameworks/
 │   ├── sglang.md
 │   ├── vllm.md
@@ -45,12 +60,14 @@ knowledge/
 
 1. Start from framework pages and topic pages before picking an optimization
    direction.
-2. Prefer source code, tests, benchmarks, and open PRs/issues before docs,
+2. Use `references/index.md` to select deep reference files instead of loading
+   the full reference tree.
+3. Prefer source code, tests, benchmarks, and open PRs/issues before docs,
    blogs, or articles.
-3. Log every source-derived idea with framework, path or URL, hypothesis, and
+4. Log every source-derived idea with framework, path or URL, hypothesis, and
    measured result.
-4. After two consecutive weak rounds (<1% improvement), read at least 50 new
+5. After two consecutive weak rounds (<1% improvement), read at least 50 new
    code-first sources before prose sources, then record a do-not-reread key for
    each source.
-5. Keep the source framework repo read-only when the task asks for a standalone
+6. Keep the source framework repo read-only when the task asks for a standalone
    optimization repo.

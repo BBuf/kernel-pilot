@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+#
+# Tests for plan file validation in setup-rlcr-loop.sh
+#
+# Tests:
+# - Absolute path rejection
+# - Relative path within project
+# - Symlink rejection
+# - Submodule rejection
+# - Git repo validation
+# - Plan file tracking status validation
+#
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Unset CLAUDE_PROJECT_DIR so setup-rlcr-loop.sh uses pwd (the temp test repo)
+# instead of the actual repo root where this test is running
+unset CLAUDE_PROJECT_DIR
+
+# Test helpers
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
+
+pass() { echo -e "${GREEN}PASS${NC}: $1"; TESTS_PASSED=$((TESTS_PASSED + 1)); }
+fail() { echo -e "${RED}FAIL${NC}: $1"; echo "  Expected: $2"; echo "  Got: $3"; TESTS_FAILED=$((TESTS_FAILED + 1)); }
+skip() { echo -e "${YELLOW}SKIP${NC}: $1 - $2"; TESTS_SKIPPED=$((TESTS_SKIPPED + 1)); }
+
+# Setup test environment
+TEST_DIR=$(mktemp -d)
+trap "rm -rf $TEST_DIR" EXIT
+
+setup_test_repo() {
+    cd "$TEST_DIR"
+
+    # Only init git if not already initialized
+    if [[ ! -d ".git" ]]; then
+        git init -q
+        git config user.email "test@test.com"
+        git config user.name "Test"
+        echo "initial" > init.txt
+        git add init.txt
+        git -c commit.gpgsign=false commit -q -m "Initial commit"
+
+        # Create test plan files
+        mkdir -p plans
+        cat > plans/test-plan.md << 'EOF'
+# Test Plan
+
+## Goal
+Test the RLCR loop functionality
+
+## Requirements
+- Requirement 1
+- Requirement 2
+- Requirement 3
+EOF
+
+        # Add plans/ to gitignore (default behavior)
+        echo "plans/" >> .gitignore
+        git add .gitignore
+        git -c commit.gpgsign=false commit -q -m "Add gitignore"
+    fi
+}
+
+# Mock codex command - always use mock to avoid calling real codex (slow)
+mock_codex() {
+    mkdir -p "$TEST_DIR/bin"
+    cat > "$TEST_DIR/bin/codex" << 'EOF'
+#!/usr/bin/env bash
+# Mock codex for test-plan-file-validation.sh
+echo "mock codex"
+EOF
+    chmod +x "$TEST_DIR/bin/codex"
+    export PATH="$TEST_DIR/bin:$PATH"
+}
+
+echo "=== Test: Plan File Path Validation ==="
+echo ""
+
+# Test 1: Absolute path should fail
+setup_test_repo
+mock_codex
+
+echo "Test 1: Reject absolute path"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "/absolute/path/plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "relative path"; then
+    pass "Absolute path rejected"
+else
+    fail "Absolute path rejection" "exit 1 with relative path error" "$RESULT"
+fi
+
+# Test 2: Non-existent file should fail
+echo "Test 2: Reject non-existent file"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "nonexistent.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "not found"; then
+    pass "Non-existent file rejected"
+else
+    fail "Non-existent file rejection" "exit 1 with not found error" "$RESULT"
+fi
+
+# Test 2.5: Non-existent directory should fail with clear error
+echo "Test 2.5: Reject non-existent parent directory"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "nonexistent-dir/plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "directory not found"; then
+    pass "Non-existent parent directory rejected with clear error"
+else
+    fail "Non-existent parent directory rejection" "exit 1 with directory not found error" "$RESULT"
+fi
+
+# Test 2.6: Path with spaces should fail
+echo "Test 2.6: Reject path with spaces"
+mkdir -p "$TEST_DIR/path with spaces"
+cat > "$TEST_DIR/path with spaces/plan.md" << 'EOF'
+# Plan
+## Goal
+Test spaces
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "path with spaces/plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "cannot contain spaces"; then
+    pass "Path with spaces rejected"
+else
+    fail "Path with spaces rejection" "exit 1 with spaces error" "$RESULT"
+fi
+
+# Test 2.7: Filename with spaces should fail
+echo "Test 2.7: Reject filename with spaces"
+cat > "$TEST_DIR/plan with spaces.md" << 'EOF'
+# Plan
+## Goal
+Test spaces
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plan with spaces.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "cannot contain spaces"; then
+    pass "Filename with spaces rejected"
+else
+    fail "Filename with spaces rejection" "exit 1 with spaces error" "$RESULT"
+fi
+
+# Test 2.8: Path with shell metacharacters should fail
+echo "Test 2.8: Reject path with shell metacharacters"
+cat > "$TEST_DIR/plans/test-plan.md" << 'EOF'
+# Plan
+## Goal
+Test metacharacters
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+# Test various shell metacharacters
+for meta_char in ';' '&' '|' '$' '`' '<' '>' '(' ')' '{' '}' '[' ']' '!' '#' '~' '*' '?'; do
+    RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/test${meta_char}plan.md" 2>&1) || true
+    if ! echo "$RESULT" | grep -q "shell metacharacters"; then
+        fail "Shell metacharacter rejection ($meta_char)" "error mentioning metacharacters" "$RESULT"
+        break
+    fi
+done
+pass "Path with shell metacharacters rejected"
+
+# Test 3: Symlink should fail
+echo "Test 3: Reject symbolic link"
+ln -sf plans/test-plan.md "$TEST_DIR/link-plan.md"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "link-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "symbolic link"; then
+    pass "Symlink rejected"
+else
+    fail "Symlink rejection" "exit 1 with symbolic link error" "$RESULT"
+fi
+
+# Test 3.5: Path resolution error handling (Fix #4)
+echo "Test 3.5: Handle path resolution errors gracefully"
+# Create a directory structure where cd might fail
+mkdir -p "$TEST_DIR/permission-test"
+cd "$TEST_DIR/permission-test"
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+# Create a plan directory that we'll make inaccessible
+mkdir -p plans
+cat > plans/plan.md << 'EOF'
+# Plan
+## Goal
+Test path resolution
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+echo "plans/" >> .gitignore
+git add .gitignore
+git -c commit.gpgsign=false commit -q -m "Gitignore"
+# Make the plans directory unreadable (if we have permission to do so)
+if chmod 000 plans 2>/dev/null; then
+    set +e
+    RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/plan.md" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    # Restore permissions for cleanup
+    chmod 755 plans
+    # Should fail with clear error about directory access
+    if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -qE "resolve|not found|directory"; then
+        pass "Path resolution error handled gracefully"
+    else
+        fail "Path resolution error" "clear error message" "exit $EXIT_CODE, output: $RESULT"
+    fi
+else
+    skip "Path resolution error" "cannot change permissions in test environment"
+fi
+cd "$TEST_DIR"
+
+# Test 4: Plan outside project (../ escape) should fail
+echo "Test 4: Reject path escaping project directory"
+mkdir -p "$TEST_DIR/outside"
+cat > "$TEST_DIR/outside/escape-plan.md" << 'EOF'
+# Escape Plan
+## Goal
+Test escape
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+mkdir -p "$TEST_DIR/project"
+cd "$TEST_DIR/project"
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "../outside/escape-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -qE "(within project|not found)"; then
+    pass "Path escape rejected"
+else
+    fail "Path escape rejection" "exit 1 with project directory error" "$RESULT"
+fi
+
+# Test 5: Non-git repo should fail
+echo "Test 5: Reject non-git repository"
+# Create a completely separate directory that is NOT inside any git repo
+NOGIT_DIR=$(mktemp -d)
+cd "$NOGIT_DIR"
+cat > plan.md << 'EOF'
+# Plan
+## Goal
+Test non-git
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+rm -rf "$NOGIT_DIR"
+cd "$TEST_DIR"
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "git repository"; then
+    pass "Non-git repo rejected"
+else
+    fail "Non-git repo rejection" "exit 1 with git repository error" "$RESULT"
+fi
+
+# Test 6: Git repo without commits should fail
+echo "Test 6: Reject git repo without commits"
+# Create a completely separate directory that is NOT inside any git repo
+NOCOMMIT_DIR=$(mktemp -d)
+cd "$NOCOMMIT_DIR"
+git init -q
+cat > plan.md << 'EOF'
+# Plan
+## Goal
+Test no commits
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+rm -rf "$NOCOMMIT_DIR"
+cd "$TEST_DIR"
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "at least one commit"; then
+    pass "Git repo without commits rejected"
+else
+    fail "Git repo without commits rejection" "exit 1 with commit error" "$RESULT"
+fi
+
+echo ""
+echo "=== Test: Plan File Tracking Validation ==="
+echo ""
+
+# Test 7: Tracked file without --track-plan-file should fail
+echo "Test 7: Reject tracked file without --track-plan-file"
+cd "$TEST_DIR"
+rm -rf tracked-test 2>/dev/null || true
+mkdir -p tracked-test
+cd tracked-test
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+cat > tracked-plan.md << 'EOF'
+# Tracked Plan
+## Goal
+Test tracking
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+git add tracked-plan.md
+git -c commit.gpgsign=false commit -q -m "Add plan"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "tracked-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "gitignored"; then
+    pass "Tracked file without --track-plan-file rejected"
+else
+    fail "Tracked file rejection" "exit 1 with gitignored error" "$RESULT"
+fi
+
+# Test 8: Untracked file with --track-plan-file should fail
+echo "Test 8: Reject untracked file with --track-plan-file"
+cd "$TEST_DIR"
+rm -rf untracked-test 2>/dev/null || true
+mkdir -p untracked-test
+cd untracked-test
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+mkdir -p plans
+cat > plans/untracked-plan.md << 'EOF'
+# Untracked Plan
+## Goal
+Test untracked
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+echo "plans/" >> .gitignore
+git add .gitignore
+git -c commit.gpgsign=false commit -q -m "Gitignore"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --track-plan-file "plans/untracked-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "tracked in git"; then
+    pass "Untracked file with --track-plan-file rejected"
+else
+    fail "Untracked file with --track-plan-file rejection" "exit 1 with tracked error" "$RESULT"
+fi
+
+# Test 9: Modified tracked file with --track-plan-file should fail
+echo "Test 9: Reject modified tracked file with --track-plan-file"
+cd "$TEST_DIR"
+rm -rf modified-test 2>/dev/null || true
+mkdir -p modified-test
+cd modified-test
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+cat > modified-plan.md << 'EOF'
+# Modified Plan
+## Goal
+Test modified
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+git add modified-plan.md
+git -c commit.gpgsign=false commit -q -m "Add plan"
+echo "# Extra line" >> modified-plan.md
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --track-plan-file "modified-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "clean"; then
+    pass "Modified tracked file with --track-plan-file rejected"
+else
+    fail "Modified tracked file rejection" "exit 1 with clean error" "$RESULT"
+fi
+
+echo ""
+echo "=== Test: Branch Name Validation ==="
+echo ""
+
+# Test 9.5: Reject branch names with YAML-unsafe characters (Fix #2)
+# Note: Git itself may reject some of these characters, which is fine
+# We test that either git rejects it OR our script rejects it
+echo "Test 9.5: Reject branch with colon (YAML-unsafe)"
+cd "$TEST_DIR"
+rm -rf branch-test 2>/dev/null || true
+mkdir -p branch-test
+cd branch-test
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+# Get the default branch name for this repo (main or master)
+BRANCH_TEST_DEFAULT=$(git rev-parse --abbrev-ref HEAD)
+mkdir -p plans
+cat > plans/plan.md << 'EOF'
+# Plan
+## Goal
+Test branch validation
+## Requirements
+- Requirement 1
+- Requirement 2
+EOF
+echo "plans/" >> .gitignore
+git add .gitignore
+git -c commit.gpgsign=false commit -q -m "Gitignore"
+# Try to create branch with colon (YAML-unsafe) - git may reject this
+if git checkout -q -b "feature:test" 2>/dev/null; then
+    set +e
+    RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/plan.md" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "YAML-unsafe"; then
+        pass "Branch with colon rejected"
+    else
+        fail "Branch with colon rejection" "exit 1 with YAML-unsafe error" "$RESULT"
+    fi
+    git checkout -q "$BRANCH_TEST_DEFAULT" 2>/dev/null || true
+else
+    # Git itself rejected the branch name, which is also fine
+    pass "Branch with colon rejected (by git)"
+fi
+
+# Test 9.6: Reject branch names with hash (YAML comment)
+echo "Test 9.6: Reject branch with hash (YAML comment)"
+git checkout -q "$BRANCH_TEST_DEFAULT" 2>/dev/null || true
+# Try to create a branch with hash - some git versions may not allow this
+if git checkout -q -b "test#comment" 2>/dev/null; then
+    set +e
+    RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/plan.md" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "YAML-unsafe"; then
+        pass "Branch with hash rejected"
+    else
+        fail "Branch with hash rejection" "exit 1 with YAML-unsafe error" "$RESULT"
+    fi
+    git checkout -q "$BRANCH_TEST_DEFAULT" 2>/dev/null || true
+else
+    pass "Branch with hash rejected (by git)"
+fi
+
+# Test 9.7: Reject branch names with quotes
+echo "Test 9.7: Reject branch with quotes (YAML-unsafe)"
+git checkout -q "$BRANCH_TEST_DEFAULT" 2>/dev/null || true
+if git checkout -q -b 'test"quote' 2>/dev/null; then
+    set +e
+    RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/plan.md" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "YAML-unsafe"; then
+        pass "Branch with quotes rejected"
+    else
+        fail "Branch with quotes rejection" "exit 1 with YAML-unsafe error" "$RESULT"
+    fi
+    git checkout -q "$BRANCH_TEST_DEFAULT" 2>/dev/null || true
+else
+    pass "Branch with quotes rejected (by git)"
+fi
+
+echo ""
+echo "=== Test: Plan File Content Validation ==="
+echo ""
+
+# Test 9.8: Reject plan file with only blank lines
+echo "Test 9.8: Reject plan with only blank lines"
+cd "$TEST_DIR"
+rm -rf content-test 2>/dev/null || true
+mkdir -p content-test
+cd content-test
+git init -q
+git config user.email "test@test.com"
+git config user.name "Test"
+echo "init" > init.txt
+git add init.txt
+git -c commit.gpgsign=false commit -q -m "Initial"
+mkdir -p plans
+# Create plan with only blank lines (6 lines total to pass the 5-line minimum)
+printf '\n\n\n\n\n\n' > plans/blank-plan.md
+echo "plans/" >> .gitignore
+git add .gitignore
+git -c commit.gpgsign=false commit -q -m "Gitignore"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/blank-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Plan with only blank lines rejected"
+else
+    fail "Blank plan rejection" "exit 1 with insufficient content error" "$RESULT"
+fi
+
+# Test 9.9: Reject plan file with only few non-blank lines
+echo "Test 9.9: Reject plan with too few non-blank lines"
+# Create plan with mostly blank lines and only 2 non-blank lines
+cat > plans/sparse-plan.md << 'EOF'
+# Title
+
+
+Only one more line
+
+
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/sparse-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Plan with too few non-blank lines rejected"
+else
+    fail "Sparse plan rejection" "exit 1 with insufficient content error" "$RESULT"
+fi
+
+# Test 9.9.1: Reject plan file with only HTML comments
+echo "Test 9.9.1: Reject plan with only HTML comments"
+cat > plans/comment-plan.md << 'EOF'
+<!-- HTML comment line 1 -->
+<!-- HTML comment line 2 -->
+
+
+<!-- HTML comment line 3 -->
+<!--
+Multi-line HTML comment
+that spans multiple lines
+-->
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/comment-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Plan with only HTML comments rejected"
+else
+    fail "HTML-comment-only plan rejection" "exit 1 with insufficient content error" "$RESULT"
+fi
+
+# Test 9.9.2: Reject plan file with only shell/markdown comments (# lines)
+echo "Test 9.9.2: Reject plan with only # comments"
+cat > plans/hash-comment-plan.md << 'EOF'
+# This is a comment line 1
+# This is a comment line 2
+# This is a comment line 3
+# This is a comment line 4
+# This is a comment line 5
+# This is a comment line 6
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/hash-comment-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Plan with only # comments rejected"
+else
+    fail "#-comment-only plan rejection" "exit 1 with insufficient content error" "$RESULT"
+fi
+
+# Test 9.10: Accept plan with enough non-blank content
+# Note: Lines starting with # are treated as comments, so we use plain text
+echo "Test 9.10: Accept plan with sufficient non-blank content"
+cat > plans/good-plan.md << 'EOF'
+Good Plan
+
+Goal
+This is a valid plan file with enough content.
+
+Requirements
+- Requirement 1
+- Requirement 2
+
+Implementation
+Details here.
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/good-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+# Should not fail due to content validation (may fail later for other reasons like codex)
+if ! echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Valid plan with sufficient content accepted"
+else
+    fail "Valid plan acceptance" "no insufficient content error" "$RESULT"
+fi
+
+# Test 9.10.1: Accept plan with single-line HTML comments and valid content
+# Regression test: single-line HTML comments should NOT trigger multi-line comment mode
+echo "Test 9.10.1: Accept plan with single-line HTML comments + valid content"
+cat > plans/single-line-html-comment-plan.md << 'EOF'
+<!-- This is a single-line HTML comment -->
+This plan has real content
+
+Goal
+The goal is to test single-line comment handling.
+
+Requirements
+- Requirement 1
+- Requirement 2
+- Requirement 3
+EOF
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" "plans/single-line-html-comment-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+# Should not fail due to content validation - single-line comments should be skipped properly
+if ! echo "$RESULT" | grep -q "insufficient content"; then
+    pass "Plan with single-line HTML comments + valid content accepted"
+else
+    fail "Single-line HTML comment handling" "no insufficient content error" "$RESULT"
+fi
+
+echo ""
+echo "=== Test: CLI Options ==="
+echo ""
+
+# Test 10: --plan-file option works
+echo "Test 10: --plan-file option"
+cd "$TEST_DIR"
+setup_test_repo
+mock_codex
+set +e
+# This should fail validation (not actually run), but pass CLI parsing
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --plan-file "plans/test-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+# Should get past CLI parsing - either run or fail on some validation
+if ! echo "$RESULT" | grep -q "requires a file path"; then
+    pass "--plan-file option accepted"
+else
+    fail "--plan-file option" "option accepted" "$RESULT"
+fi
+
+# Test 11: Both --plan-file and positional should fail
+echo "Test 11: Reject both --plan-file and positional"
+rm -rf "$TEST_DIR/.humanize/rlcr" 2>/dev/null || true
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --plan-file "plans/a.md" "plans/b.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "Cannot specify both"; then
+    pass "Both --plan-file and positional rejected"
+else
+    fail "Both options rejection" "exit 1 with both error" "$RESULT"
+fi
+
+echo ""
+echo "=== Test: Codex Parameter Validation ==="
+echo ""
+
+# Test 12: Reject codex model with YAML-unsafe characters
+# Note: colon is used as delimiter (model:effort), so test with $ which stays in model portion
+echo "Test 12: Reject codex model with YAML-unsafe characters"
+setup_test_repo
+mock_codex
+rm -rf "$TEST_DIR/.humanize/rlcr" 2>/dev/null || true
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --codex-model 'model$inject:high' "plans/test-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "invalid characters"; then
+    pass "Codex model with $ rejected"
+else
+    fail "Codex model validation" "exit 1 with invalid characters error" "$RESULT"
+fi
+
+# Test 13: Reject codex effort with YAML-unsafe characters
+echo "Test 13: Reject codex effort with YAML-unsafe characters"
+rm -rf "$TEST_DIR/.humanize/rlcr" 2>/dev/null || true
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --codex-model "gpt-5.5:high#comment" "plans/test-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+if [[ $EXIT_CODE -ne 0 ]] && echo "$RESULT" | grep -q "Invalid codex effort"; then
+    pass "Codex effort with hash rejected"
+else
+    fail "Codex effort validation" "exit 1 with invalid codex effort error" "$RESULT"
+fi
+
+# Test 14: Accept valid codex model with dots and hyphens
+echo "Test 14: Accept valid codex model (alphanumeric, dots, hyphens)"
+set +e
+RESULT=$("$PROJECT_ROOT/scripts/setup-rlcr-loop.sh" --codex-model "gpt-5.5:medium" "plans/test-plan.md" 2>&1)
+EXIT_CODE=$?
+set -e
+# Should not fail due to model/effort validation (may fail later for other reasons)
+if ! echo "$RESULT" | grep -q "invalid characters"; then
+    pass "Valid codex model accepted"
+else
+    fail "Valid codex model" "no invalid characters error" "$RESULT"
+fi
+
+echo ""
+echo "========================================="
+echo "Test Results"
+echo "========================================="
+echo -e "Passed: ${GREEN}$TESTS_PASSED${NC}"
+echo -e "Failed: ${RED}$TESTS_FAILED${NC}"
+echo -e "Skipped: ${YELLOW}$TESTS_SKIPPED${NC}"
+echo ""
+
+exit $TESTS_FAILED

@@ -7,7 +7,18 @@ skills_root="$codex_home/skills"
 
 mkdir -p "$skills_root"
 
-rm -rf "$skills_root/kernel-pilot" "$skills_root/kernel-knowledge" "$skills_root/profile-evidence"
+if [[ -x "$repo_root/humanize/scripts/install-skills-codex.sh" ]]; then
+    "$repo_root/humanize/scripts/install-skills-codex.sh" --kernelpilot-root "$repo_root"
+else
+    echo "Error: patched Humanize checkout not found at $repo_root/humanize" >&2
+    exit 1
+fi
+
+rm -rf \
+    "$skills_root/kernel-pilot" \
+    "$skills_root/humanize-kernel-rlcr" \
+    "$skills_root/kernel-knowledge" \
+    "$skills_root/profile-evidence"
 cp -R "$repo_root/skills/kernel-knowledge" "$skills_root/kernel-knowledge"
 cp -R "$repo_root/skills/profile-evidence" "$skills_root/profile-evidence"
 
@@ -26,6 +37,7 @@ rm -rf "$repo_root/.pytest_cache"
 find "$repo_root" -type d -name "__pycache__" -prune -exec rm -rf {} +
 
 echo "Installed Codex skills:"
+echo "  $skills_root/humanize-kernel-agent-loop"
 echo "  $skills_root/kernel-knowledge"
 echo "  $skills_root/profile-evidence"
 echo

@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/pytorch/pytorch>
 
+Deep reference: `knowledge/references/frameworks/pytorch.md`
+
 PyTorch is the **correctness oracle and integration backbone** for most LLM
 kernel work. ATen native CUDA kernels are the reference for elementwise,
 reduction, and SDPA semantics. Inductor is the reference for fused Triton

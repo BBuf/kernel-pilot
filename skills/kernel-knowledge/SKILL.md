@@ -26,17 +26,27 @@ Before writing a plan or choosing a kernel edit:
 
 1. Read `knowledge/README.md`.
 2. Read `knowledge/topics/index.md`.
-3. Pick and read the most relevant topic pages, for example:
+3. Read `knowledge/references/index.md` to choose the detailed reference layer.
+4. Pick and read the most relevant topic pages, for example:
    - normalization or fused norm: `knowledge/topics/normalization.md`
    - elementwise fusion: `knowledge/topics/activation-fusion.md`
    - GEMM or tensor cores: `knowledge/topics/matmul-gemm.md`
    - attention or KV cache: `knowledge/topics/attention.md`,
      `knowledge/topics/kv-cache.md`
-4. Pick and read relevant framework pages, usually starting with:
+5. Pick and read relevant framework pages, usually starting with:
    - `knowledge/frameworks/sglang.md` for SGLang work
    - `knowledge/frameworks/vllm.md`, `flashinfer.md`, `flash-attention.md`,
      `cutlass.md`, `deepgemm.md`, or `triton.md` when the topic points there
-5. Read `references/kernel-source-catalog.md` before broader research.
+6. Read the matching deep framework reference under
+   `knowledge/references/frameworks/` for PyTorch, TensorRT-LLM, SGLang, vLLM,
+   FlashInfer, or CUTLASS work.
+7. For implementation/profiling mechanics, read the copied AKO4ALL references:
+   - CUDA C++: `knowledge/references/ako4all/cuda-cpp-kernel-reference.md`
+   - CUTLASS/CuTe prior art:
+     `knowledge/references/ako4all/cutlass-cpp-kernel-reference.md`
+   - Profiling: `knowledge/references/ako4all/profiling-debugging-reference.md`
+   - H100: `knowledge/references/ako4all/architectures/sm90-optimization-guide.md`
+8. Read `references/kernel-source-catalog.md` before broader research.
 
 ## Research Rules
 

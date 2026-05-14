@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/vllm-project/vllm>
 
+Deep reference: `knowledge/references/frameworks/vllm.md`
+
 vLLM is one of the largest production LLM-serving codebases. Its kernels are
 written either by the vLLM team or upstreamed from FlashInfer / FlashAttention /
 xFormers, then wrapped with paged-attention bookkeeping.

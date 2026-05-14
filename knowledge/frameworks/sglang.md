@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/sgl-project/sglang>
 
+Deep reference: `knowledge/references/frameworks/sglang.md`
+
 SGLang is a serving framework for LLMs and VLMs. For kernel work it is the
 canonical place to look at **production attention scheduling**, **fused MoE on
 Triton + CUDA**, **FP8 paths**, **RadixAttention / HiCache**, **speculative /

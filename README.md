@@ -1,26 +1,19 @@
-# KernelPilot Knowledge Pack
+# KernelPilot
 
-This repo is a GPU-kernel knowledge pack. It is no longer a Humanize fork and it
-does not provide `humanize-kernel-rlcr`.
-
-Use the original [PolyArch/humanize](https://github.com/PolyArch/humanize)
-Codex skills for RLCR. Use this repo only as reference material for kernel
-optimization: code-first knowledge, source catalogs, and Nsight Compute profile
-guidance.
+KernelPilot is a Humanize-based kernel agent loop for CUDA optimization. It
+vendors a patched [PolyArch/humanize](https://github.com/PolyArch/humanize)
+runtime and adds kernel-knowledge plus Nsight Compute profile guidance for
+evidence-driven kernel iteration.
 
 Hard rule for KernelPilot-style work: candidate kernels must be naive,
 hand-written CUDA C++ in `.cu` / `.cuh`. Triton, CuTe DSL, CUTLASS,
 ThunderKittens, torch.compile, library dispatch, and framework DSLs may be used
 as references or baselines, but not as candidate implementations.
 
-## Install Humanize
-
-Install upstream Humanize for Codex:
+## Install
 
 ```bash
-tmp_dir="$(mktemp -d)"
-git clone --branch dev --depth 1 https://github.com/PolyArch/humanize.git "$tmp_dir/humanize"
-"$tmp_dir/humanize/scripts/install-skills-codex.sh"
+./scripts/install-codex-skills.sh
 ```
 
 Restart Codex after installation.
@@ -29,36 +22,21 @@ If Codex shows `hook needs review`, open **`/hooks`** and approve the Humanize
 Stop hook. Use **`/permissions`** to switch to Full Access, then continue after
 Codex shows **`Permissions updated to Full Access`**.
 
-## Install KernelPilot Skills
-
-Install the KernelPilot knowledge skills for Codex:
-
-```bash
-./scripts/install-codex-skills.sh
-```
-
 This installs:
 
+- patched Humanize skills
+- `humanize-kernel-agent-loop`
 - `kernel-knowledge`
 - `profile-evidence`
 
-## Which Skills To Use
-
-For a kernel optimization loop in Codex, use upstream Humanize for the loop and
-KernelPilot only for knowledge/profile evidence:
-
-- `humanize-gen-plan`
-- `humanize-refine-plan`
-- `humanize-rlcr`
-- `kernel-knowledge`
-- `profile-evidence`
-
-Do not use `humanize-kernel-rlcr`; it has been removed.
+`kernel-knowledge` includes copied AKO4ALL CUDA/CUTLASS/NCU references plus
+deep source-reading guides for SGLang, vLLM, TensorRT-LLM, PyTorch,
+FlashInfer, and CUTLASS.
 
 ## Prompt Card
 
 ```text
-I want to optimize SGLang's H100 int8_scaled_mm kernel on H100. Use Humanize RLCR. Use kernel-knowledge and profile-evidence as reference material only. Implement candidate kernels only as naive hand-written CUDA C++ in a clean standalone repo; use the existing framework/CUTLASS code only as baseline or prior art.
+[$humanize-kernel-agent-loop] I want to optimize SGLang's H100 int8_scaled_mm kernel on H100. Keep SGLang read-only as baseline/prior art. Implement candidates only as naive hand-written CUDA C++ in a clean standalone repo.
 ```
 
 ## Monitor

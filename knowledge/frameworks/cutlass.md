@@ -2,6 +2,8 @@
 
 Repository: <https://github.com/NVIDIA/cutlass>
 
+Deep reference: `knowledge/references/frameworks/cutlass.md`
+
 CUTLASS is NVIDIA's primary template library for GEMM, GEMV, convolution, and
 fused-epilogue kernels. CuTe (`include/cute/`) is the tensor-algebra layer
 used internally; the CuTe DSL exposes the same semantics in Python.
