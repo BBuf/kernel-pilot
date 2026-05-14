@@ -46,7 +46,9 @@ Codex shows **`Permissions updated to Full Access`**.
 
 ## Use In Codex
 
-Open Codex in the target work repo, not in this knowledge-pack repo.
+Open Codex in the framework repo or workspace that contains the source kernel,
+not in this knowledge-pack repo. The skill creates a clean standalone
+optimization repo automatically.
 
 In `/skills`, select only:
 
@@ -59,7 +61,7 @@ Then paste a short task prompt.
 ## Prompt Card
 
 ```text
-I want to optimize the SGLang diffusion fused_norm_scale_shift operator on H100.
+I want to optimize SGLang's H100 int8_scaled_mm kernel. Use the existing CUTLASS SM90 implementation only as baseline/prior art.
 ```
 
 ## Monitor
