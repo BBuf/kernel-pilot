@@ -4,9 +4,10 @@ This repo is the GPU-kernel knowledge pack used by the
 [BBuf/humanize](https://github.com/BBuf/humanize) Codex fork.
 
 The active workflow now lives in Humanize as one Codex skill:
-`humanize-kernel-rlcr`. It combines plan generation, plan refinement, RLCR
-startup, KernelPilot knowledge lookup, Nsight Compute profile guidance, and
-plateau research rules. KernelPilot work has one hard implementation constraint:
+`humanize-kernel-rlcr`. It is a thin wrapper around the original Humanize RLCR
+loop: it drafts/refines a plan, starts RLCR with KernelPilot mode, and injects
+KernelPilot knowledge lookup, Nsight Compute profile guidance, and plateau
+research rules. KernelPilot work has one hard implementation constraint:
 candidate kernels must be naive, hand-written CUDA C++ in `.cu` / `.cuh`.
 Triton, CuTe DSL, CUTLASS, ThunderKittens, torch.compile, library dispatch, and
 framework DSLs may be used as references or baselines, but not as candidate
@@ -61,7 +62,7 @@ Then paste a short task prompt.
 ## Prompt Card
 
 ```text
-I want to optimize SGLang's H100 int8_scaled_mm kernel. Use the existing CUTLASS SM90 implementation only as baseline/prior art.
+[$humanize-kernel-rlcr] I want to optimize SGLang's H100 int8_scaled_mm kernel. Use the existing CUTLASS SM90 implementation only as baseline/prior art.
 ```
 
 ## Monitor
