@@ -42,10 +42,23 @@ That installs:
 - `kernel-knowledge`
 - `profile-evidence`
 
+## Which Skills To Use
+
+For a kernel optimization loop in Codex, use upstream Humanize for the loop and
+KernelPilot only for knowledge/profile evidence:
+
+- `humanize-gen-plan`
+- `humanize-refine-plan`
+- `humanize-rlcr`
+- `kernel-knowledge`
+- `profile-evidence`
+
+Do not use `humanize-kernel-rlcr`; it has been removed.
+
 ## Prompt Card
 
 ```text
-I want to optimize SGLang's H100 int8_scaled_mm kernel. Use Humanize RLCR. Use this KernelPilot knowledge pack as reference material only, and implement candidate kernels only as naive hand-written CUDA C++.
+I want to optimize SGLang's H100 int8_scaled_mm kernel on H100. Use Humanize RLCR. Use kernel-knowledge and profile-evidence as reference material only. Implement candidate kernels only as naive hand-written CUDA C++ in a clean standalone repo; use the existing framework/CUTLASS code only as baseline or prior art.
 ```
 
 ## Monitor
