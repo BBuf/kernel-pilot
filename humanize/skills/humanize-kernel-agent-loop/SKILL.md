@@ -38,13 +38,23 @@ missing and cannot be inferred.
 
 ## Hard Rules
 
-- Candidate implementations must be naive, hand-written CUDA C++ in `.cu` or
-  `.cuh`.
-- Do not use Triton, CuTe DSL, CUTLASS, ThunderKittens, torch.compile, library
-  dispatch, generated kernels, or framework DSLs as candidate implementations.
-  They are allowed only as baselines, behavior references, or prior art.
-- Keep the source framework repository read-only unless the user explicitly asks
-  for an in-place patch.
+- Candidate implementation language is user-directed. If the user specifies
+  CUDA C++/PTX, Triton, CuTe DSL, TileLang, CUTLASS/CuTe, ThunderKittens,
+  torch.compile/Inductor, or another kernel stack, use that stack.
+- If the user does not specify a language, start from the active baseline
+  kernel's implementation system unless there is a measured reason to choose a
+  different one.
+- The baseline kernel is a first-class starting point. You may copy or adapt
+  baseline code into the standalone repo when license and attribution allow.
+  Record the exact source path/URL, commit, license/notice, and delta in the
+  source ledger and lineage.
+- If the user explicitly asks for a from-scratch kernel or says not to use the
+  baseline implementation, do not copy, adapt, or pattern-match the baseline
+  kernel code. Use that baseline only for correctness, benchmark, profiler, and
+  API comparison.
+- Keep the source framework checkout itself read-only for standalone work unless
+  the user explicitly asks for an in-place framework patch. The standalone repo
+  may contain the copied/adapted baseline candidate and subsequent mutations.
 - Run optimization work in a fresh standalone git repo with its own PyTorch
   binding, correctness tests, benchmark harness, ledgers, lineage, and profile
   artifacts.
@@ -79,24 +89,44 @@ tracking local loop state.
 Before writing the plan or choosing any optimization direction:
 
 1. Read `{{KERNELPILOT_ROOT}}/knowledge/README.md`.
-2. Read `{{KERNELPILOT_ROOT}}/knowledge/topics/index.md`.
+2. Read `{{KERNELPILOT_ROOT}}/knowledge/routing/topics/index.md`.
 3. Read `{{KERNELPILOT_ROOT}}/knowledge/references/index.md`.
 4. Read relevant topic pages, usually one or more of:
-   - `knowledge/topics/matmul-gemm.md`
-   - `knowledge/topics/attention.md`
-   - `knowledge/topics/normalization.md`
-   - `knowledge/topics/activation-fusion.md`
-   - `knowledge/topics/quantization-fp8.md`
+   - `knowledge/routing/topics/matmul-gemm.md`
+   - `knowledge/routing/topics/attention.md`
+   - `knowledge/routing/topics/normalization.md`
+   - `knowledge/routing/topics/activation-fusion.md`
+   - `knowledge/routing/topics/quantization-fp8.md`
 5. Read relevant framework pages, usually:
-   - `knowledge/frameworks/sglang.md`
+   - `knowledge/routing/frameworks/sglang.md`
    - plus `cutlass.md`, `deepgemm.md`, `vllm.md`, `flashinfer.md`,
-     `flash-attention.md`, `triton.md`, or `pytorch.md` as appropriate.
-6. Read the matching deep framework reference under
-   `knowledge/references/frameworks/`.
-7. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
+     `flash-attention.md`, `triton.md`, `tilelang.md`, `cute-dsl.md`,
+     `quack.md`, `tilekernels.md`, `thunderkittens.md`,
+     `veitner-blog.md`, `colfax-research.md`, `cuda-blog-kernels.md`, or
+     `pytorch.md` as appropriate.
+6. Read the matching PR guide under `knowledge/references/prs/`. Treat PR
+   diffs, changed kernel files, linked tests, benchmark files, and review-linked
+   issues as the primary kernel-knowledge evidence layer. These pages keep all
+   filtered CUDA-kernel PRs rather than a small curated top-N, so search the full
+   relevant page for kernel family, dtype, architecture, backend, and bottleneck
+   terms before choosing an edit.
+7. If the bottleneck is known but the best source repository is unclear, read
+   `knowledge/references/prs/by-topic/index.md` and the matching topic page.
+8. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
+   ideas, and re-check linked GitHub PRs before using code or benchmark claims.
+9. Read the matching deep source guide under
+   `knowledge/references/source-guides/`.
+10. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
+11. For plateau research or blog-driven source ideas, read
+   `knowledge/references/blogs/index.md` and the matching blog page before
+   opening companion code.
 
-Prefer source code, tests, benchmarks, and open PRs/issues before blogs or
-articles. External kernels are prior art only.
+Prefer production PRs, source code, tests, benchmarks, and open PRs/issues
+before blogs or articles. During plateau expansion, use merged repository PR
+pages first, then cross-repository by-topic PR pages, then the open PR
+watchlist, then source guides and blog/code references. External kernels may be
+used as baselines, starting candidates, or prior art when their
+license/attribution allows it.
 
 ## Plan Requirements
 
@@ -104,8 +134,15 @@ Write `.humanize/kernel-agent/refined-plan.md` in the standalone repo. It must
 use the Humanize gen-plan schema and include these acceptance criteria:
 
 - Clean standalone repo exists and is committed before RLCR starts.
-- Baseline framework is read-only and measured as baseline/prior art.
-- Candidate kernels obey the naive hand-written CUDA C++ rule.
+- Baseline framework checkout is protected from accidental edits unless the
+  user asks for an in-place patch.
+- Candidate implementation language is documented and follows the user request
+  or the active baseline's kernel stack.
+- If baseline code seeds the first candidate, provenance, license/notice,
+  copied files, and the first optimization delta are recorded before further
+  mutation.
+- If the user requested a from-scratch kernel, the plan states that baseline
+  kernel code is comparison-only and cannot seed candidates.
 - Correctness tests cover representative shapes, dtypes, edge cases, and
   baseline parity.
 - Benchmark harness records per-shape timing, geomean, best/worst cases, and
@@ -119,10 +156,12 @@ use the Humanize gen-plan schema and include these acceptance criteria:
   and selected/rejected status.
 - After two consecutive weak rounds with less than 1% geomean improvement over
   the prior best, perform research expansion before editing again: read at
-  least 50 new code-first sources before prose sources, log source provenance,
-  and avoid re-reading by checking `artifacts/source-idea-ledger.md`.
-- Stop only when all ACs are met, or when NCU evidence shows the kernel is
-  already beyond 85% of the relevant peak and no low-effort CUDA edit remains.
+  least 50 new code-first sources before prose sources, prioritize unread PR
+  diffs and changed kernel/test/benchmark files, log source provenance, and
+  avoid re-reading by checking `artifacts/source-idea-ledger.md`.
+- Stop only when all ACs are met, or when profile evidence shows the kernel is
+  already beyond 85% of the relevant peak and no low-effort implementation edit
+  remains.
 
 ## Profile Evidence
 

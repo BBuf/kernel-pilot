@@ -19,8 +19,14 @@ grep -q 'humanize-kernel-agent-loop' "$install_script" \
 grep -q -- '--kernelpilot-root' "$install_script" \
     || fail "install script cannot hydrate KernelPilot root"
 
-grep -q 'naive, hand-written CUDA C++' "$skill_file" \
-    || fail "skill does not enforce naive CUDA candidate rule"
+grep -q 'Candidate implementation language is user-directed' "$skill_file" \
+    || fail "skill does not support user-directed candidate stacks"
+grep -q 'baseline kernel is a first-class starting point' "$skill_file" \
+    || fail "skill does not allow baseline-derived candidates"
+grep -q 'from-scratch kernel' "$skill_file" \
+    || fail "skill does not honor from-scratch baseline exclusion"
+grep -q 'comparison-only' "$skill_file" \
+    || fail "skill does not make excluded baselines comparison-only"
 grep -q 'kernel-knowledge' "$skill_file" \
     || fail "skill does not use kernel-knowledge naming"
 if grep -q 'Kernel''Wiki' "$skill_file"; then
@@ -30,6 +36,10 @@ grep -q 'Nsight Compute' "$skill_file" \
     || fail "skill does not require Nsight Compute evidence"
 grep -q '50 new code-first sources' "$skill_file" \
     || fail "skill does not require plateau research expansion"
+grep -q 'by-topic/index.md' "$skill_file" \
+    || fail "skill does not route cross-repository PR topic pages"
+grep -q 'open-watchlist.md' "$skill_file" \
+    || fail "skill does not mention open PR watchlist"
 grep -q 'artifacts/lineage.jsonl' "$skill_file" \
     || fail "skill does not require lineage tracking"
 grep -q 'setup-rlcr-loop.sh' "$skill_file" \

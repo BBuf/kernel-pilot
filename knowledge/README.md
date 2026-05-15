@@ -1,73 +1,145 @@
 # Kernel Knowledge Base
 
-This directory is a code-first map for GPU kernel optimization. It points Codex
-to production kernels, tests, benchmarks, open issues or PRs, and the profiler
-signals that are usually relevant for a topic.
+This directory is a PR- and code-first map for GPU kernel optimization. It
+points Codex to production pull requests, kernel diffs, tests, benchmarks,
+source maps, and the profiler signals that are usually relevant for a topic.
+The PR layer keeps all filtered CUDA-kernel PRs from the registered source
+repositories; it is not capped to a curated top-N list.
 
-The knowledge base is **reference material, not candidate code**. Candidate
-kernels should be written as native CUDA C++ (`.cu` / `.cuh`) unless the user
-explicitly asks otherwise. Python, Triton, CuTe DSL, CUTLASS, or framework code
-can define semantics, shapes, tests, benchmarks, and hypotheses, but should not
-be copied into a candidate kernel body.
+The knowledge base is both reference material and a route to baseline-derived
+candidate code. Candidate kernels should use the implementation system requested
+by the user, or the active baseline kernel's system when unspecified: CUDA
+C++/PTX, Triton, CuTe DSL, TileLang, CUTLASS/CuTe, ThunderKittens,
+torch.compile/Inductor, or another framework-specific kernel stack. Baseline
+kernel code may be copied or adapted into the standalone repo when license and
+attribution allow; record exact provenance, copied files, and deltas before
+mutating it.
 
 ## Layout
 
 ```text
 knowledge/
 ├── index.json
+├── routing/
+│   ├── frameworks/
+│   │   ├── sglang.md
+│   │   ├── vllm.md
+│   │   ├── tensorrt-llm.md
+│   │   ├── pytorch.md
+│   │   ├── flash-attention.md
+│   │   ├── flashinfer.md
+│   │   ├── cutlass.md
+│   │   ├── cccl-cub.md
+│   │   ├── triton.md
+│   │   ├── deepgemm.md
+│   │   ├── thunderkittens.md
+│   │   ├── tilelang.md
+│   │   ├── cute-dsl.md
+│   │   ├── quack.md
+│   │   ├── tilekernels.md
+│   │   ├── veitner-blog.md
+│   │   ├── colfax-research.md
+│   │   └── cuda-blog-kernels.md
+│   └── topics/
+│       ├── attention.md
+│       ├── matmul-gemm.md
+│       ├── moe.md
+│       ├── normalization.md
+│       ├── rope.md
+│       ├── activation-fusion.md
+│       ├── sampling.md
+│       ├── quantization-fp8.md
+│       ├── kv-cache.md
+│       └── communication.md
 ├── references/
 │   ├── index.md
+│   ├── prs/
+│   │   ├── index.md
+│   │   ├── pr-index.json
+│   │   ├── pr-scan-cache.json
+│   │   ├── open-watchlist.md
+│   │   ├── by-topic/
+│   │   │   ├── index.md
+│   │   │   ├── gemm_quant.md
+│   │   │   ├── attention_kv.md
+│   │   │   └── ...
+│   │   ├── sglang.md
+│   │   ├── vllm.md
+│   │   ├── tensorrt-llm.md
+│   │   ├── pytorch.md
+│   │   ├── flashinfer.md
+│   │   ├── deepgemm.md
+│   │   └── ...
+│   ├── blogs/
+│   │   ├── index.md
+│   │   ├── veitner.md
+│   │   ├── colfax.md
+│   │   ├── nvidia-cuda.md
+│   │   ├── simon-boehm-sgemm.md
+│   │   ├── lei-mao-cuda.md
+│   │   └── yifan-yang-matmul.md
 │   ├── ako4all/
 │   │   ├── ako4all-kernel-loop.md
 │   │   ├── cuda-cpp-kernel-reference.md
 │   │   ├── cutlass-cpp-kernel-reference.md
 │   │   ├── profiling-debugging-reference.md
 │   │   └── ...
-│   └── frameworks/
+│   └── source-guides/
 │       ├── sglang.md
 │       ├── vllm.md
 │       ├── tensorrt-llm.md
 │       ├── pytorch.md
+│       ├── flash-attention.md
 │       ├── flashinfer.md
-│       └── cutlass.md
-├── frameworks/
-│   ├── sglang.md
-│   ├── vllm.md
-│   ├── tensorrt-llm.md
-│   ├── pytorch.md
-│   ├── flash-attention.md
-│   ├── flashinfer.md
-│   ├── cutlass.md
-│   ├── cccl-cub.md
-│   ├── triton.md
-│   ├── deepgemm.md
-│   ├── thunderkittens.md
-│   └── tilelang.md
-└── topics/
-    ├── attention.md
-    ├── matmul-gemm.md
-    ├── moe.md
-    ├── normalization.md
-    ├── rope.md
-    ├── activation-fusion.md
-    ├── sampling.md
-    ├── quantization-fp8.md
-    ├── kv-cache.md
-    └── communication.md
+│       ├── cutlass.md
+│       ├── deepgemm.md
+│       ├── triton.md
+│       ├── tilelang.md
+│       ├── cute-dsl.md
+│       ├── quack.md
+│       ├── tilekernels.md
+│       ├── thunderkittens.md
+│       ├── veitner-blog.md
+│       ├── colfax-research.md
+│       └── cuda-blog-kernels.md
 ```
 
 ## Usage Rules
 
-1. Start from framework pages and topic pages before picking an optimization
-   direction.
+1. Start from `routing/topics/` and `routing/frameworks/` before picking an
+   optimization direction.
 2. Use `references/index.md` to select deep reference files instead of loading
    the full reference tree.
-3. Prefer source code, tests, benchmarks, and open PRs/issues before docs,
+3. Read the relevant `references/prs/<repo>.md` page before blog/article pages.
+   PR diffs, changed kernel files, tests, benchmarks, and review-linked issues
+   are the primary knowledge source. Search within the full page instead of
+   assuming only the first entries matter.
+4. If the bottleneck is clearer than the source repository, read
+   `references/prs/by-topic/index.md` and the matching topic page.
+5. Use `references/prs/open-watchlist.md` only as volatile current context; open
+   PRs must be re-checked on GitHub before copying code or trusting benchmark
+   claims.
+6. Prefer source code, tests, benchmarks, and open PRs/issues before docs,
    blogs, or articles.
-4. Log every source-derived idea with framework, path or URL, hypothesis, and
-   measured result.
-5. After two consecutive weak rounds (<1% improvement), read at least 50 new
+7. Log every source-derived idea with framework, PR or path URL, hypothesis,
+   measured result, and do-not-reread key.
+8. After two consecutive weak rounds (<1% improvement), read at least 50 new
    code-first sources before prose sources, then record a do-not-reread key for
    each source.
-6. Keep the source framework repo read-only when the task asks for a standalone
-   optimization repo.
+9. Keep the source framework checkout read-only when the task asks for a
+   standalone optimization repo, but copy/adapt the baseline kernel into the
+   standalone repo when it is the best starting point and provenance is tracked.
+10. If the user explicitly asks for a from-scratch kernel or says not to use the
+   baseline implementation, treat baseline kernel code as comparison-only:
+   benchmark/profile it, but do not copy, adapt, or pattern-match it.
+
+## Refreshing PR Knowledge
+
+The PR layer is generated from GitHub and can be refreshed with:
+
+```bash
+python3 scripts/refresh_pr_knowledge.py --since 2024-05-15
+```
+
+The generated cache is kept at `references/prs/pr-scan-cache.json` so the pages
+can be regenerated quickly with `--use-cache` after tuning filters or formatting.
