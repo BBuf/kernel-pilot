@@ -2,7 +2,9 @@
 
 Repository: <https://github.com/Dao-AILab/quack>
 
-PR case notes: `../prs/quack.md`
+Source-only policy: do not query PR notes for this repository unless the PR
+corpus reaches at least 10 selected CUDA optimization PRs. Use this source
+guide, the source catalog, and current source paths directly.
 
 QuACK is a CuTe DSL kernel collection from Dao-AILab. Use it for CuTe DSL
 memory-bound kernels, normalization, softmax, cross entropy, Hopper GEMM, and

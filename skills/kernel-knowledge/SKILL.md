@@ -51,8 +51,9 @@ Before writing a plan or choosing a kernel edit:
    source guides show where the current implementation and transferable code
    live. Do not query PRs for source-only repositories such as PyTorch,
    DeepSeek TileKernels, CUDA sample repos, blog/code companion repos, puzzle
-   repos, and source catalogs; inspect their source guide and current code
-   directly instead.
+   repos, source catalogs, and repositories with fewer than 10 selected CUDA
+   optimization PRs; inspect their source guide and current code directly
+   instead.
 8. Each PR entry records what changed, where it came from, changed paths, and
    the optimization recipe to test. The PR pages keep all filtered CUDA
    optimization PRs, not a curated top-N; each entry must have CUDA/NVIDIA
@@ -83,8 +84,9 @@ Before writing a plan or choosing a kernel edit:
 
 - Pair production PRs with current source code, tests, and benchmarks before
   blogs or articles when the repository is PR-driven. For source-only
-  repositories, skip PR lookup entirely and use source guides plus direct code
-  scans.
+  repositories, including repositories with fewer than 10 selected CUDA
+  optimization PRs, skip PR lookup entirely and use source guides plus direct
+  code scans.
 - Treat `knowledge/references/prs/` and
   `knowledge/references/source-guides/` as the paired primary corpus for CUDA
   optimization ideas for PR-driven repositories. Treat source guides and source

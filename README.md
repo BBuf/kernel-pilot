@@ -39,8 +39,8 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 | Signal | What makes it useful |
 | --- | --- |
 | **Humanize Kernel Agent Loop** | One Codex skill handles planning, refinement, standalone repo setup, RLCR startup, benchmark/profile iteration, and review-gated progress. |
-| **634 CUDA optimization PRs** | Production PR knowledge from PR-driven repos such as SGLang, vLLM, TensorRT-LLM, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, Triton, TileLang, QuACK, ThunderKittens, CCCL/CUB, and more. |
-| **313 open PR watchlist entries** | Fresh CUDA optimization ideas from PR-driven repos are tracked separately from merged evidence, so agents can explore current work without confusing it with production truth. |
+| **607 CUDA optimization PRs** | Production PR knowledge from PR-driven repos such as SGLang, vLLM, TensorRT-LLM, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, TileLang, CCCL/CUB, and more. |
+| **280 open PR watchlist entries** | Fresh CUDA optimization ideas from PR-driven repos are tracked separately from merged evidence, so agents can explore current work without confusing it with production truth. |
 | **Code-first knowledge routing** | Topic pages, source guides, PR notes, blog-to-code maps, and AKO4ALL references tell the agent what to read before choosing an optimization direction. |
 | **Nsight Compute feedback loop** | `profile-evidence` converts NCU metrics into bottleneck classifications, regression explanations, and one concrete next edit. |
 | **Clean standalone repos** | Candidate kernels live in isolated repos with their own bindings, tests, benchmarks, ledgers, lineage, and artifacts. |
@@ -106,9 +106,10 @@ Codex shows **`Permissions updated to Full Access`**.
 
 `kernel-knowledge` includes copied AKO4ALL CUDA/CUTLASS/NCU references plus a
 PR-driven production knowledge layer plus source-only code guides. The current
-PR scan covers 13 PR-driven CUDA optimization repos; PyTorch, DeepSeek
-TileKernels, sample repos, blog/code companion repos, puzzle repos, and source
-catalogs are intentionally source-only.
+PR scan covers 9 PR-driven CUDA optimization repos. PyTorch, DeepSeek
+TileKernels, Triton, QuACK, ThunderKittens, sample repos, blog/code companion
+repos, puzzle repos, source catalogs, and any repo with fewer than 10 selected
+CUDA optimization PRs are intentionally source-only.
 
 The knowledge layout is split into:
 

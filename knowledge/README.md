@@ -8,8 +8,9 @@ source repositories; it is not capped to a curated top-N list. A PR must carry
 CUDA/NVIDIA target evidence, a real kernel/source change, and an
 optimization/performance mechanism before it enters this corpus.
 PyTorch, DeepSeek TileKernels, sample repos, blog/code companion repos, puzzle
-repos, and source catalogs are source-only; inspect their source guides and
-current code directly instead of querying PRs.
+repos, source catalogs, and repositories with fewer than 10 selected CUDA
+optimization PRs are source-only; inspect their source guides and current code
+directly instead of querying PRs.
 
 The knowledge base is both reference material and a route to baseline-derived
 candidate code. Candidate kernels should use the implementation system requested
@@ -75,12 +76,8 @@ knowledge/
 │   │   ├── flashinfer.md
 │   │   ├── cutlass.md
 │   │   ├── deepgemm.md
-│   │   ├── triton.md
 │   │   ├── tilelang.md
-│   │   ├── quack.md
-│   │   ├── thunderkittens.md
 │   │   ├── cccl-cub.md
-│   │   ├── tencent-hpc-ops.md
 │   │   └── ...
 │   ├── blogs/
 │   │   ├── index.md
@@ -128,8 +125,9 @@ knowledge/
    code scans show the current implementation, callable wrappers, tests,
    benchmarks, and candidate code locations.
 4. For source-only repos such as PyTorch, DeepSeek TileKernels, sample repos,
-   blog/code companion repos, puzzle repos, and source catalogs, skip PR lookup
-   and inspect source guides plus current source paths directly.
+   blog/code companion repos, puzzle repos, source catalogs, and repositories
+   with fewer than 10 selected CUDA optimization PRs, skip PR lookup and inspect
+   source guides plus current source paths directly.
 5. If the bottleneck is clearer than the source repository, read
    `references/prs/by-topic/index.md` and the matching topic page.
 6. Use `references/prs/open-watchlist.md` only as volatile current context; open

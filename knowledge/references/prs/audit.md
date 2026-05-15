@@ -13,16 +13,12 @@ Scan window: merged or updated since `2024-05-15`.
 | `deepseek-ai/DeepGEMM` | 20 | 20 | 11 |
 | `NVIDIA/TensorRT-LLM` | 121 | 121 | 49 |
 | `Dao-AILab/flash-attention` | 46 | 46 | 34 |
-| `triton-lang/triton` | 7 | 7 | 22 |
 | `tile-ai/tilelang` | 34 | 34 | 13 |
-| `Dao-AILab/quack` | 9 | 9 | 3 |
-| `HazyResearch/ThunderKittens` | 6 | 6 | 5 |
 | `NVIDIA/cccl` | 62 | 62 | 17 |
-| `Tencent/hpc-ops` | 5 | 5 | 3 |
 
 ## Source-Only Repositories
 
-These repositories are excluded from PR scanning and should be queried through source guides or current source trees.
+These repositories are excluded from PR documents and should be queried through source guides or current source trees. Repositories with fewer than 10 selected CUDA optimization PRs are also folded into this source-only set.
 
 | Repository | Source reference | Reason |
 | --- | --- | --- |
@@ -45,6 +41,10 @@ These repositories are excluded from PR scanning and should be queried through s
 | `simveit/load_and_store` | [`source`](../source-guides/veitner-blog.md) | Blog companion code; use source guide and code paths directly. |
 | `moderngpu/moderngpu` | [`source`](../../../references/kernel-source-catalog.md) | Classic code archive; use source/catalog references directly. |
 | `huggingface/kernels` | [`source`](../../../references/kernel-source-catalog.md) | Reusable code/package repository; use source/catalog references directly. |
+| `triton-lang/triton` | [`source`](../source-guides/triton.md) | Only 7 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `Dao-AILab/quack` | [`source`](../source-guides/quack.md) | Only 9 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `HazyResearch/ThunderKittens` | [`source`](../source-guides/thunderkittens.md) | Only 6 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `Tencent/hpc-ops` | [`source`](../../../references/kernel-source-catalog.md) | Only 5 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
 
 ## Filter Policy
 

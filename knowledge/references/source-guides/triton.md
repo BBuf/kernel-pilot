@@ -2,7 +2,9 @@
 
 Repository: <https://github.com/triton-lang/triton>
 
-PR case notes: `../prs/triton.md`
+Source-only policy: do not query PR notes for this repository unless the PR
+corpus reaches at least 10 selected CUDA optimization PRs. Use this source
+guide, the source catalog, and current source paths directly.
 
 Use this when the user asks for Triton, the baseline is Triton or Inductor
 generated code, or the target framework's hot kernel is written in Triton.

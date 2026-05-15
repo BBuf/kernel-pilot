@@ -112,8 +112,9 @@ Before writing the plan or choosing any optimization direction:
    source guide paths, and direct source scans as the paired kernel-knowledge
    evidence layer. Do not query PRs for source-only repositories such as
    PyTorch, DeepSeek TileKernels, CUDA sample repos, blog/code companion repos,
-   puzzle repos, and source catalogs; inspect their source guide and current
-   code directly instead.
+   puzzle repos, source catalogs, and repositories with fewer than 10 selected
+   CUDA optimization PRs; inspect their source guide and current code directly
+   instead.
 8. PR pages keep filtered CUDA optimization PRs rather than a small curated
    top-N. Each entry must have CUDA/NVIDIA target evidence, a real kernel/source
    change, and an optimization/performance mechanism. Search both the PR page,
@@ -130,9 +131,10 @@ Before writing the plan or choosing any optimization direction:
 
 Pair production PRs with current source code, tests, and benchmarks before
 blogs or articles when the repository is PR-driven. For source-only repositories
-such as PyTorch and blog/code companion repos, skip PR lookup entirely and use
-source guides plus direct source scans. During plateau expansion, use merged
-repository PR pages plus matching source guides for PR-driven repos, then
+such as PyTorch, blog/code companion repos, and repositories with fewer than 10
+selected CUDA optimization PRs, skip PR lookup entirely and use source guides
+plus direct source scans. During plateau expansion, use merged repository PR
+pages plus matching source guides for PR-driven repos, then
 cross-repository by-topic PR pages plus relevant source guides, then the open PR
 watchlist plus current source scan, then blog/code references. External kernels
 may be used as baselines, starting candidates, or prior art when their

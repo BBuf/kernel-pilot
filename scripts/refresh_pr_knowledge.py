@@ -23,6 +23,7 @@ from typing import Any
 
 
 DEFAULT_SINCE = "2024-05-15"
+MIN_PR_DOC_SELECTED_COUNT = 10
 
 
 @dataclass(frozen=True)
@@ -702,6 +703,10 @@ SOURCE_ONLY_GUIDES: dict[str, str] = {
     "simveit-load-and-store": "../source-guides/veitner-blog.md",
     "moderngpu": "../../../references/kernel-source-catalog.md",
     "huggingface-kernels": "../../../references/kernel-source-catalog.md",
+    "triton": "../source-guides/triton.md",
+    "quack": "../source-guides/quack.md",
+    "thunderkittens": "../source-guides/thunderkittens.md",
+    "tencent-hpc-ops": "../../../references/kernel-source-catalog.md",
 }
 
 PR_REPOS: dict[str, RepoConfig] = {
@@ -1559,15 +1564,21 @@ def render_by_topic_pages(root: Path, repo_records: list[dict[str, Any]]) -> Non
     (topic_dir / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
 
-def remove_source_only_pr_pages(root: Path) -> None:
+def remove_source_only_pr_pages(root: Path, source_only_repos: dict[str, str]) -> None:
     pr_dir = root / "knowledge/references/prs"
-    for repo_id in SOURCE_ONLY_REPOS:
+    for repo_id in source_only_repos:
         path = pr_dir / f"{repo_id}.md"
         if path.exists():
             path.unlink()
 
 
-def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: list[dict[str, Any]], since: str) -> None:
+def render_index(
+    root: Path,
+    repo_records: list[dict[str, Any]],
+    open_watch: list[dict[str, Any]],
+    source_only_repos: dict[str, str],
+    since: str,
+) -> None:
     pr_dir = root / "knowledge/references/prs"
     idx: list[str] = []
     idx.append("# PR-Driven Kernel Knowledge\n")
@@ -1578,7 +1589,9 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     idx.append("1. Start with the target topic and framework routing pages.")
     idx.append("2. Read the matching source guide under `knowledge/references/source-guides/`.")
     idx.append("3. For PR-driven repositories listed below, also read the matching PR page in the same knowledge pass.")
-    idx.append("4. For source-only repositories, skip PR lookup and inspect the linked source guide or source catalog plus current code paths directly.")
+    idx.append(
+        f"4. For source-only repositories, including repositories with fewer than {MIN_PR_DOC_SELECTED_COUNT} selected CUDA optimization PRs, skip PR lookup and inspect the linked source guide or source catalog plus current code paths directly."
+    )
     idx.append("5. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.")
     idx.append("6. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.")
     idx.append("7. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.\n")
@@ -1595,7 +1608,7 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     )
     idx.append("| Repository | Source reference | Reason |")
     idx.append("| --- | --- | --- |")
-    for repo_id, reason in SOURCE_ONLY_REPOS.items():
+    for repo_id, reason in source_only_repos.items():
         cfg = REPOS[repo_id]
         guide = SOURCE_ONLY_GUIDES.get(repo_id, "../../../references/kernel-source-catalog.md")
         idx.append(f"| `{cfg.repo}` | [`source`]({guide}) | {reason} |")
@@ -1638,7 +1651,13 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     (pr_dir / "open-watchlist.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: list[dict[str, Any]], since: str) -> None:
+def render_audit(
+    root: Path,
+    repo_records: list[dict[str, Any]],
+    open_watch: list[dict[str, Any]],
+    source_only_repos: dict[str, str],
+    since: str,
+) -> None:
     pr_dir = root / "knowledge/references/prs"
     lines: list[str] = []
     lines.append("# PR Knowledge Coverage Audit\n")
@@ -1652,10 +1671,12 @@ def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
             f"| `{entry['repo']}` | {entry['candidate_pool_after_filter']} | {entry['selected_count']} | {open_counts.get(entry['repo'], 0)} |"
         )
     lines.append("\n## Source-Only Repositories\n")
-    lines.append("These repositories are excluded from PR scanning and should be queried through source guides or current source trees.\n")
+    lines.append(
+        f"These repositories are excluded from PR documents and should be queried through source guides or current source trees. Repositories with fewer than {MIN_PR_DOC_SELECTED_COUNT} selected CUDA optimization PRs are also folded into this source-only set.\n"
+    )
     lines.append("| Repository | Source reference | Reason |")
     lines.append("| --- | --- | --- |")
-    for repo_id, reason in SOURCE_ONLY_REPOS.items():
+    for repo_id, reason in source_only_repos.items():
         cfg = REPOS[repo_id]
         guide = SOURCE_ONLY_GUIDES.get(repo_id, "../../../references/kernel-source-catalog.md")
         lines.append(f"| `{cfg.repo}` | [`source`]({guide}) | {reason} |")
@@ -1750,9 +1771,10 @@ def main() -> int:
         }
         cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    remove_source_only_pr_pages(root)
+    remove_source_only_pr_pages(root, SOURCE_ONLY_REPOS)
     repo_records: list[dict[str, Any]] = []
     open_watch: list[dict[str, Any]] = []
+    dynamic_source_only_repos: dict[str, str] = {}
     for repo_id, cfg in PR_REPOS.items():
         pool = list(merged_by_repo.get(repo_id, {}).values())
         pool = [pr for pr in pool if keep_pr(pr)]
@@ -1765,6 +1787,12 @@ def main() -> int:
             pr["source_key"] = f"{cfg.repo}#{pr['number']}"
         pool.sort(key=lambda item: (item["_score"], item.get("mergedAt") or ""), reverse=True)
         selected = select_diverse(pool, cfg.target)
+        if len(selected) < MIN_PR_DOC_SELECTED_COUNT:
+            dynamic_source_only_repos[repo_id] = (
+                f"Only {len(selected)} selected CUDA optimization PRs after filtering "
+                f"(<{MIN_PR_DOC_SELECTED_COUNT}); use source guide and current source scan."
+            )
+            continue
         render_repo_page(root, repo_id, cfg, selected, len(pool), framework_paths.get(repo_id, []))
         repo_records.append(
             {
@@ -1791,6 +1819,18 @@ def main() -> int:
         open_pool.sort(key=lambda item: (item["_score"], item.get("updatedAt") or ""), reverse=True)
         open_watch.extend(open_pool)
 
+    source_only_repos = {**SOURCE_ONLY_REPOS, **dynamic_source_only_repos}
+    remove_source_only_pr_pages(root, source_only_repos)
+    if dynamic_source_only_repos and cache_path.exists():
+        cache = json.loads(cache_path.read_text())
+        cache_repos = cache.get("repositories", {})
+        filtered_cache_repos = {
+            repo_id: payload for repo_id, payload in cache_repos.items() if repo_id not in dynamic_source_only_repos
+        }
+        if filtered_cache_repos != cache_repos:
+            cache["repositories"] = filtered_cache_repos
+            cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
     out_json = {
         "schema_version": 3,
         "generated_from": "GitHub PR scan by kernel family plus prior PR notes; all filtered CUDA optimization PRs are kept for source/runtime/tuning relevance.",
@@ -1815,8 +1855,8 @@ def main() -> int:
     }
     (pr_dir / "pr-index.json").write_text(json.dumps(out_json, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     render_by_topic_pages(root, repo_records)
-    render_index(root, repo_records, open_watch, args.since)
-    render_audit(root, repo_records, open_watch, args.since)
+    render_index(root, repo_records, open_watch, source_only_repos, args.since)
+    render_audit(root, repo_records, open_watch, source_only_repos, args.since)
 
     for repo in repo_records:
         print(f"{repo['id']}: selected={repo['selected_count']} pool={repo['candidate_pool_after_filter']}")

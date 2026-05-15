@@ -7,7 +7,7 @@ This layer follows the kernel-knowledge design implied by MIT Kernel Mafia: prod
 1. Start with the target topic and framework routing pages.
 2. Read the matching source guide under `knowledge/references/source-guides/`.
 3. For PR-driven repositories listed below, also read the matching PR page in the same knowledge pass.
-4. For source-only repositories, skip PR lookup and inspect the linked source guide or source catalog plus current code paths directly.
+4. For source-only repositories, including repositories with fewer than 10 selected CUDA optimization PRs, skip PR lookup and inspect the linked source guide or source catalog plus current code paths directly.
 5. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.
 6. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.
 7. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.
@@ -23,12 +23,8 @@ This layer follows the kernel-knowledge design implied by MIT Kernel Mafia: prod
 | `deepseek-ai/DeepGEMM` | [`deepgemm.md`](deepgemm.md) | 20 | 20 |
 | `NVIDIA/TensorRT-LLM` | [`tensorrt-llm.md`](tensorrt-llm.md) | 121 | 121 |
 | `Dao-AILab/flash-attention` | [`flash-attention.md`](flash-attention.md) | 46 | 46 |
-| `triton-lang/triton` | [`triton.md`](triton.md) | 7 | 7 |
 | `tile-ai/tilelang` | [`tilelang.md`](tilelang.md) | 34 | 34 |
-| `Dao-AILab/quack` | [`quack.md`](quack.md) | 9 | 9 |
-| `HazyResearch/ThunderKittens` | [`thunderkittens.md`](thunderkittens.md) | 6 | 6 |
 | `NVIDIA/cccl` | [`cccl-cub.md`](cccl-cub.md) | 62 | 62 |
-| `Tencent/hpc-ops` | [`tencent-hpc-ops.md`](tencent-hpc-ops.md) | 5 | 5 |
 
 ## Source-Only Repositories
 
@@ -55,6 +51,10 @@ These repositories are intentionally not queried through PR pages. Use the linke
 | `simveit/load_and_store` | [`source`](../source-guides/veitner-blog.md) | Blog companion code; use source guide and code paths directly. |
 | `moderngpu/moderngpu` | [`source`](../../../references/kernel-source-catalog.md) | Classic code archive; use source/catalog references directly. |
 | `huggingface/kernels` | [`source`](../../../references/kernel-source-catalog.md) | Reusable code/package repository; use source/catalog references directly. |
+| `triton-lang/triton` | [`source`](../source-guides/triton.md) | Only 7 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `Dao-AILab/quack` | [`source`](../source-guides/quack.md) | Only 9 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `HazyResearch/ThunderKittens` | [`source`](../source-guides/thunderkittens.md) | Only 6 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
+| `Tencent/hpc-ops` | [`source`](../../../references/kernel-source-catalog.md) | Only 5 selected CUDA optimization PRs after filtering (<10); use source guide and current source scan. |
 
 ## Cross-Repository Topic Pages
 

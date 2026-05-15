@@ -71,22 +71,23 @@ and concrete code paths to inspect.
 | FlashInfer | `prs/flashinfer.md` |
 | CUTLASS / CuTe | `prs/cutlass.md` |
 | DeepGEMM | `prs/deepgemm.md` |
-| Triton | `prs/triton.md` |
 | TileLang | `prs/tilelang.md` |
-| QuACK | `prs/quack.md` |
-| ThunderKittens | `prs/thunderkittens.md` |
 | CCCL / CUB | `prs/cccl-cub.md` |
-| Tencent HPC Ops | `prs/tencent-hpc-ops.md` |
 
 ## Source-Only Deep References
 
-Do not query PRs for these sources. Read the source guide, source catalog, and
-current source tree directly.
+Do not query PRs for these sources. This also applies to repositories with fewer
+than 10 selected CUDA optimization PRs. Read the source guide, source catalog,
+and current source tree directly.
 
 | Source | Read |
 | --- | --- |
 | PyTorch | `source-guides/pytorch.md` |
 | DeepSeek TileKernels | `source-guides/tilekernels.md` |
+| Triton | `source-guides/triton.md` |
+| QuACK | `source-guides/quack.md` |
+| ThunderKittens | `source-guides/thunderkittens.md` |
+| Tencent HPC Ops | `../../references/kernel-source-catalog.md` |
 | CUDA samples, CUDA library samples, cuDNN frontend, NVBench, CUDA Tile, GPU Mode reference kernels, Triton Puzzles, ModernGPU, Hugging Face kernels | `../../references/kernel-source-catalog.md` |
 | NVIDIA blog code, Lei Mao GEMM, Simon Boehm SGEMM | `source-guides/cuda-blog-kernels.md` |
 | Veitner blog/code, simveit repositories | `source-guides/veitner-blog.md` |
