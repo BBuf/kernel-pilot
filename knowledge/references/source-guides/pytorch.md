@@ -2,7 +2,9 @@
 
 Repository: <https://github.com/pytorch/pytorch>
 
-PR case notes: `../prs/pytorch.md`
+Source-only policy: do not query PyTorch PR notes. PyTorch is too large/noisy
+for useful PR recall; inspect the source paths and current generated code
+directly.
 
 Use PyTorch as correctness oracle, semantic reference, broad-shape behavior
 reference, and sometimes the candidate-code source when the baseline is ATen,

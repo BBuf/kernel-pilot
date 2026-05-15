@@ -2,7 +2,9 @@
 
 Repository: <https://github.com/deepseek-ai/TileKernels>
 
-PR case notes: `../prs/tilekernels.md`
+Source-only policy: do not query PR notes for this repository. Public PR
+history is sparse; inspect `tile_kernels/`, `tests/`, and the current source
+tree directly.
 
 Use this when the target is a DeepSeek-style TileLang kernel, or when plateau
 research needs production TileLang ideas for MoE routing, quantization,

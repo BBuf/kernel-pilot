@@ -10,6 +10,9 @@ Primary code:
 Use this reference when the loop needs CUTLASS / CuTe implementation detail
 from articles with companion code.
 
+Source-only policy: do not query PR notes for these companion repositories.
+Inspect the source paths, article map, and current code directly.
+
 Article-level map: `../blogs/colfax.md`
 
 ## Read Order By Topic

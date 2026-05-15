@@ -106,28 +106,33 @@ Before writing the plan or choosing any optimization direction:
      `pytorch.md` as appropriate.
 6. Read the matching deep source guide under
    `knowledge/references/source-guides/`.
-7. Read the matching PR guide under `knowledge/references/prs/` in the same
-   knowledge pass. Treat PR diffs, changed kernel files, linked tests,
-   benchmark files, review-linked issues, source guide paths, and direct source
-   scans as the paired kernel-knowledge evidence layer. These pages keep all
-   filtered CUDA optimization PRs rather than a small curated top-N. Each entry
-   must have CUDA/NVIDIA target evidence, a real kernel/source change, and an
-   optimization/performance mechanism. Search both the PR page and source guide
-   for kernel family, dtype, architecture, backend, and bottleneck terms before
-   choosing an edit.
-8. If the bottleneck is known but the best source repository is unclear, read
+7. For PR-driven production repositories, read the matching PR guide under
+   `knowledge/references/prs/` in the same knowledge pass. Treat PR diffs,
+   changed kernel files, linked tests, benchmark files, review-linked issues,
+   source guide paths, and direct source scans as the paired kernel-knowledge
+   evidence layer. Do not query PRs for source-only repositories such as
+   PyTorch, DeepSeek TileKernels, CUDA sample repos, blog/code companion repos,
+   puzzle repos, and source catalogs; inspect their source guide and current
+   code directly instead.
+8. PR pages keep filtered CUDA optimization PRs rather than a small curated
+   top-N. Each entry must have CUDA/NVIDIA target evidence, a real kernel/source
+   change, and an optimization/performance mechanism. Search both the PR page,
+   when applicable, and source guide for kernel family, dtype, architecture,
+   backend, and bottleneck terms before choosing an edit.
+9. If the bottleneck is known but the best source repository is unclear, read
    `knowledge/references/prs/by-topic/index.md` and the matching topic page.
-9. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
+10. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
    ideas, and re-check linked GitHub PRs before using code or benchmark claims.
-10. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
-11. For plateau research or blog-driven source ideas, read
+11. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
+12. For plateau research or blog-driven source ideas, read
    `knowledge/references/blogs/index.md` and the matching blog page before
    opening companion code.
 
 Pair production PRs with current source code, tests, and benchmarks before
-blogs or articles. Source guides are not a fallback after PR miss; the knowledge
-pass must inspect PR evidence and source evidence together. During plateau
-expansion, use merged repository PR pages plus matching source guides, then
+blogs or articles when the repository is PR-driven. For source-only repositories
+such as PyTorch and blog/code companion repos, skip PR lookup entirely and use
+source guides plus direct source scans. During plateau expansion, use merged
+repository PR pages plus matching source guides for PR-driven repos, then
 cross-repository by-topic PR pages plus relevant source guides, then the open PR
 watchlist plus current source scan, then blog/code references. External kernels
 may be used as baselines, starting candidates, or prior art when their

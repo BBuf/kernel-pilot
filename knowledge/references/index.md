@@ -20,7 +20,7 @@ specifics:
 | Nsight Compute / Nsight Systems evidence | `ako4all/profiling-debugging-reference.md` |
 | Hopper H100 tuning | `ako4all/nvidia-architecture-reference.md`, `ako4all/architectures/sm90-optimization-guide.md` |
 | Kernel templates and debugging | `ako4all/kernel-templates.md`, `ako4all/troubleshooting.md` |
-| Paired PR/source production case notes | `prs/index.md`, `prs/pr-index.json`, `source-guides/` |
+| PR/source production case notes | `prs/index.md`, `prs/pr-index.json`, `source-guides/` |
 | Cross-repository PR lookup by kernel family | `prs/by-topic/index.md` |
 | Current open PR watchlist | `prs/open-watchlist.md` |
 | Blog-to-code source maps | `blogs/index.md` |
@@ -54,19 +54,19 @@ source collection:
 | Colfax Research blog and code | `source-guides/colfax-research.md` |
 | CUDA blog companion kernels | `source-guides/cuda-blog-kernels.md` |
 
-## Paired PR + Source Deep References
+## PR-Driven Deep References
 
-Read the matching PR guide and source guide together when a repository matches
-the target kernel or when the loop enters plateau-driven research. PRs explain
-optimization history, review context, tests, and benchmark evidence; source
-guides show the current implementation and concrete code paths to inspect.
+For these repositories, read the matching PR guide and source guide together
+when a repository matches the target kernel or when the loop enters
+plateau-driven research. PRs explain optimization history, review context,
+tests, and benchmark evidence; source guides show the current implementation
+and concrete code paths to inspect.
 
 | Source | PR guide |
 | --- | --- |
 | SGLang | `prs/sglang.md` |
 | vLLM | `prs/vllm.md` |
 | TensorRT-LLM | `prs/tensorrt-llm.md` |
-| PyTorch | `prs/pytorch.md` |
 | FlashAttention | `prs/flash-attention.md` |
 | FlashInfer | `prs/flashinfer.md` |
 | CUTLASS / CuTe | `prs/cutlass.md` |
@@ -74,9 +74,23 @@ guides show the current implementation and concrete code paths to inspect.
 | Triton | `prs/triton.md` |
 | TileLang | `prs/tilelang.md` |
 | QuACK | `prs/quack.md` |
-| DeepSeek TileKernels | `prs/tilekernels.md` |
 | ThunderKittens | `prs/thunderkittens.md` |
 | CCCL / CUB | `prs/cccl-cub.md` |
+| Tencent HPC Ops | `prs/tencent-hpc-ops.md` |
+
+## Source-Only Deep References
+
+Do not query PRs for these sources. Read the source guide, source catalog, and
+current source tree directly.
+
+| Source | Read |
+| --- | --- |
+| PyTorch | `source-guides/pytorch.md` |
+| DeepSeek TileKernels | `source-guides/tilekernels.md` |
+| CUDA samples, CUDA library samples, cuDNN frontend, NVBench, CUDA Tile, GPU Mode reference kernels, Triton Puzzles, ModernGPU, Hugging Face kernels | `../../references/kernel-source-catalog.md` |
+| NVIDIA blog code, Lei Mao GEMM, Simon Boehm SGEMM | `source-guides/cuda-blog-kernels.md` |
+| Veitner blog/code, simveit repositories | `source-guides/veitner-blog.md` |
+| Colfax article source and CUTLASS kernels | `source-guides/colfax-research.md` |
 
 If the bottleneck is known but the best source repository is unclear, start from
 `prs/by-topic/index.md`, then open the matching source guide for every promising
@@ -104,11 +118,13 @@ should come from a companion repo or standalone candidate:
 
 ## Use Rules
 
-- Prefer paired production PRs and source code, tests, benchmarks, and open
-  PRs/issues before docs or blogs.
+- Prefer PR/source evidence for PR-driven repos and source-only evidence for
+  source-only repos before docs or blogs.
 - During plateau research, inspect repository PR pages together with matching
-  source guides, then by-topic PR pages together with relevant source guides,
-  then open PR watchlist plus current source scan, then blog/code references.
+  source guides for PR-driven repos. For source-only repos, inspect current
+  source files, symbols, tests, and benchmarks directly. Then use by-topic PR
+  pages plus relevant source guides, open PR watchlist plus current source scan,
+  then blog/code references.
 - Use the user-requested candidate stack, or the active baseline kernel's stack
   when unspecified.
 - Baseline kernels may seed candidates in the standalone repo when

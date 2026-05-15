@@ -3,7 +3,9 @@
 
 This script uses the GitHub CLI to collect merged and open pull requests from
 kernel-heavy repositories, filters out release/CI/backend noise, and regenerates
-human-readable PR notes plus machine-readable metadata.
+human-readable PR notes plus machine-readable metadata. Huge monorepos and
+blog/code companion repositories are source-only: the knowledge loop reads their
+source guides and current code instead of PR pages.
 """
 
 from __future__ import annotations
@@ -656,6 +658,54 @@ REPOS: dict[str, RepoConfig] = {
             "rope",
         ),
     ),
+}
+
+SOURCE_ONLY_REPOS: dict[str, str] = {
+    "pytorch": "PyTorch is too large/noisy for useful PR recall; use source guide and current source scan.",
+    "tilekernels": "Little public PR history; use source guide and current source scan.",
+    "cuda-samples": "Sample/code repository; PR history is not the optimization knowledge layer.",
+    "cuda-library-samples": "Sample/code repository; PR history is not the optimization knowledge layer.",
+    "cudnn-frontend": "Sample/API repository; use source/catalog references directly.",
+    "nvbench": "Benchmark methodology repository; use source/catalog references directly.",
+    "cuda-tile": "Experimental source repository; use source/catalog references directly.",
+    "gpu-mode-reference-kernels": "Reference-kernel repository; use source/catalog references directly.",
+    "gpu-mode-kernelbot": "Competition/tooling repository; use source/catalog references directly.",
+    "triton-puzzles": "Educational code repository; use source/catalog references directly.",
+    "nvidia-blog-code-samples": "Blog companion code; use source guide and code paths directly.",
+    "leimao-cuda-gemm": "Blog/worklog companion code; use source guide and code paths directly.",
+    "siboehm-sgemm": "Blog/worklog companion code; use source guide and code paths directly.",
+    "colfax-cutlass-kernels": "Blog/tutorial companion code; use source guide and code paths directly.",
+    "colfax-article-src": "Blog/tutorial companion code; use source guide and code paths directly.",
+    "simveit-effective-transpose": "Blog companion code; use source guide and code paths directly.",
+    "simveit-load-and-store": "Blog companion code; use source guide and code paths directly.",
+    "moderngpu": "Classic code archive; use source/catalog references directly.",
+    "huggingface-kernels": "Reusable code/package repository; use source/catalog references directly.",
+}
+
+SOURCE_ONLY_GUIDES: dict[str, str] = {
+    "pytorch": "../source-guides/pytorch.md",
+    "tilekernels": "../source-guides/tilekernels.md",
+    "cuda-samples": "../source-guides/cuda-blog-kernels.md",
+    "cuda-library-samples": "../../../references/kernel-source-catalog.md",
+    "cudnn-frontend": "../../../references/kernel-source-catalog.md",
+    "nvbench": "../../../references/kernel-source-catalog.md",
+    "cuda-tile": "../../../references/kernel-source-catalog.md",
+    "gpu-mode-reference-kernels": "../../../references/kernel-source-catalog.md",
+    "gpu-mode-kernelbot": "../../../references/kernel-source-catalog.md",
+    "triton-puzzles": "../../../references/kernel-source-catalog.md",
+    "nvidia-blog-code-samples": "../source-guides/cuda-blog-kernels.md",
+    "leimao-cuda-gemm": "../source-guides/cuda-blog-kernels.md",
+    "siboehm-sgemm": "../source-guides/cuda-blog-kernels.md",
+    "colfax-cutlass-kernels": "../source-guides/colfax-research.md",
+    "colfax-article-src": "../source-guides/colfax-research.md",
+    "simveit-effective-transpose": "../source-guides/veitner-blog.md",
+    "simveit-load-and-store": "../source-guides/veitner-blog.md",
+    "moderngpu": "../../../references/kernel-source-catalog.md",
+    "huggingface-kernels": "../../../references/kernel-source-catalog.md",
+}
+
+PR_REPOS: dict[str, RepoConfig] = {
+    repo_id: cfg for repo_id, cfg in REPOS.items() if repo_id not in SOURCE_ONLY_REPOS
 }
 
 
@@ -1509,6 +1559,14 @@ def render_by_topic_pages(root: Path, repo_records: list[dict[str, Any]]) -> Non
     (topic_dir / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
 
+def remove_source_only_pr_pages(root: Path) -> None:
+    pr_dir = root / "knowledge/references/prs"
+    for repo_id in SOURCE_ONLY_REPOS:
+        path = pr_dir / f"{repo_id}.md"
+        if path.exists():
+            path.unlink()
+
+
 def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: list[dict[str, Any]], since: str) -> None:
     pr_dir = root / "knowledge/references/prs"
     idx: list[str] = []
@@ -1516,12 +1574,14 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     idx.append(
         "This layer follows the kernel-knowledge design implied by MIT Kernel Mafia: production pull requests are treated as first-class evidence because many real optimization recipes live in PR diffs, review threads, tests, benchmarks, and follow-up fixes rather than in official documentation.\n"
     )
-    idx.append("## Paired PR + Source Read Order\n")
+    idx.append("## PR/Source Read Order\n")
     idx.append("1. Start with the target topic and framework routing pages.")
-    idx.append("2. Read the matching source guide under `knowledge/references/source-guides/` and the matching PR page below in the same knowledge pass.")
-    idx.append("3. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.")
-    idx.append("4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.")
-    idx.append("5. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.\n")
+    idx.append("2. Read the matching source guide under `knowledge/references/source-guides/`.")
+    idx.append("3. For PR-driven repositories listed below, also read the matching PR page in the same knowledge pass.")
+    idx.append("4. For source-only repositories, skip PR lookup and inspect the linked source guide or source catalog plus current code paths directly.")
+    idx.append("5. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.")
+    idx.append("6. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.")
+    idx.append("7. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.\n")
     idx.append("## Repository PR Pages\n")
     idx.append("| Repository | PR guide | CUDA optimization PRs | Filtered pool |")
     idx.append("| --- | --- | ---: | ---: |")
@@ -1529,6 +1589,16 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
         idx.append(
             f"| `{repo_entry['repo']}` | [`{repo_entry['id']}.md`]({repo_entry['id']}.md) | {repo_entry['selected_count']} | {repo_entry['candidate_pool_after_filter']} |"
         )
+    idx.append("\n## Source-Only Repositories\n")
+    idx.append(
+        "These repositories are intentionally not queried through PR pages. Use the linked source guide or source catalog, then inspect current code paths directly.\n"
+    )
+    idx.append("| Repository | Source reference | Reason |")
+    idx.append("| --- | --- | --- |")
+    for repo_id, reason in SOURCE_ONLY_REPOS.items():
+        cfg = REPOS[repo_id]
+        guide = SOURCE_ONLY_GUIDES.get(repo_id, "../../../references/kernel-source-catalog.md")
+        idx.append(f"| `{cfg.repo}` | [`source`]({guide}) | {reason} |")
     idx.append("\n## Cross-Repository Topic Pages\n")
     idx.append("Use [`by-topic/index.md`](by-topic/index.md) to inspect PRs by kernel family across all repositories.\n")
     idx.append("## Coverage Audit\n")
@@ -1581,6 +1651,14 @@ def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
         lines.append(
             f"| `{entry['repo']}` | {entry['candidate_pool_after_filter']} | {entry['selected_count']} | {open_counts.get(entry['repo'], 0)} |"
         )
+    lines.append("\n## Source-Only Repositories\n")
+    lines.append("These repositories are excluded from PR scanning and should be queried through source guides or current source trees.\n")
+    lines.append("| Repository | Source reference | Reason |")
+    lines.append("| --- | --- | --- |")
+    for repo_id, reason in SOURCE_ONLY_REPOS.items():
+        cfg = REPOS[repo_id]
+        guide = SOURCE_ONLY_GUIDES.get(repo_id, "../../../references/kernel-source-catalog.md")
+        lines.append(f"| `{cfg.repo}` | [`source`]({guide}) | {reason} |")
     lines.append("\n## Filter Policy\n")
     lines.append("- Keep PRs only when they have CUDA/NVIDIA target evidence, a real kernel/source change, and an optimization/performance mechanism.")
     lines.append("- Keep CUDA optimization PRs across the registered knowledge repositories, including implementation, runtime dispatch, tuning, benchmark-backed speed work, profiler evidence, and kernel-family feature additions.")
@@ -1595,10 +1673,11 @@ def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     lines.append("- Transfer recipe and first NCU metrics to inspect.")
     lines.append("- Matched search queries in `pr-index.json` for traceability.\n")
     lines.append("## Retrieval Strategy\n")
-    lines.append("1. Use the repository PR page and the matching source guide together when the baseline framework is known.")
-    lines.append("2. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not, then open source guides for every promising repository.")
-    lines.append("3. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub plus the current source tree before trusting the code or benchmark claim.")
-    lines.append("4. Log every source-derived idea in `artifacts/source-idea-ledger.md` with PR key when available, source path or symbol, opened tests/benchmarks, hypothesis, result, and do-not-reread key.\n")
+    lines.append("1. Use the repository PR page and the matching source guide together when the baseline framework is PR-driven.")
+    lines.append("2. For source-only repositories, skip PR lookup and use the source guide or source catalog plus current source tree.")
+    lines.append("3. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not, then open source guides for every promising repository.")
+    lines.append("4. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub plus the current source tree before trusting the code or benchmark claim.")
+    lines.append("5. Log every source-derived idea in `artifacts/source-idea-ledger.md` with PR key when available, source path or symbol, opened tests/benchmarks, hypothesis, result, and do-not-reread key.\n")
     lines.append("## Known Gaps\n")
     lines.append("- DeepSeek TileKernels has little public PR history, so source-guide and direct code scan are mandatory paired evidence for that repo.")
     lines.append("- GitHub search can miss PRs whose titles and bodies use generic wording. When optimizing a specific kernel, still run path-based `gh pr list` or `gh search prs` for that exact file/function name and inspect current source paths.")
@@ -1630,19 +1709,26 @@ def main() -> int:
 
     if args.use_cache and cache_path.exists():
         cache = json.loads(cache_path.read_text())
+        cache_repos = cache.get("repositories", {})
+        filtered_cache_repos = {
+            repo_id: payload for repo_id, payload in cache_repos.items() if repo_id in PR_REPOS
+        }
+        if filtered_cache_repos != cache_repos:
+            cache["repositories"] = filtered_cache_repos
+            cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         merged_by_repo = {
             repo_id: {int(pr["number"]): pr for pr in payload.get("merged", [])}
-            for repo_id, payload in cache.get("repositories", {}).items()
+            for repo_id, payload in filtered_cache_repos.items()
         }
         open_by_repo = {
             repo_id: {int(pr["number"]): pr for pr in payload.get("open", [])}
-            for repo_id, payload in cache.get("repositories", {}).items()
+            for repo_id, payload in filtered_cache_repos.items()
         }
     else:
         merged_by_repo: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
         open_by_repo: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
         merge_prior(merged_by_repo, root)
-        for repo_id, cfg in REPOS.items():
+        for repo_id, cfg in PR_REPOS.items():
             print(f"== scanning merged {cfg.repo}", file=sys.stderr)
             for pr in fetch_prs(repo_id, cfg, "merged", args.since, args.limit_per_query):
                 merged_by_repo[repo_id][pr["number"]] = pr
@@ -1655,18 +1741,19 @@ def main() -> int:
             "scan_since": args.since,
             "repositories": {
                 repo_id: {
-                    "repo": REPOS[repo_id].repo,
+                    "repo": PR_REPOS[repo_id].repo,
                     "merged": list(merged_by_repo.get(repo_id, {}).values()),
                     "open": list(open_by_repo.get(repo_id, {}).values()),
                 }
-                for repo_id in REPOS
+                for repo_id in PR_REPOS
             },
         }
         cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    remove_source_only_pr_pages(root)
     repo_records: list[dict[str, Any]] = []
     open_watch: list[dict[str, Any]] = []
-    for repo_id, cfg in REPOS.items():
+    for repo_id, cfg in PR_REPOS.items():
         pool = list(merged_by_repo.get(repo_id, {}).values())
         pool = [pr for pr in pool if keep_pr(pr)]
         for pr in pool:

@@ -11,6 +11,9 @@ Primary code:
 Use this reference when the optimization loop needs practical Hopper /
 Blackwell examples that explain both the idea and a small implementation.
 
+Source-only policy: do not query PR notes for these companion repositories.
+Inspect the source paths, article map, gists, and current code directly.
+
 Article-level map: `../blogs/veitner.md`
 
 ## Read Order By Topic

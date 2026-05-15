@@ -4,6 +4,9 @@ Use this when plateau research needs classic CUDA optimization examples with
 both prose and code. Prefer these for memory coalescing, shared-memory bank
 conflicts, reductions, transpose, and stepwise GEMM reasoning.
 
+Source-only policy: do not query PR notes for these companion repositories.
+Inspect the source paths, blog map, and current code directly.
+
 ## Primary Sources
 
 | Source | Use for |
