@@ -39,8 +39,8 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 | Signal | What makes it useful |
 | --- | --- |
 | **Humanize Kernel Agent Loop** | One Codex skill handles planning, refinement, standalone repo setup, RLCR startup, benchmark/profile iteration, and review-gated progress. |
-| **2840 CUDA-kernel PRs** | Production PR knowledge from SGLang, vLLM, TensorRT-LLM, PyTorch, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, Triton, TileLang, QuACK, ThunderKittens, CCCL/CUB, and more. |
-| **1079 open PR watchlist entries** | Fresh kernel ideas are tracked separately from merged evidence, so agents can explore current work without confusing it with production truth. |
+| **645 CUDA optimization PRs** | Production PR knowledge from SGLang, vLLM, TensorRT-LLM, PyTorch, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, Triton, TileLang, QuACK, ThunderKittens, CCCL/CUB, and more. |
+| **325 open PR watchlist entries** | Fresh CUDA optimization ideas are tracked separately from merged evidence, so agents can explore current work without confusing it with production truth. |
 | **Code-first knowledge routing** | Topic pages, source guides, PR notes, blog-to-code maps, and AKO4ALL references tell the agent what to read before choosing an optimization direction. |
 | **Nsight Compute feedback loop** | `profile-evidence` converts NCU metrics into bottleneck classifications, regression explanations, and one concrete next edit. |
 | **Clean standalone repos** | Candidate kernels live in isolated repos with their own bindings, tests, benchmarks, ledgers, lineage, and artifacts. |
@@ -51,7 +51,7 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 | Goal | Start here |
 | --- | --- |
 | Run an end-to-end autonomous kernel optimization loop in Codex | [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) |
-| Route an agent through CUDA/kernel PR knowledge before editing | [`kernel-knowledge`](skills/kernel-knowledge/) |
+| Route an agent through CUDA optimization PR knowledge before editing | [`kernel-knowledge`](skills/kernel-knowledge/) |
 | Turn NCU reports into concrete next kernel edits | [`profile-evidence`](skills/profile-evidence/) |
 | Inspect the PR-driven kernel corpus by framework | [`knowledge/references/prs/`](knowledge/references/prs/) |
 | Inspect kernel ideas by bottleneck family | [`knowledge/references/prs/by-topic/`](knowledge/references/prs/by-topic/) |
@@ -104,8 +104,8 @@ Codex shows **`Permissions updated to Full Access`**.
 ## Knowledge Base
 
 `kernel-knowledge` includes copied AKO4ALL CUDA/CUTLASS/NCU references plus a
-PR-driven production knowledge layer. The current scan covers 32 CUDA-kernel
-sources, including SGLang, vLLM, TensorRT-LLM, PyTorch, FlashAttention,
+PR-driven production knowledge layer. The current scan covers 32 CUDA
+optimization sources, including SGLang, vLLM, TensorRT-LLM, PyTorch, FlashAttention,
 FlashInfer, CUTLASS/CuTe, DeepGEMM, Triton, TileLang, QuACK, DeepSeek
 TileKernels, ThunderKittens, CCCL/CUB, CUDA samples, CUDA library samples,
 cuDNN frontend, NVBench, GPU Mode reference kernels and KernelBot, NVIDIA
@@ -119,7 +119,7 @@ The knowledge layout is split into:
 - `knowledge/references/source-guides/` for code maps
 - `knowledge/references/blogs/` for article-to-code maps
 
-The PR layer keeps all filtered CUDA-kernel PRs, not a small curated top-N. It
+The PR layer keeps all filtered CUDA optimization PRs, not a small curated top-N. It
 also has cross-repository topic pages and an open PR watchlist.
 
 Refresh it with:

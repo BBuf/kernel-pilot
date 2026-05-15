@@ -2,26 +2,16 @@
 
 Repository: <https://github.com/siboehm/SGEMM_CUDA>
 
-This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.
+This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
 ## Repository Source Scan
 
 ## Coverage Summary
 
-| Category | CUDA-kernel PRs |
+| Category | CUDA optimization PRs |
 | --- | ---: |
-| GEMM / Quantization | 1 |
 
 ## Pull Request Case Notes
-
-### GEMM / Quantization
-
-Use this section for: Inspect scale layout, accumulator type, tile/schedule choice, epilogue fusion, and partial-tile guards before deriving a candidate.
-NCU first look: Tensor pipe %, DRAM/L2 bytes, active cycles, register pressure, and scale-load traffic.
-
-| PR | Merged | Signals | What changed | Evidence paths | Transfer note |
-| --- | --- | --- | --- | --- | --- |
-| [#20](https://github.com/siboehm/SGEMM_CUDA/pull/20) Fix verification bug | 2025-09-02 | gemm_quant | First of all, thank you for this amazing resource! I have been reconstructing various kernels while learning from your blog and this repository. At one point, one of my kernels had unusually high GFLOPS which really perplexed me. It took me a while before I discovered I had a bug in my verification... | other: `src/runner.cu` | Inspect scale layout, accumulator type, tile/schedule choice, epilogue fusion, and partial-tile guards before deriving a candidate. |
 
 ## Per-PR Ledger Fields
 

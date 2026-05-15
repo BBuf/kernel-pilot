@@ -2,13 +2,13 @@
 
 Repository: <https://github.com/simveit/load_and_store>
 
-This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.
+This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
 ## Repository Source Scan
 
 ## Coverage Summary
 
-| Category | CUDA-kernel PRs |
+| Category | CUDA optimization PRs |
 | --- | ---: |
 
 ## Pull Request Case Notes

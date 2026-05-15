@@ -2,15 +2,15 @@
 
 Repository: <https://github.com/leimao/CUDA-GEMM-Optimization>
 
-This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.
+This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
 ## Repository Source Scan
 
 ## Coverage Summary
 
-| Category | CUDA-kernel PRs |
+| Category | CUDA optimization PRs |
 | --- | ---: |
-| GEMM / Quantization | 2 |
+| GEMM / Quantization | 1 |
 
 ## Pull Request Case Notes
 
@@ -21,8 +21,7 @@ NCU first look: Tensor pipe %, DRAM/L2 bytes, active cycles, register pressure, 
 
 | PR | Merged | Signals | What changed | Evidence paths | Transfer note |
 | --- | --- | --- | --- | --- | --- |
-| [#4](https://github.com/leimao/CUDA-GEMM-Optimization/pull/4) Add FP16 GEMM | 2023-12-29 | gemm_quant, memory_primitives, arch_pipeline, benchmark_test | Add FP16 GEMM | kernel: `backup/gemm.cu`, `include/cuda_gemm.hpp`, `include/cuda_gemm_utils.cuh`<br>benchmark: `examples/profile_cuda_gemm.cu`, `include/profile_utils.cuh`, `src/profile_cuda_gemm_fp16.cu`, `src/profile_cuda_gemm_fp32.cu`<br>docs: `README.md`, `backup/README.md`, `examples/README.md`<br>other: `backup/.gitignore`, `docker/gemm-cuda.Dockerfile`, `examples/CMakeLists.txt`, `src/02_2d_block_tiling.cu` | Inspect scale layout, accumulator type, tile/schedule choice, epilogue fusion, and partial-tile guards before deriving a candidate. |
-| [#6](https://github.com/leimao/CUDA-GEMM-Optimization/pull/6) Improve WMMA GEMM | 2024-07-19 | gemm_quant, benchmark_test, memory_primitives, arch_pipeline | * Fixed a synchronization bug. * Created a few device helper functions. * Slightly improve the WMMA GEMM Performance. | kernel: `include/cuda_gemm.hpp`, `include/cuda_gemm_utils.cuh`<br>benchmark: `include/profile_utils.cuh`, `src/profile_cuda_gemm_fp16.cu`, `src/profile_cuda_gemm_fp32.cu`<br>docs: `README.md`<br>other: `CMakeLists.txt`, `docker/gemm-cuda.Dockerfile`, `src/02_2d_block_tiling.cu`, `src/02_2d_block_tiling_vectorized_memory_access.cu` | Inspect scale layout, accumulator type, tile/schedule choice, epilogue fusion, and partial-tile guards before deriving a candidate. |
+| [#6](https://github.com/leimao/CUDA-GEMM-Optimization/pull/6) Improve WMMA GEMM | 2024-07-19 | gemm_quant, benchmark_test, memory_primitives, arch_pipeline | * Fixed a synchronization bug. * Created a few device helper functions. * Slightly improve the WMMA GEMM Performance. | kernel: `include/cuda_gemm.hpp`, `include/cuda_gemm_utils.cuh`, `src/05_2d_block_tiling_2d_thread_tiling_matrix_transpose.cu`, `src/05_2d_block_tiling_2d_thread_tiling_matrix_transpose_vectorized_memory_access.cu`<br>benchmark: `include/profile_utils.cuh`, `src/profile_cuda_gemm_fp16.cu`, `src/profile_cuda_gemm_fp32.cu`<br>docs: `README.md`<br>other: `CMakeLists.txt`, `docker/gemm-cuda.Dockerfile`, `src/02_2d_block_tiling.cu`, `src/02_2d_block_tiling_vectorized_memory_access.cu` | Inspect scale layout, accumulator type, tile/schedule choice, epilogue fusion, and partial-tile guards before deriving a candidate. |
 
 ## Per-PR Ledger Fields
 

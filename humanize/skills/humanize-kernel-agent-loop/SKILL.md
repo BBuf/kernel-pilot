@@ -107,9 +107,11 @@ Before writing the plan or choosing any optimization direction:
 6. Read the matching PR guide under `knowledge/references/prs/`. Treat PR
    diffs, changed kernel files, linked tests, benchmark files, and review-linked
    issues as the primary kernel-knowledge evidence layer. These pages keep all
-   filtered CUDA-kernel PRs rather than a small curated top-N, so search the full
-   relevant page for kernel family, dtype, architecture, backend, and bottleneck
-   terms before choosing an edit.
+   filtered CUDA optimization PRs rather than a small curated top-N. Each entry
+   must have CUDA/NVIDIA target evidence, a real kernel/source change, and an
+   optimization/performance mechanism, so search the full relevant page for
+   kernel family, dtype, architecture, backend, and bottleneck terms before
+   choosing an edit.
 7. If the bottleneck is known but the best source repository is unclear, read
    `knowledge/references/prs/by-topic/index.md` and the matching topic page.
 8. Read `knowledge/references/prs/open-watchlist.md` only for volatile current

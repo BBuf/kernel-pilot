@@ -43,8 +43,10 @@ Before writing a plan or choosing a kernel edit:
 6. Read the matching PR guide under `knowledge/references/prs/` before prose
    references. Each PR entry records what changed, where it came from, changed
    paths, and the optimization recipe to test. The PR pages keep all filtered
-   CUDA-kernel PRs, not a curated top-N; search the full relevant page for the
-   kernel family, dtype, backend, architecture, and bottleneck terms.
+   CUDA optimization PRs, not a curated top-N; each entry must have CUDA/NVIDIA
+   target evidence, a real kernel/source change, and an optimization/performance
+   mechanism. Search the full relevant page for the kernel family, dtype,
+   backend, architecture, and bottleneck terms.
 7. If the bottleneck is known but the best source repository is unclear, read
    `knowledge/references/prs/by-topic/index.md` and the matching topic page.
 8. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
@@ -73,7 +75,7 @@ Before writing a plan or choosing a kernel edit:
 
 - Prefer production PRs, code, tests, benchmarks, and open PRs/issues before
   blogs or articles.
-- Treat `knowledge/references/prs/` as the primary corpus for CUDA-kernel
+- Treat `knowledge/references/prs/` as the primary corpus for CUDA optimization
   optimization ideas. Use source guides and blogs to explain or extend PR/code
   evidence, not as the first stop.
 - Read order during plateau expansion is: merged repository PR pages,

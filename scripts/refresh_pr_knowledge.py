@@ -894,6 +894,13 @@ CATEGORY_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 CATEGORY_ORDER = tuple(CATEGORY_PROFILES)
+PR_REFERENCE_ONLY_REPOS = {
+    # These repositories are useful source/profiling references, but their PRs
+    # mostly change tooling or service infrastructure rather than concrete CUDA
+    # kernel optimizations.
+    "nvbench",
+    "gpu-mode-kernelbot",
+}
 
 SOURCE_FILE_RE = re.compile(
     r"(\.(cu|cuh|c|cc|cpp|cxx|h|hpp|inl|py)$|csrc/|sgl-kernel/|jit_kernel/|aten/src/|torch/_inductor/|"
@@ -924,7 +931,8 @@ REJECT_TITLE_RE = re.compile(
     r"cookbook image|\bcookbook\b|ci:|\[ci\]|bump ci|nightly migration|"
     r"conditional split|split .*stage|migrate .*test/registered|pytest exit code|"
     r"release-whl|release-docker|\bMPS\b|\bROCm\b|\bAMD\b|\bMUSA\b|"
-    r"\bAscend\b|\bXPU\b|\bSYCL\b|\boneAPI\b|\bIntel\b|\bCPU\b|\bHIP_VERSION\b|"
+    r"\bAscend\b|\bNPU\b|\bXPU\b|\bSYCL\b|\boneAPI\b|\bIntel\b|\bCPU\b|\bHIP_VERSION\b|"
+    r"\bMLX\b|\bAITER\b|\bDNNL\b|\bAVX2\b|"
     r"\bMetal\b|\bRVV\b|\bRISC\b|\briscv\b|"
     r"\bWindows\b|benchmark\] skip|skip .*benchmark|"
     r"SPDX|copyright header|copyright headers|\bMyPy\b|mypy|"
@@ -935,7 +943,8 @@ REJECT_TITLE_RE = re.compile(
     re.I,
 )
 BACKEND_NOISE_RE = re.compile(
-    r"\b(MPS|ROCm|AMD|MUSA|Ascend|XPU|SYCL|oneAPI|Intel|CPU|Metal|RVV|RISC-V|riscv|HIP)\b",
+    r"\b(MPS|ROCm|AMD|MUSA|Ascend|NPU|XPU|SYCL|oneAPI|Intel|CPU|Metal|RVV|"
+    r"RISC-V|riscv|HIP|MLX|Apple|AITER|DNNL|AVX2|MI\d{3,4}X?)\b",
     re.I,
 )
 INFRA_NOISE_RE = re.compile(
@@ -947,11 +956,62 @@ INFRA_NOISE_RE = re.compile(
     r"unused param|memory leak|check_cuda|rst to mdx|minor edits)",
     re.I,
 )
-STRONG_KERNEL_OPT_RE = re.compile(
-    r"(optimi[sz]e|optimization|speedup|faster|perf|performance|benchmark|profile|ncu|"
-    r"gemm|matmul|attention|moe|norm|topk|reduce|scan|sort|transpose|"
-    r"fp8|fp4|int8|mxfp4|nvfp4|sm90|sm100|sm120|hopper|blackwell|"
-    r"wgmma|tma|tcgen|shared memory|coalesc|tensor core)",
+PERF_ACTION_RE = re.compile(
+    r"(optimi[sz]e|optimization|speedup|faster|\bperf\b|performance|benchmark|profile|ncu|"
+    r"nsight|latency|throughput|bandwidth|dram|occupancy|tune|autotune|heuristic|"
+    r"scheduler|persistent|stream-?k|split-?k|pipeline|prefetch|fusion|fuse|fused|"
+    r"vectori[sz]|coalesc|shared memory|tensor core|warmup|dispatch|selection|"
+    r"low latency|fast path|microbenchmark|blockwise|groupwise|blockscaled|parallelization)",
+    re.I,
+)
+KERNEL_FAMILY_RE = re.compile(
+    r"(gemm|matmul|attention|mla|moe|router|routing|norm|rmsnorm|layernorm|topk|top-k|"
+    r"sampling|reduce|reduction|scan|sort|transpose|quant|dequant|epilogue|softmax|"
+    r"mamba|selective[_ -]?state|allreduce|all-reduce|coalesc|bank conflict|gups|"
+    r"copy|memcpy|d2d|kv|kvcache|gqa|decode|prefill|paged)",
+    re.I,
+)
+KERNEL_SPECIALIZATION_RE = re.compile(
+    r"(fp8|fp4|mxfp4|nvfp4|int8|int4|w4a|w8a|sm90|sm100|sm120|sm12x|hopper|"
+    r"blackwell|b200|h100|h200|gb200|tma|wgmma|mma|tcgen|cute|cutlass|triton|"
+    r"tilelang|deepgemm|flashinfer|flashmla|marlin|machete)",
+    re.I,
+)
+KERNEL_ACTION_RE = re.compile(
+    r"(add|support|implement|enable|port|migrate|replace|select|route|tune|"
+    r"speciali[sz]e|integrate|use|default|switch)",
+    re.I,
+)
+NOISE_TITLE_RE = re.compile(
+    r"(pytest|unit tests?|test-only|tests? path|ci\b|nightly|est_time|expected accuracy|"
+    r"tutorial|notebook|example|demo|comment|grammar|nit\b|minor|rename|cleanup|"
+    r"refactor|restruct|migrate|build|compile|compilation|compatibility|import-time|link error|cmake|wheel|docker|"
+    r"artifact|install|codeowners?|skills?|workflow|release|version|dependency|"
+    r"metadata|license|upload|queue race|dead code|format|lint|warning|readme|docs?|"
+    r"model support|support .*models?|onboard|re-onboard|modelopt .*support|"
+    r"^\s*(\[.*\])?\s*chore\b|^\s*(\[.*\])?\s*\[.*infra.*\]|"
+    r"\binfra\b|github pipeline|required changes|compressed archives?|"
+    r"update .* from |review feedback|non-blocking review|add guard|"
+    r"host-side cflags|aarch64|tvm_ffi|default disable|disable .*fusion|"
+    r"unused variable|bad links?|coderabbit feedback|fallback guards?|"
+    r"legacy .* path|declare .* scope|string truthiness|accuracy issue|"
+    r"illegal memory|out[- ]?of[- ]?bounds|\boob\b|overflow|use-after-free|"
+    r"kwarg mismatch|wrong order|invalid value|\bbug\b)",
+    re.I,
+)
+STRONG_PERF_WORD_RE = re.compile(
+    r"(optimi[sz]e|speedup|faster|\bperf\b|performance|latency|throughput|bandwidth|dram|"
+    r"occupancy|profile|ncu|nsight|low latency|fast path)",
+    re.I,
+)
+OPTIMIZATION_MECHANISM_RE = re.compile(
+    r"(tma|wgmma|tcgen|mma|tensor core|warp speciali[sz]|producer-consumer|"
+    r"persistent|stream-?k|split-?k|split kv|pipeline|prefetch|pdl|"
+    r"autotun|heuristic|scheduler|dispatch|selection|tile|tiled_copy|"
+    r"blockscaled|block-scaled|blockwise|groupwise|vectori[sz]|coalesc|"
+    r"shared memory|ldg|stg|copy_optimized|copy_shared|"
+    r"fp8|fp4|nvfp4|mxfp4|int8|int4|marlin|machete|deepgemm|"
+    r"flashmla|pack-gqa|r2p|paged|kv cache compression|blocktopk)",
     re.I,
 )
 CUDA_TARGET_EVIDENCE_RE = re.compile(
@@ -1054,10 +1114,13 @@ def path_buckets(files: list[str]) -> dict[str, list[str]]:
         low = path.lower()
         if "bench" in low or "benchmark" in low or "profile" in low or "ncu" in low:
             buckets["benchmark"].append(path)
-        elif "/test" in low or low.startswith("test") or "tests/" in low:
+        elif "/test" in low or low.startswith("test") or "tests/" in low or "/testing/" in low or "__pycache__" in low:
             buckets["test"].append(path)
         elif low.endswith((".cu", ".cuh", ".h", ".hpp", ".cc", ".cpp", ".py")) and re.search(
-            r"(csrc|kernel|kernels|cutlass|cute|triton|tile|flashinfer|cub|thrust|moe|attention|gemm|quant|norm)",
+            r"(csrc|kernel|kernels|cutlass|cute|triton|tile|flashinfer|cub|thrust|moe|"
+            r"attention|gemm|quant|norm|transpose|coalesc|gups|shared|rope|kv|tma|"
+            r"wgmma|fmha|fa3|flash|kvcache|allreduce|cudax|cuda\.compute|copy|"
+            r"segmented_reduce|scan|reduce|sort|topk|sampling|softmax|fusion|fused)",
             low,
         ):
             buckets["kernel"].append(path)
@@ -1070,11 +1133,64 @@ def path_buckets(files: list[str]) -> dict[str, list[str]]:
     return {key: value[:12] for key, value in buckets.items() if value}
 
 
+def has_cuda_optimization_evidence(pr: dict[str, Any]) -> bool:
+    files = normalize_files(pr)
+    text = full_text(pr)
+    title = pr.get("title") or ""
+    title_body = " ".join([pr.get("title") or "", pr.get("body_excerpt") or "", pr.get("what_changed") or ""])
+
+    has_cuda_target = CUDA_TARGET_EVIDENCE_RE.search(text) or any(CUDA_TARGET_EVIDENCE_RE.search(path) for path in files)
+    if not has_cuda_target:
+        return False
+
+    code_files = [
+        path
+        for path in files
+        if not re.search(
+            r"(^|/)(tests?|testing|benchmarks?|docs?|examples?|tutorials?)/|"
+            r"(^|/)test_|benchmark|bench_|notebook|tutorial|__pycache__",
+            path,
+            re.I,
+        )
+    ]
+    source_buckets = path_buckets(code_files)
+    has_kernel_source = bool(source_buckets.get("kernel")) or any(
+        path.lower().endswith((".cu", ".cuh", ".ptx", ".cubin"))
+        and (
+            KERNEL_FAMILY_RE.search(" ".join([path, title_body]))
+            or KERNEL_SPECIALIZATION_RE.search(" ".join([path, title_body]))
+        )
+        for path in code_files
+    )
+    if not has_kernel_source:
+        return False
+
+    has_perf_action = PERF_ACTION_RE.search(title) or STRONG_PERF_WORD_RE.search(title_body)
+    has_optimization_mechanism = OPTIMIZATION_MECHANISM_RE.search(title_body)
+    has_kernel_family = KERNEL_FAMILY_RE.search(text)
+    has_specialization = KERNEL_SPECIALIZATION_RE.search(text)
+    has_kernel_action = KERNEL_ACTION_RE.search(title)
+
+    # Tutorials, examples, CI/build work, and test-only PRs are useful context,
+    # but they are not optimization evidence unless the title/body explicitly
+    # carries a performance/profiling claim.
+    if NOISE_TITLE_RE.search(title) and not STRONG_PERF_WORD_RE.search(title):
+        return False
+
+    if has_perf_action and (has_kernel_family or has_specialization or has_kernel_source):
+        return True
+    if has_kernel_source and has_kernel_family and has_specialization and has_kernel_action and has_optimization_mechanism:
+        return True
+    return False
+
+
 def keep_pr(pr: dict[str, Any], *, open_watch: bool = False) -> bool:
+    if pr.get("repo_id") in PR_REFERENCE_ONLY_REPOS:
+        return False
     title = pr.get("title") or ""
     files = normalize_files(pr)
     text = full_text(pr)
-    if INFRA_NOISE_RE.search(title) and not STRONG_KERNEL_OPT_RE.search(title):
+    if INFRA_NOISE_RE.search(title) and not STRONG_PERF_WORD_RE.search(text):
         return False
     if BACKEND_NOISE_RE.search(title) and not (
         CUDA_TARGET_EVIDENCE_RE.search(text)
@@ -1086,6 +1202,8 @@ def keep_pr(pr: dict[str, Any], *, open_watch: bool = False) -> bool:
     if not (CUDA_SOURCE_RE.search(text) or any(CUDA_SOURCE_RE.search(path) for path in files)):
         return False
     if not KERNEL_SIGNAL_RE.search(text):
+        return False
+    if not has_cuda_optimization_evidence(pr):
         return False
     if not any(SOURCE_FILE_RE.search(path) for path in files) and not re.search(
         r"(kernel|gemm|attention|moe|TMA|WGMMA|SM90|SM100|SM120|fp8|fp4|cutlass|triton|tilelang|cub|scan|reduce)",
@@ -1237,7 +1355,7 @@ def merge_prior(prs_by_repo: dict[str, dict[int, dict[str, Any]]], root: Path) -
 
 
 def select_diverse(prs: list[dict[str, Any]], target: int) -> list[dict[str, Any]]:
-    # KernelPilot keeps every filtered CUDA-kernel PR in the knowledge base.
+    # KernelPilot keeps every filtered CUDA optimization PR in the knowledge base.
     # The target field remains for historical/audit context but does not cap
     # repository coverage.
     return sorted(
@@ -1295,7 +1413,7 @@ def render_repo_page(root: Path, repo_id: str, cfg: RepoConfig, selected: list[d
     lines.append(f"# {cfg.display} PR Knowledge Notes\n")
     lines.append(f"Repository: <https://github.com/{cfg.repo}>\n")
     lines.append(
-        "This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.\n"
+        "This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.\n"
     )
     if repo_id == "tilekernels" and len(selected) < 3:
         lines.append(
@@ -1308,7 +1426,7 @@ def render_repo_page(root: Path, repo_id: str, cfg: RepoConfig, selected: list[d
         lines.append("")
     lines.append("## Coverage Summary\n")
     counts = Counter(pr["primary_category"] for pr in selected)
-    lines.append("| Category | CUDA-kernel PRs |")
+    lines.append("| Category | CUDA optimization PRs |")
     lines.append("| --- | ---: |")
     for cat in CATEGORY_ORDER:
         if counts[cat]:
@@ -1405,7 +1523,7 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     idx.append("4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`.")
     idx.append("5. Record each used PR in the source idea ledger with repo, PR number, changed paths, hypothesis, measured result, and do-not-reread key.\n")
     idx.append("## Repository PR Pages\n")
-    idx.append("| Repository | PR guide | CUDA-kernel PRs | Filtered pool |")
+    idx.append("| Repository | PR guide | CUDA optimization PRs | Filtered pool |")
     idx.append("| --- | --- | ---: | ---: |")
     for repo_entry in repo_records:
         idx.append(
@@ -1464,10 +1582,10 @@ def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
             f"| `{entry['repo']}` | {entry['candidate_pool_after_filter']} | {entry['selected_count']} | {open_counts.get(entry['repo'], 0)} |"
         )
     lines.append("\n## Filter Policy\n")
-    lines.append("- Keep PRs that touch kernels, runtime dispatch, JIT/compiler lowering, tuning configs, benchmarks, tests, or profiler evidence.")
-    lines.append("- Keep CUDA-kernel-related PRs across the registered knowledge repositories, including implementation, runtime dispatch, tuning, benchmark, testing, and profiling changes.")
+    lines.append("- Keep PRs only when they have CUDA/NVIDIA target evidence, a real kernel/source change, and an optimization/performance mechanism.")
+    lines.append("- Keep CUDA optimization PRs across the registered knowledge repositories, including implementation, runtime dispatch, tuning, benchmark-backed speed work, profiler evidence, and kernel-family feature additions.")
     lines.append("- Filter obvious non-CUDA backend work such as MPS, ROCm, AMD-only, MUSA, Ascend, Intel, CPU-only, Metal, RVV, and RISC-V PRs unless the same PR also carries CUDA/NVIDIA kernel evidence.")
-    lines.append("- Filter release-only, CI-only, dependency-bump, formatting, copyright-header, MyPy, doc-only, cookbook-only, and example-path-only PRs.")
+    lines.append("- Filter release-only, CI-only, dependency-bump, formatting, copyright-header, MyPy, doc-only, cookbook-only, example-path-only, and correctness-only PRs.")
     lines.append("- Keep major release PRs only when their changed paths expose real kernel/API source files and the title/body points to kernel features.\n")
     lines.append("## Evidence Captured Per PR\n")
     lines.append("- PR URL and stable source key, for example `vllm-project/vllm#42236`.")
@@ -1588,7 +1706,7 @@ def main() -> int:
 
     out_json = {
         "schema_version": 3,
-        "generated_from": "GitHub PR scan by kernel family plus prior PR notes; all filtered CUDA-kernel PRs are kept for source/runtime/tuning relevance.",
+        "generated_from": "GitHub PR scan by kernel family plus prior PR notes; all filtered CUDA optimization PRs are kept for source/runtime/tuning relevance.",
         "scan_since": args.since,
         "paper_alignment": "Production PRs are first-class evidence, with human summaries and machine metadata preserving traceability to PRs, changed code paths, tests, benchmarks, docs, and contest artifacts.",
         "categories": {key: {"title": value["title"], "recipe": value["recipe"], "ncu_hint": value["ncu"]} for key, value in CATEGORY_PROFILES.items()},

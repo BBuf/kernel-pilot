@@ -2,7 +2,7 @@
 
 Repository: <https://github.com/deepseek-ai/TileKernels>
 
-This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.
+This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
 Note: this repository has little public PR history. Use the source guide and direct code scan as the main knowledge pass, and treat this page as provenance when PRs exist.
 
@@ -16,20 +16,10 @@ Read these source regions before opening individual PR diffs:
 
 ## Coverage Summary
 
-| Category | CUDA-kernel PRs |
+| Category | CUDA optimization PRs |
 | --- | ---: |
-| Other Kernel Cases | 1 |
 
 ## Pull Request Case Notes
-
-### Other Kernel Cases
-
-Use this section for: Use the PR as grounded prior art; inspect diff, linked tests, and benchmark evidence before applying the idea.
-NCU first look: Choose metrics based on the changed kernel family after opening the diff.
-
-| PR | Merged | Signals | What changed | Evidence paths | Transfer note |
-| --- | --- | --- | --- | --- | --- |
-| [#1](https://github.com/deepseek-ai/TileKernels/pull/1) Revise Engram Kernel Comments | 2026-04-23 | kernel_other | Revise Engram Kernel Comments | kernel: `tile_kernels/engram/engram_gate_kernel.py` | Use the PR as grounded prior art; inspect diff, linked tests, and benchmark evidence before applying the idea. |
 
 ## Per-PR Ledger Fields
 

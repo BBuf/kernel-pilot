@@ -2,36 +2,16 @@
 
 Repository: <https://github.com/NVIDIA/CUDALibrarySamples>
 
-This page is the production-PR layer for kernel-knowledge. It favors merged PRs that changed kernels, dispatch, JIT/runtime integration, tuning policy, tests, benchmarks, or profiling evidence. Release, CI-only, formatting, pure version-bump, and non-target-backend PRs are filtered out.
+This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
 ## Repository Source Scan
 
 ## Coverage Summary
 
-| Category | CUDA-kernel PRs |
+| Category | CUDA optimization PRs |
 | --- | ---: |
-| Compiler / Runtime | 1 |
-| Other Kernel Cases | 1 |
 
 ## Pull Request Case Notes
-
-### Compiler / Runtime
-
-Use this section for: Treat compiler/runtime integration as part of the kernel: launch wrapper, cache/JIT behavior, generated code, and build flags need tests.
-NCU first look: Generated kernel shape, launch overhead, occupancy, register pressure, and compile-time-selected schedule.
-
-| PR | Merged | Signals | What changed | Evidence paths | Transfer note |
-| --- | --- | --- | --- | --- | --- |
-| [#49](https://github.com/NVIDIA/CUDALibrarySamples/pull/49) [cuTENSOR] Fix a license resolve error. | 2021-12-07 | compiler_runtime | Problem description When installing cuTENSOR with python extension (the Step 3 in Installation section) , the `pip install .` command returned error and cannot successfully install the package. Environment NGC containers: nvcr.io/nvidia/pytorch:21.10-py3 it contains setuptools 58.2.0. Manually upgra... | kernel: `cuTENSOR/python/cutensor/package_info.py` | Treat compiler/runtime integration as part of the kernel: launch wrapper, cache/JIT behavior, generated code, and build flags need tests. |
-
-### Other Kernel Cases
-
-Use this section for: Use the PR as grounded prior art; inspect diff, linked tests, and benchmark evidence before applying the idea.
-NCU first look: Choose metrics based on the changed kernel family after opening the diff.
-
-| PR | Merged | Signals | What changed | Evidence paths | Transfer note |
-| --- | --- | --- | --- | --- | --- |
-| [#2](https://github.com/NVIDIA/CUDALibrarySamples/pull/2) Update spmm_csr_example.c | 2020-08-17 | kernel_other | There is a small mistake on the file. The function to check cudaMalloc should be CHECK_CUDA, not CHECK_SPARSE | other: `cuSPARSE/spmm_csr/spmm_csr_example.c` | Use the PR as grounded prior art; inspect diff, linked tests, and benchmark evidence before applying the idea. |
 
 ## Per-PR Ledger Fields
 

@@ -3,8 +3,10 @@
 This directory is a PR- and code-first map for GPU kernel optimization. It
 points Codex to production pull requests, kernel diffs, tests, benchmarks,
 source maps, and the profiler signals that are usually relevant for a topic.
-The PR layer keeps all filtered CUDA-kernel PRs from the registered source
-repositories; it is not capped to a curated top-N list.
+The PR layer keeps all filtered CUDA optimization PRs from the registered
+source repositories; it is not capped to a curated top-N list. A PR must carry
+CUDA/NVIDIA target evidence, a real kernel/source change, and an
+optimization/performance mechanism before it enters this corpus.
 
 The knowledge base is both reference material and a route to baseline-derived
 candidate code. Candidate kernels should use the implementation system requested
