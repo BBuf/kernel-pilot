@@ -140,6 +140,18 @@ From-scratch optimization:
 [$humanize-kernel-agent-loop] I want to optimize SGLang's H100 int8_scaled_mm kernel on H100. Implement the candidate kernel from scratch and use the existing SGLang/CUTLASS kernel only as the correctness/performance comparison baseline. Work in a clean standalone repo and keep provenance/lineage.
 ```
 
+## Example Outputs
+
+The loop should leave enough state for you to tell what happened without
+replaying the whole session.
+
+![Humanize stop hook summary](docs/assets/humanize-stop-hook-summary.png)
+
+The optimization ledger should make the useful versions and rejected follow-ups
+easy to scan.
+
+![KernelPilot optimization ledger](docs/assets/kernelpilot-optimization-ledger.png)
+
 ## Monitor
 
 Open another terminal in the same target repo:
