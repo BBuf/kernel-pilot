@@ -4,7 +4,7 @@ Repository: <https://github.com/deepseek-ai/TileKernels>
 
 This page is the production-PR layer for kernel-knowledge. It keeps merged PRs with CUDA/NVIDIA target evidence, real kernel/source changes, and an optimization/performance mechanism such as tuning, fusion, tensor-core paths, memory movement, scheduling, profiling, or benchmark-backed speed work. Release, CI-only, formatting, dependency-only, correctness-only, and non-target-backend PRs are filtered out.
 
-Note: this repository has little public PR history. Use the source guide and direct code scan as the main knowledge pass, and treat this page as provenance when PRs exist.
+Note: this repository has little public PR history. Use the source guide and direct code scan as mandatory paired evidence, and treat this page as provenance when PRs exist.
 
 ## Repository Source Scan
 

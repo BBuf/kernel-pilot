@@ -20,7 +20,7 @@ specifics:
 | Nsight Compute / Nsight Systems evidence | `ako4all/profiling-debugging-reference.md` |
 | Hopper H100 tuning | `ako4all/nvidia-architecture-reference.md`, `ako4all/architectures/sm90-optimization-guide.md` |
 | Kernel templates and debugging | `ako4all/kernel-templates.md`, `ako4all/troubleshooting.md` |
-| PR-driven production case notes | `prs/index.md`, `prs/pr-index.json` |
+| Paired PR/source production case notes | `prs/index.md`, `prs/pr-index.json`, `source-guides/` |
 | Cross-repository PR lookup by kernel family | `prs/by-topic/index.md` |
 | Current open PR watchlist | `prs/open-watchlist.md` |
 | Blog-to-code source maps | `blogs/index.md` |
@@ -54,10 +54,12 @@ source collection:
 | Colfax Research blog and code | `source-guides/colfax-research.md` |
 | CUDA blog companion kernels | `source-guides/cuda-blog-kernels.md` |
 
-## PR Deep References
+## Paired PR + Source Deep References
 
-Read these before prose references when a repository matches the target kernel
-or when the loop enters plateau-driven research:
+Read the matching PR guide and source guide together when a repository matches
+the target kernel or when the loop enters plateau-driven research. PRs explain
+optimization history, review context, tests, and benchmark evidence; source
+guides show the current implementation and concrete code paths to inspect.
 
 | Source | PR guide |
 | --- | --- |
@@ -77,10 +79,10 @@ or when the loop enters plateau-driven research:
 | CCCL / CUB | `prs/cccl-cub.md` |
 
 If the bottleneck is known but the best source repository is unclear, start from
-`prs/by-topic/index.md`. The topic pages group PRs by GEMM/quantization,
-attention/KV, MoE/routing, norm/elementwise, memory primitives,
-scheduler/autotune, architecture pipeline, compiler/runtime, and benchmark/test
-evidence.
+`prs/by-topic/index.md`, then open the matching source guide for every promising
+repository. The topic pages group PRs by GEMM/quantization, attention/KV,
+MoE/routing, norm/elementwise, memory primitives, scheduler/autotune,
+architecture pipeline, compiler/runtime, and benchmark/test evidence.
 
 Use `prs/open-watchlist.md` for fresh open PR ideas only after re-checking the
 linked PR on GitHub. Open PRs are volatile and should be logged separately from
@@ -102,14 +104,15 @@ should come from a companion repo or standalone candidate:
 
 ## Use Rules
 
-- Prefer production PRs, code, tests, benchmarks, and open PRs/issues before
-  docs or blogs.
-- During plateau research, use repository PR pages first, then by-topic PR
-  pages, then open PR watchlist, then blog/code references.
+- Prefer paired production PRs and source code, tests, benchmarks, and open
+  PRs/issues before docs or blogs.
+- During plateau research, inspect repository PR pages together with matching
+  source guides, then by-topic PR pages together with relevant source guides,
+  then open PR watchlist plus current source scan, then blog/code references.
 - Use the user-requested candidate stack, or the active baseline kernel's stack
   when unspecified.
 - Baseline kernels may seed candidates in the standalone repo when
   license/attribution allow; keep the source checkout read-only unless the user
   asks for an in-place framework patch.
-- Log every source-derived idea with source path or URL, hypothesis, result, and
-  a do-not-reread key.
+- Log every source-derived idea with PR number when available, source path or
+  symbol, hypothesis, result, and a do-not-reread key.

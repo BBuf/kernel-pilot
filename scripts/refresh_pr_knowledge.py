@@ -1417,7 +1417,7 @@ def render_repo_page(root: Path, repo_id: str, cfg: RepoConfig, selected: list[d
     )
     if repo_id == "tilekernels" and len(selected) < 3:
         lines.append(
-            "Note: this repository has little public PR history. Use the source guide and direct code scan as the main knowledge pass, and treat this page as provenance when PRs exist.\n"
+            "Note: this repository has little public PR history. Use the source guide and direct code scan as mandatory paired evidence, and treat this page as provenance when PRs exist.\n"
         )
     lines.append("## Repository Source Scan\n")
     if framework_paths:
@@ -1516,12 +1516,12 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     idx.append(
         "This layer follows the kernel-knowledge design implied by MIT Kernel Mafia: production pull requests are treated as first-class evidence because many real optimization recipes live in PR diffs, review threads, tests, benchmarks, and follow-up fixes rather than in official documentation.\n"
     )
-    idx.append("## Read Order\n")
+    idx.append("## Paired PR + Source Read Order\n")
     idx.append("1. Start with the target topic and framework routing pages.")
-    idx.append("2. Read the matching source guide under `knowledge/references/source-guides/`.")
-    idx.append("3. Read the matching PR page below and open only PR categories relevant to the current bottleneck.")
-    idx.append("4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`.")
-    idx.append("5. Record each used PR in the source idea ledger with repo, PR number, changed paths, hypothesis, measured result, and do-not-reread key.\n")
+    idx.append("2. Read the matching source guide under `knowledge/references/source-guides/` and the matching PR page below in the same knowledge pass.")
+    idx.append("3. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.")
+    idx.append("4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.")
+    idx.append("5. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.\n")
     idx.append("## Repository PR Pages\n")
     idx.append("| Repository | PR guide | CUDA optimization PRs | Filtered pool |")
     idx.append("| --- | --- | ---: | ---: |")
@@ -1544,7 +1544,7 @@ def render_index(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
         idx.append(f"| `{cat}` | {profile['title']} |")
     idx.append("\n## Expansion Rule\n")
     idx.append(
-        "When two consecutive optimization rounds improve the best geomean by less than 1%, prefer unread PRs and code diffs first. Read at least 50 new code-first sources before prose sources; a PR diff, linked test, benchmark, or changed kernel file counts as a code-first source when it is recorded with a do-not-reread key.\n"
+        "When two consecutive optimization rounds improve the best geomean by less than 1%, read paired PR/source evidence first. Read at least 50 new code-first sources before prose sources; a PR diff, source file, symbol, linked test, benchmark, or changed kernel file counts as a code-first source when it is recorded with a do-not-reread key.\n"
     )
     idx.append("## Refresh Command\n")
     idx.append("```bash")
@@ -1595,13 +1595,13 @@ def render_audit(root: Path, repo_records: list[dict[str, Any]], open_watch: lis
     lines.append("- Transfer recipe and first NCU metrics to inspect.")
     lines.append("- Matched search queries in `pr-index.json` for traceability.\n")
     lines.append("## Retrieval Strategy\n")
-    lines.append("1. Use the repository PR page when the baseline framework is known.")
-    lines.append("2. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not.")
-    lines.append("3. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub before trusting the code or benchmark claim.")
-    lines.append("4. Log every PR-derived idea in `artifacts/source-idea-ledger.md` with source key, opened paths, hypothesis, result, and do-not-reread key.\n")
+    lines.append("1. Use the repository PR page and the matching source guide together when the baseline framework is known.")
+    lines.append("2. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not, then open source guides for every promising repository.")
+    lines.append("3. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub plus the current source tree before trusting the code or benchmark claim.")
+    lines.append("4. Log every source-derived idea in `artifacts/source-idea-ledger.md` with PR key when available, source path or symbol, opened tests/benchmarks, hypothesis, result, and do-not-reread key.\n")
     lines.append("## Known Gaps\n")
-    lines.append("- DeepSeek TileKernels has little public PR history, so source-guide and direct code scan should dominate for that repo.")
-    lines.append("- GitHub search can miss PRs whose titles and bodies use generic wording. When optimizing a specific kernel, still run path-based `gh pr list` or `gh search prs` for that exact file/function name.")
+    lines.append("- DeepSeek TileKernels has little public PR history, so source-guide and direct code scan are mandatory paired evidence for that repo.")
+    lines.append("- GitHub search can miss PRs whose titles and bodies use generic wording. When optimizing a specific kernel, still run path-based `gh pr list` or `gh search prs` for that exact file/function name and inspect current source paths.")
     lines.append("- Open PR entries are intentionally volatile and should not be treated as merged production evidence.")
     lines.append("- The corpus is intentionally CUDA-first. Non-CUDA backend PRs are filtered out unless they also contain CUDA/NVIDIA kernel evidence.\n")
     lines.append("## Refresh Command\n")

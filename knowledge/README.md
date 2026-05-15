@@ -112,19 +112,21 @@ knowledge/
    optimization direction.
 2. Use `references/index.md` to select deep reference files instead of loading
    the full reference tree.
-3. Read the relevant `references/prs/<repo>.md` page before blog/article pages.
-   PR diffs, changed kernel files, tests, benchmarks, and review-linked issues
-   are the primary knowledge source. Search within the full page instead of
-   assuming only the first entries matter.
+3. Read the relevant `references/source-guides/<repo>.md` page and
+   `references/prs/<repo>.md` page in the same knowledge pass. PR diffs explain
+   why optimizations landed; source guides and direct code scans show the
+   current implementation, callable wrappers, tests, benchmarks, and candidate
+   code locations. Search both pages instead of assuming only PRs or only source
+   files matter.
 4. If the bottleneck is clearer than the source repository, read
    `references/prs/by-topic/index.md` and the matching topic page.
 5. Use `references/prs/open-watchlist.md` only as volatile current context; open
    PRs must be re-checked on GitHub before copying code or trusting benchmark
    claims.
-6. Prefer source code, tests, benchmarks, and open PRs/issues before docs,
-   blogs, or articles.
-7. Log every source-derived idea with framework, PR or path URL, hypothesis,
-   measured result, and do-not-reread key.
+6. Prefer paired PR/source evidence, tests, benchmarks, and open PRs/issues
+   before docs, blogs, or articles.
+7. Log every source-derived idea with framework, PR number when available,
+   source path or symbol, hypothesis, measured result, and do-not-reread key.
 8. After two consecutive weak rounds (<1% improvement), read at least 50 new
    code-first sources before prose sources, then record a do-not-reread key for
    each source.

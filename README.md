@@ -59,8 +59,8 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 
 ## How The Loop Works
 
-1. **Knowledge pass**: read topic routing, framework routing, PR pages, source
-   guides, AKO4ALL references, and relevant blog-to-code maps.
+1. **Knowledge pass**: read topic/framework routing, then inspect PR pages and
+   source guides together before choosing an optimization direction.
 2. **Standalone setup**: create a fresh repo with torch bindings, correctness
    tests, benchmarks, ledgers, lineage, and profile artifact folders.
 3. **Evidence loop**: implement one candidate, test it, benchmark it, collect

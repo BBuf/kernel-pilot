@@ -104,30 +104,33 @@ Before writing the plan or choosing any optimization direction:
      `quack.md`, `tilekernels.md`, `thunderkittens.md`,
      `veitner-blog.md`, `colfax-research.md`, `cuda-blog-kernels.md`, or
      `pytorch.md` as appropriate.
-6. Read the matching PR guide under `knowledge/references/prs/`. Treat PR
-   diffs, changed kernel files, linked tests, benchmark files, and review-linked
-   issues as the primary kernel-knowledge evidence layer. These pages keep all
+6. Read the matching deep source guide under
+   `knowledge/references/source-guides/`.
+7. Read the matching PR guide under `knowledge/references/prs/` in the same
+   knowledge pass. Treat PR diffs, changed kernel files, linked tests,
+   benchmark files, review-linked issues, source guide paths, and direct source
+   scans as the paired kernel-knowledge evidence layer. These pages keep all
    filtered CUDA optimization PRs rather than a small curated top-N. Each entry
    must have CUDA/NVIDIA target evidence, a real kernel/source change, and an
-   optimization/performance mechanism, so search the full relevant page for
-   kernel family, dtype, architecture, backend, and bottleneck terms before
+   optimization/performance mechanism. Search both the PR page and source guide
+   for kernel family, dtype, architecture, backend, and bottleneck terms before
    choosing an edit.
-7. If the bottleneck is known but the best source repository is unclear, read
+8. If the bottleneck is known but the best source repository is unclear, read
    `knowledge/references/prs/by-topic/index.md` and the matching topic page.
-8. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
+9. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
    ideas, and re-check linked GitHub PRs before using code or benchmark claims.
-9. Read the matching deep source guide under
-   `knowledge/references/source-guides/`.
 10. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
 11. For plateau research or blog-driven source ideas, read
    `knowledge/references/blogs/index.md` and the matching blog page before
    opening companion code.
 
-Prefer production PRs, source code, tests, benchmarks, and open PRs/issues
-before blogs or articles. During plateau expansion, use merged repository PR
-pages first, then cross-repository by-topic PR pages, then the open PR
-watchlist, then source guides and blog/code references. External kernels may be
-used as baselines, starting candidates, or prior art when their
+Pair production PRs with current source code, tests, and benchmarks before
+blogs or articles. Source guides are not a fallback after PR miss; the knowledge
+pass must inspect PR evidence and source evidence together. During plateau
+expansion, use merged repository PR pages plus matching source guides, then
+cross-repository by-topic PR pages plus relevant source guides, then the open PR
+watchlist plus current source scan, then blog/code references. External kernels
+may be used as baselines, starting candidates, or prior art when their
 license/attribution allows it.
 
 ## Plan Requirements
@@ -156,11 +159,15 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - Optimization ledger records only correct versions with measured improvement.
 - Lineage records parent version, mutation/motivation, source idea keys, result,
   and selected/rejected status.
+- Source idea ledger records both PR provenance, when available, and source-code
+  provenance: repo, path, symbol/function, opened tests or benchmarks,
+  hypothesis, result, and do-not-reread key.
 - After two consecutive weak rounds with less than 1% geomean improvement over
   the prior best, perform research expansion before editing again: read at
   least 50 new code-first sources before prose sources, prioritize unread PR
-  diffs and changed kernel/test/benchmark files, log source provenance, and
-  avoid re-reading by checking `artifacts/source-idea-ledger.md`.
+  diffs, current source files, symbols, and changed kernel/test/benchmark
+  files, log paired source provenance, and avoid re-reading by checking
+  `artifacts/source-idea-ledger.md`.
 - Stop only when all ACs are met, or when profile evidence shows the kernel is
   already beyond 85% of the relevant peak and no low-effort implementation edit
   remains.

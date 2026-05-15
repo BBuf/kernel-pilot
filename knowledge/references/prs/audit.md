@@ -58,15 +58,15 @@ Scan window: merged or updated since `2024-05-15`.
 
 ## Retrieval Strategy
 
-1. Use the repository PR page when the baseline framework is known.
-2. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not.
-3. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub before trusting the code or benchmark claim.
-4. Log every PR-derived idea in `artifacts/source-idea-ledger.md` with source key, opened paths, hypothesis, result, and do-not-reread key.
+1. Use the repository PR page and the matching source guide together when the baseline framework is known.
+2. Use `by-topic/index.md` when the bottleneck category is known but the best source repository is not, then open source guides for every promising repository.
+3. Use `open-watchlist.md` only for fresh ideas, and re-check GitHub plus the current source tree before trusting the code or benchmark claim.
+4. Log every source-derived idea in `artifacts/source-idea-ledger.md` with PR key when available, source path or symbol, opened tests/benchmarks, hypothesis, result, and do-not-reread key.
 
 ## Known Gaps
 
-- DeepSeek TileKernels has little public PR history, so source-guide and direct code scan should dominate for that repo.
-- GitHub search can miss PRs whose titles and bodies use generic wording. When optimizing a specific kernel, still run path-based `gh pr list` or `gh search prs` for that exact file/function name.
+- DeepSeek TileKernels has little public PR history, so source-guide and direct code scan are mandatory paired evidence for that repo.
+- GitHub search can miss PRs whose titles and bodies use generic wording. When optimizing a specific kernel, still run path-based `gh pr list` or `gh search prs` for that exact file/function name and inspect current source paths.
 - Open PR entries are intentionally volatile and should not be treated as merged production evidence.
 - The corpus is intentionally CUDA-first. Non-CUDA backend PRs are filtered out unless they also contain CUDA/NVIDIA kernel evidence.
 

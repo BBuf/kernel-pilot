@@ -40,23 +40,26 @@ Before writing a plan or choosing a kernel edit:
      `cute-dsl.md`, `quack.md`, `tilekernels.md`, `thunderkittens.md`,
      `veitner-blog.md`, `colfax-research.md`, or `cuda-blog-kernels.md`
      when the topic points there
-6. Read the matching PR guide under `knowledge/references/prs/` before prose
-   references. Each PR entry records what changed, where it came from, changed
-   paths, and the optimization recipe to test. The PR pages keep all filtered
-   CUDA optimization PRs, not a curated top-N; each entry must have CUDA/NVIDIA
-   target evidence, a real kernel/source change, and an optimization/performance
-   mechanism. Search the full relevant page for the kernel family, dtype,
-   backend, architecture, and bottleneck terms.
-7. If the bottleneck is known but the best source repository is unclear, read
-   `knowledge/references/prs/by-topic/index.md` and the matching topic page.
-8. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
-   ideas, and re-check linked GitHub PRs before trusting code or benchmark
-   claims.
-9. Read the matching deep source guide under
+6. Read the matching deep source guide under
    `knowledge/references/source-guides/` for PyTorch, TensorRT-LLM, SGLang, vLLM,
    FlashAttention, FlashInfer, CUTLASS, DeepGEMM, Triton, TileLang, CuTe DSL,
    QuACK, DeepSeek TileKernels, ThunderKittens, Veitner blog/code, Colfax
    blog/code, or CUDA blog companion kernels.
+7. Read the matching PR guide under `knowledge/references/prs/` in the same
+   knowledge pass. PR evidence and source evidence are paired: PRs explain why
+   an optimization was made and source guides show where the current
+   implementation and transferable code live. Each PR entry records what
+   changed, where it came from, changed paths, and the optimization recipe to
+   test. The PR pages keep all filtered CUDA optimization PRs, not a curated
+   top-N; each entry must have CUDA/NVIDIA target evidence, a real kernel/source
+   change, and an optimization/performance mechanism. Search both the PR page
+   and the source guide for the kernel family, dtype, backend, architecture, and
+   bottleneck terms before choosing an edit.
+8. If the bottleneck is known but the best source repository is unclear, read
+   `knowledge/references/prs/by-topic/index.md` and the matching topic page.
+9. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
+   ideas, and re-check linked GitHub PRs before trusting code or benchmark
+   claims.
 10. For implementation/profiling mechanics, read the copied AKO4ALL references:
    - CUDA C++: `knowledge/references/ako4all/cuda-cpp-kernel-reference.md`
    - Triton: `knowledge/references/ako4all/triton-kernel-reference.md`
@@ -73,14 +76,18 @@ Before writing a plan or choosing a kernel edit:
 
 ## Research Rules
 
-- Prefer production PRs, code, tests, benchmarks, and open PRs/issues before
-  blogs or articles.
-- Treat `knowledge/references/prs/` as the primary corpus for CUDA optimization
-  optimization ideas. Use source guides and blogs to explain or extend PR/code
-  evidence, not as the first stop.
-- Read order during plateau expansion is: merged repository PR pages,
-  cross-repository by-topic PR pages, open PR watchlist, source guides, then
-  blog/code references.
+- Pair production PRs with current source code, tests, and benchmarks before
+  blogs or articles. Do not treat source guides as a fallback after PR miss;
+  source and PR evidence must both be checked before choosing an optimization
+  direction.
+- Treat `knowledge/references/prs/` and
+  `knowledge/references/source-guides/` as the paired primary corpus for CUDA
+  optimization ideas. Use blogs to explain or extend PR/source evidence, not as
+  the first stop.
+- Read order during plateau expansion is paired: merged repository PR pages plus
+  matching source guides, cross-repository by-topic PR pages plus relevant
+  source guides, open PR watchlist plus current source scan, then blog/code
+  references.
 - Candidate implementation language is user-directed. Use CUDA C++/PTX,
   Triton, CuTe DSL, TileLang, CUTLASS/CuTe, ThunderKittens,
   torch.compile/Inductor, or a framework-specific kernel stack when the user or
@@ -107,7 +114,8 @@ Before writing a plan or choosing a kernel edit:
 Record every source-derived idea with:
 
 - source repo or local knowledge file
-- exact PR number, path, or URL
+- exact PR number when available
+- exact source path, symbol, or URL
 - hypothesis tested
 - measured result
 - do-not-reread key

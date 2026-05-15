@@ -2,13 +2,13 @@
 
 This layer follows the kernel-knowledge design implied by MIT Kernel Mafia: production pull requests are treated as first-class evidence because many real optimization recipes live in PR diffs, review threads, tests, benchmarks, and follow-up fixes rather than in official documentation.
 
-## Read Order
+## Paired PR + Source Read Order
 
 1. Start with the target topic and framework routing pages.
-2. Read the matching source guide under `knowledge/references/source-guides/`.
-3. Read the matching PR page below and open only PR categories relevant to the current bottleneck.
-4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`.
-5. Record each used PR in the source idea ledger with repo, PR number, changed paths, hypothesis, measured result, and do-not-reread key.
+2. Read the matching source guide under `knowledge/references/source-guides/` and the matching PR page below in the same knowledge pass.
+3. Use PRs for optimization history, review context, tests, and benchmark evidence; use source guides and direct source scans for the current implementation, wrappers, tests, benchmark entry points, and candidate code locations.
+4. If the bottleneck is known but the source repository is unclear, use `by-topic/index.md`, then open the matching source guide for each promising repository.
+5. Record each source-derived idea in the source idea ledger with repo, PR number when available, source path or symbol, hypothesis, measured result, and do-not-reread key.
 
 ## Repository PR Pages
 
@@ -76,7 +76,7 @@ Use [`open-watchlist.md`](open-watchlist.md) for current open PRs. Re-run the re
 
 ## Expansion Rule
 
-When two consecutive optimization rounds improve the best geomean by less than 1%, prefer unread PRs and code diffs first. Read at least 50 new code-first sources before prose sources; a PR diff, linked test, benchmark, or changed kernel file counts as a code-first source when it is recorded with a do-not-reread key.
+When two consecutive optimization rounds improve the best geomean by less than 1%, read paired PR/source evidence first. Read at least 50 new code-first sources before prose sources; a PR diff, source file, symbol, linked test, benchmark, or changed kernel file counts as a code-first source when it is recorded with a do-not-reread key.
 
 ## Refresh Command
 
