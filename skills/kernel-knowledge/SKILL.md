@@ -80,6 +80,11 @@ Before writing a plan or choosing a kernel edit:
    `knowledge/references/blogs/index.md` and the matching blog page before
    opening companion code.
 
+Keep the initial pass small. For a concrete target kernel, read one topic page,
+one framework page, one source guide, and one PR page only if that framework is
+PR-driven. Use by-topic pages, the open PR watchlist, and broad source catalogs
+after the first benchmark/profile result or when the target source is unclear.
+
 ## Research Rules
 
 - Pair production PRs with current source code, tests, and benchmarks before

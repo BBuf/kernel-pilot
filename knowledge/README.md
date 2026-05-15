@@ -1,12 +1,13 @@
 # Kernel Knowledge Base
 
-This directory is a PR/source map for GPU kernel optimization. It
-points Codex to production pull requests, kernel diffs, tests, benchmarks,
-source maps, and the profiler signals that are usually relevant for a topic.
-The PR layer keeps all filtered CUDA optimization PRs from the registered
-source repositories; it is not capped to a curated top-N list. A PR must carry
-CUDA/NVIDIA target evidence, a real kernel/source change, and an
-optimization/performance mechanism before it enters this corpus.
+This directory is the lookup table for GPU-kernel work. It points Codex to the
+PRs, source files, tests, benchmarks, and profiler notes worth reading for a
+given topic.
+
+The PR layer keeps filtered CUDA optimization PRs from the registered source
+repositories. It is not a hand-picked top-N list. A PR must mention a
+CUDA/NVIDIA target, change real kernel/source code, and have a performance or
+optimization reason before it is kept.
 PyTorch, DeepSeek TileKernels, sample repos, blog/code companion repos, puzzle
 repos, source catalogs, and repositories with fewer than 10 selected CUDA
 optimization PRs are source-only; inspect their source guides and current code

@@ -21,7 +21,7 @@ grep -q -- '--kernelpilot-root' "$install_script" \
 
 grep -q 'Candidate implementation language is user-directed' "$skill_file" \
     || fail "skill does not support user-directed candidate stacks"
-grep -q 'baseline kernel is a first-class starting point' "$skill_file" \
+grep -q 'baseline kernel can be the starting point' "$skill_file" \
     || fail "skill does not allow baseline-derived candidates"
 grep -q 'from-scratch kernel' "$skill_file" \
     || fail "skill does not honor from-scratch baseline exclusion"

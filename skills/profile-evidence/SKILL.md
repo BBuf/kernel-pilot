@@ -5,10 +5,9 @@ description: Use when a GPU kernel optimization loop needs to turn Nsight Comput
 
 # Profile Evidence Skill
 
-**Purpose.** Turn fine-grained Nsight Compute (ncu) evidence into concrete
-optimization guidance: identify stalls, bubbles, memory-bound vs compute-bound
-behavior, occupancy issues, and other runtime bottlenecks, and emit a
-ranked list of next actions tied to specific source / kernel features.
+**Purpose.** Turn Nsight Compute (ncu) output into a short bottleneck note and
+one next kernel edit. The goal is not to profile everything; it is to explain
+the cases where benchmark numbers alone are not enough.
 
 Invoke this skill whenever a candidate's benchmark result does not, by itself,
 explain the bottleneck (regression, plateau, suspicious wins, or
@@ -20,16 +19,20 @@ correctness-only outcomes).
 
 Run the Profile Evidence Skill whenever **any** of the following are true:
 
-1. The candidate is correct, but every case is within ±2% of the baseline.
-2. The candidate is correct overall but regresses on one or more configured
+1. The baseline benchmark has passed and there is no baseline Profile Evidence
+   Digest yet.
+2. The candidate is correct, but every case is within ±2% of the baseline.
+3. The candidate is correct overall but regresses on one or more configured
    cases.
-3. Two consecutive iterations have shown <1% geomean improvement over the
+4. Two consecutive iterations have shown <1% geomean improvement over the
    prior best.
-4. The candidate is much faster than expected and needs a "why is it faster"
+5. The candidate is much faster than expected and needs a "why is it faster"
    explanation before being recorded.
-5. A reviewer asks for a Profile Evidence Digest.
+6. A reviewer asks for a Profile Evidence Digest.
 
 Do **not** invoke the skill when correctness is failing; fix correctness first.
+Do not run full NCU on every minor edit. Use it at baseline, on unexplained
+benchmark behavior, or before making a profile-driven change.
 
 ---
 
@@ -79,8 +82,8 @@ The optimization loop should keep both artifact paths in the digest.
 
 ## Digest format
 
-The skill emits one **Profile Evidence Digest** per kernel. Every digest must
-contain the following sections:
+Write one **Profile Evidence Digest** per kernel. Every digest must contain the
+following sections:
 
 ```text
 ### Profile Evidence Digest: <kernel name> @ <version>

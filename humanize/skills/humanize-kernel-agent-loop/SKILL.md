@@ -1,6 +1,6 @@
 ---
 name: humanize-kernel-agent-loop
-description: "Run an end-to-end Humanize Kernel Agent Loop for GPU kernel optimization: plan, refine, create a clean standalone repo, use kernel-knowledge, benchmark, profile with Nsight Compute, maintain lineage/ledgers, and drive RLCR autonomously."
+description: "Run an end-to-end Humanize Kernel Agent Loop for GPU kernel optimization: plan, refine, create a clean standalone repo, use kernel-knowledge, benchmark, profile with Nsight Compute, maintain lineage/ledgers, and start RLCR."
 type: flow
 ---
 
@@ -22,8 +22,8 @@ If `{{KERNELPILOT_ROOT}}` was not hydrated, locate a repository containing
 
 ## Contract
 
-The loop is autonomous. Do not ask the user to run separate `gen-plan`,
-`refine-plan`, or `humanize-rlcr` steps.
+Run the Humanize steps inside this skill. Do not ask the user to run separate
+`gen-plan`, `refine-plan`, or `humanize-rlcr` commands.
 
 Given a one-sentence kernel request, you must:
 
@@ -44,8 +44,8 @@ missing and cannot be inferred.
 - If the user does not specify a language, start from the active baseline
   kernel's implementation system unless there is a measured reason to choose a
   different one.
-- The baseline kernel is a first-class starting point. You may copy or adapt
-  baseline code into the standalone repo when license and attribution allow.
+- The baseline kernel can be the starting point. You may copy or adapt baseline
+  code into the standalone repo when license and attribution allow.
   Record the exact source path/URL, commit, license/notice, and delta in the
   source ledger and lineage.
 - If the user explicitly asks for a from-scratch kernel or says not to use the
@@ -60,8 +60,14 @@ missing and cannot be inferred.
   artifacts.
 - Every correct candidate attempt gets an attempt-ledger row. Only correct
   candidates that improve performance get an optimization-ledger row.
-- Nsight Compute evidence is a first-class feedback source. Do not declare the
-  loop complete while relevant NCU/profile acceptance criteria are unmet.
+- Collect one baseline Nsight Compute digest for a representative case after
+  baseline correctness/benchmark succeeds. Skip it only when NCU cannot run, and
+  record the reason.
+- Use NCU again for regressions, plateaus, surprising wins, or profile-driven
+  edits. Do not run full NCU for every tiny iteration unless the benchmark
+  result is hard to explain.
+- Do not declare the loop complete while relevant NCU/profile acceptance
+  criteria are unmet.
 
 ## Required Files In The Standalone Repo
 
@@ -129,16 +135,20 @@ Before writing the plan or choosing any optimization direction:
    `knowledge/references/blogs/index.md` and the matching blog page before
    opening companion code.
 
-Pair production PRs with current source code, tests, and benchmarks before
-blogs or articles when the repository is PR-driven. For source-only repositories
-such as PyTorch, blog/code companion repos, and repositories with fewer than 10
-selected CUDA optimization PRs, skip PR lookup entirely and use source guides
-plus direct source scans. During plateau expansion, use merged repository PR
-pages plus matching source guides for PR-driven repos, then
-cross-repository by-topic PR pages plus relevant source guides, then the open PR
-watchlist plus current source scan, then blog/code references. External kernels
-may be used as baselines, starting candidates, or prior art when their
-license/attribution allows it.
+Keep the first pass scoped: one topic page, one framework page, one source
+guide, and one PR page when the repository is PR-driven. Do not scan the whole
+knowledge tree up front.
+
+Pair production PRs with current source code, tests, and benchmarks before blogs
+or articles when the repository is PR-driven. For source-only repositories such
+as PyTorch, blog/code companion repos, and repositories with fewer than 10
+selected CUDA optimization PRs, skip PR lookup and use source guides plus direct
+source scans. During plateau expansion, use merged repository PR pages plus
+matching source guides for PR-driven repos, then cross-repository by-topic PR
+pages plus relevant source guides, then the open PR watchlist plus current
+source scan, then blog/code references. External kernels may be used as
+baselines, starting candidates, or prior art when their license/attribution
+allows it.
 
 ## Plan Requirements
 
@@ -159,8 +169,12 @@ use the Humanize gen-plan schema and include these acceptance criteria:
   baseline parity.
 - Benchmark harness records per-shape timing, geomean, best/worst cases, and
   environment metadata.
-- Nsight Compute profiles are captured for representative bottleneck cases and
-  converted into Profile Evidence Digests before profile-driven edits.
+- A baseline Nsight Compute profile is captured for one representative
+  bottleneck case after baseline benchmark succeeds and before the first
+  profile-driven edit.
+- Later Nsight Compute profiles are captured for regressions, plateaus,
+  surprising wins, or reviewer-requested evidence, then converted into Profile
+  Evidence Digests.
 - Attempt ledger records every version, including failed correctness,
   regressions, plateaus, and abandoned ideas.
 - Optimization ledger records only correct versions with measured improvement.
@@ -183,6 +197,7 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 
 Invoke profile-evidence rules whenever any of these hold:
 
+- Baseline benchmark has passed and no baseline Profile Evidence Digest exists.
 - A correct candidate is within +/-2% of baseline across configured cases.
 - A correct candidate regresses on one or more configured cases.
 - Two consecutive iterations show less than 1% geomean improvement over the

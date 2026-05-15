@@ -2,47 +2,43 @@
 
 # KernelPilot
 
-**Humanize-powered GPU kernel agent loops with PR-driven kernel knowledge,
-Nsight Compute evidence, and clean standalone optimization repos.**
+**A Codex + Humanize workflow for GPU kernel tuning: local CUDA knowledge,
+Nsight Compute digests, and clean standalone benchmark repos.**
 
 [![GitHub stars](https://img.shields.io/github/stars/BBuf/kernel-pilot?style=social)](https://github.com/BBuf/kernel-pilot/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/BBuf/kernel-pilot?style=social)](https://github.com/BBuf/kernel-pilot/forks)
 [![Last commit](https://img.shields.io/github/last-commit/BBuf/kernel-pilot?style=flat-square)](https://github.com/BBuf/kernel-pilot/commits/main)
-[![CUDA PR corpus](https://img.shields.io/badge/CUDA_kernel_PRs-2840-2ea44f?style=flat-square)](knowledge/references/prs/)
-[![Open watchlist](https://img.shields.io/badge/open_PR_watchlist-1079-8250df?style=flat-square)](knowledge/references/prs/open-watchlist.md)
+[![CUDA PR corpus](https://img.shields.io/badge/CUDA_kernel_PRs-607-2ea44f?style=flat-square)](knowledge/references/prs/)
+[![Open watchlist](https://img.shields.io/badge/open_PR_watchlist-280-8250df?style=flat-square)](knowledge/references/prs/open-watchlist.md)
 
-**Part of the same AI-infra agent ecosystem as
+**Works well with
 [AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS).**
 
 </div>
 
-KernelPilot is for engineers who want an agent to keep optimizing a real GPU
-kernel after the first obvious rewrite is done.
+KernelPilot is for long GPU-kernel tuning runs, the kind where the useful facts
+are easy to lose: which baseline was copied, which shape regressed, what NCU
+said, and which source idea has already been tried.
 
-It turns [Humanize RLCR](https://github.com/PolyArch/humanize) into a
-kernel-specialized loop: plan, refine, build a clean standalone repo, implement
-candidates, run correctness tests, benchmark, collect Nsight Compute evidence,
-record provenance, and continue from review feedback. The point is not another
-prompt template. The point is to give Codex the memory, process, and profiler
-discipline needed to do kernel work without constant human steering.
+It wraps [Humanize RLCR](https://github.com/PolyArch/humanize) for kernel work.
+Codex plans the task, creates a standalone repo, builds candidates, runs tests
+and benchmarks, records provenance, profiles representative cases, and lets the
+Humanize stop hook decide whether another round is needed.
 
-If [AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS)
-is the agent playbook pack for serving, profiler triage, SGLang operations, and
-model-family PR intelligence, KernelPilot is the autonomous kernel optimization
-lab that plugs into that ecosystem.
+It is designed to sit next to
+[AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS):
+that repo carries broader serving/profiler/SGLang playbooks, while this repo
+keeps the kernel-loop machinery and CUDA knowledge pack.
 
-If this saves you one failed benchmark loop, one lost NCU insight, or one
-forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
-
-## Why Star It
+## What Is Here
 
 | Signal | What makes it useful |
 | --- | --- |
-| **Humanize Kernel Agent Loop** | One Codex skill handles planning, refinement, standalone repo setup, RLCR startup, benchmark/profile iteration, and review-gated progress. |
-| **607 CUDA optimization PRs** | Production PR knowledge from PR-driven repos such as SGLang, vLLM, TensorRT-LLM, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, TileLang, CCCL/CUB, and more. |
-| **280 open PR watchlist entries** | Fresh CUDA optimization ideas from PR-driven repos are tracked separately from merged evidence, so agents can explore current work without confusing it with production truth. |
-| **Code-first knowledge routing** | Topic pages, source guides, PR notes, blog-to-code maps, and AKO4ALL references tell the agent what to read before choosing an optimization direction. |
-| **Nsight Compute feedback loop** | `profile-evidence` converts NCU metrics into bottleneck classifications, regression explanations, and one concrete next edit. |
+| **Humanize Kernel Agent Loop** | One Codex skill does the plan, refinement, standalone repo setup, RLCR startup, benchmark/profile loop, and stop-hook review. |
+| **607 CUDA optimization PRs** | PR notes from SGLang, vLLM, TensorRT-LLM, FlashAttention, FlashInfer, CUTLASS/CuTe, DeepGEMM, TileLang, CCCL/CUB, and similar repos. |
+| **280 open PR watchlist entries** | Current CUDA optimization work is kept separate from merged evidence. Open PRs must be re-checked before use. |
+| **Code-first knowledge routing** | Topic pages, source guides, PR notes, blog-to-code maps, and AKO4ALL references tell Codex what to read first. |
+| **Nsight Compute feedback loop** | `profile-evidence` turns NCU metrics into a bottleneck call and one next edit. |
 | **Clean standalone repos** | Candidate kernels live in isolated repos with their own bindings, tests, benchmarks, ledgers, lineage, and artifacts. |
 | **Baseline-aware, language-flexible** | Use CUDA C++/PTX, Triton, CuTe DSL, TileLang, CUTLASS/CuTe, ThunderKittens, or the baseline's own kernel stack unless the user asks for from-scratch work. |
 
@@ -50,8 +46,8 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 
 | Goal | Start here |
 | --- | --- |
-| Run an end-to-end autonomous kernel optimization loop in Codex | [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) |
-| Route an agent through CUDA PR/source knowledge before editing | [`kernel-knowledge`](skills/kernel-knowledge/) |
+| Run a full kernel optimization loop in Codex | [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) |
+| Route Codex through CUDA PR/source knowledge before editing | [`kernel-knowledge`](skills/kernel-knowledge/) |
 | Turn NCU reports into concrete next kernel edits | [`profile-evidence`](skills/profile-evidence/) |
 | Inspect the PR-driven kernel corpus by framework | [`knowledge/references/prs/`](knowledge/references/prs/) |
 | Inspect kernel ideas by bottleneck family | [`knowledge/references/prs/by-topic/`](knowledge/references/prs/by-topic/) |
@@ -59,20 +55,22 @@ forgotten upstream kernel PR, a star helps more AI-infra engineers find it.
 
 ## How The Loop Works
 
-1. **Knowledge pass**: read topic/framework routing, then inspect source guides
-   plus PR pages for PR-driven repos; source-only repos use code guides and
-   source scans directly.
+1. **Scoped knowledge pass**: read the target topic, target framework, matching
+   source guide, and the PR page only when that repo is PR-driven. Source-only
+   repos go straight to source files, tests, and benchmarks.
 2. **Standalone setup**: create a fresh repo with torch bindings, correctness
    tests, benchmarks, ledgers, lineage, and profile artifact folders.
-3. **Evidence loop**: implement one candidate, test it, benchmark it, collect
-   NCU when useful, and record every attempt.
-4. **Review gate**: Humanize RLCR reviews the round and either stops cleanly or
-   emits the next round prompt.
+3. **Baseline evidence**: run baseline correctness/benchmark and collect one
+   representative NCU digest before the first profile-driven edit.
+4. **Evidence loop**: implement one candidate, test it, benchmark it, collect
+   NCU on regressions/plateaus/surprising wins, and record every attempt.
+5. **Review gate**: Humanize RLCR reviews the round and either stops cleanly or
+   writes the next round prompt.
 
 After two consecutive weak rounds with less than 1% geomean improvement,
-KernelPilot forces a research expansion: read at least 50 new code-first
-sources before prose sources and log do-not-reread keys so long-context loss
-does not erase what the agent already learned.
+KernelPilot expands the search: read at least 50 new code-first sources before
+prose sources and log do-not-reread keys so the next round does not repeat the
+same reading.
 
 ## Install
 
@@ -156,8 +154,7 @@ Keep the monitor outside the Codex TUI.
 ## Related
 
 - [AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS):
-  agent-ready playbooks for serving benchmarks, torch-profiler triage, SGLang
-  optimization, production incidents, model PR histories, and GPU-kernel
-  AKO4ALL workflows.
+  playbooks for serving benchmarks, torch-profiler triage, SGLang optimization,
+  production incidents, model PR histories, and GPU-kernel AKO4ALL workflows.
 - [Humanize](https://github.com/PolyArch/humanize): the RLCR loop runtime that
   KernelPilot specializes for GPU kernel work.
