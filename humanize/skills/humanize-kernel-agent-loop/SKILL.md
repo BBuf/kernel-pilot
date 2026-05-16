@@ -65,10 +65,24 @@ missing and cannot be inferred.
 - If the user does not specify a language, start from the active baseline
   kernel's implementation system unless there is a measured reason to choose a
   different one.
+- Treat "standalone" as a repository, build, benchmark, and runtime boundary,
+  not as a clean-room source restriction. A standalone candidate must live in
+  the isolated optimization repo and must not call the baseline package as its
+  runtime implementation, but it may be derived from public baseline source
+  when license and attribution allow.
+- Do not infer "from scratch" from phrases such as "standalone",
+  "CUDA/inline-PTX", or "using X as the baseline". The baseline implementation
+  is comparison-only only when the user explicitly says "from scratch",
+  "clean-room", "do not copy/adapt", or equivalent.
 - The baseline kernel can be the starting point. You may copy or adapt baseline
   code into the standalone repo when license and attribution allow.
   Record the exact source path/URL, commit, license/notice, and delta in the
   attempt ledger or lineage.
+- When the request names a high-performance baseline and sets a target near or
+  above that baseline, the first implementation plan should normally select a
+  baseline-derived parent before attempting a teaching, scalar, or unrelated
+  stepping-stone kernel. If it does not, the plan must include measured or
+  licensing evidence for why baseline-derived work is unsuitable.
 - If the user explicitly asks for a from-scratch kernel or says not to use the
   baseline implementation, do not copy, adapt, or pattern-match the baseline
   kernel code. Use that baseline only for correctness, benchmark, profiler, and
@@ -76,6 +90,11 @@ missing and cannot be inferred.
 - Keep the source framework checkout itself read-only for standalone work unless
   the user explicitly asks for an in-place framework patch. The standalone repo
   may contain the copied/adapted baseline candidate and subsequent mutations.
+- If copying the baseline into the standalone repo is allowed but the final
+  requested implementation language differs from the baseline language, port or
+  specialize the canonical source/helper logic toward the requested stack
+  instead of hand-deriving hardware descriptors, synchronization protocols, or
+  layout algebra from memory.
 - Run optimization work in a fresh standalone git repo with its own PyTorch
   binding, correctness tests, benchmark harness, ledgers, lineage, and profile
   artifacts.
@@ -170,11 +189,15 @@ Autonomous query order:
    operator, bottleneck, or exact instruction/feature term.
 2. Use `scripts/get_page.py --follow-sources` to expand a promising wiki or PR
    page into its cited evidence.
-3. Open the materialized `review.diff`, `ORIGIN.yaml`, `upstream.json`, and
+3. For any named baseline or directly relevant prior implementation, inspect
+   materialized upstream source snapshots, local installed source, and helper
+   files before writing a new kernel. Wiki/blog summaries may route the search,
+   but source code and provenance decide implementation details.
+4. Open the materialized `review.diff`, `ORIGIN.yaml`, `upstream.json`, and
    `source-snapshot/` files for the PR before borrowing any idea.
-4. Use `scripts/grep_wiki.py` for exact terms such as instruction mnemonics,
+5. Use `scripts/grep_wiki.py` for exact terms such as instruction mnemonics,
    CuTe atoms, profiler counters, dtype names, and memory/cache policy names.
-5. Use wiki syntheses to choose techniques and interpret profiler symptoms; use
+6. Use wiki syntheses to choose techniques and interpret profiler symptoms; use
    docs/blogs to understand hardware contracts, DSL semantics, and public
    performance claims; then ground implementation choices back in PR/source
    evidence when code is borrowed or adapted.
@@ -194,6 +217,14 @@ use the Humanize gen-plan schema and include these acceptance criteria:
   user asks for an in-place patch.
 - Candidate implementation language is documented and follows the user request
   or the active baseline's kernel stack.
+- Source-use policy is explicit: either baseline-derived is allowed by default
+  with provenance requirements, or the user explicitly requested a from-scratch
+  comparison-only baseline. Do not leave this as a pending user decision merely
+  because the repo is standalone.
+- If a high-performance baseline is named and baseline-derived work is allowed,
+  the milestone sequence starts with source/provenance inspection and a
+  baseline-derived or baseline-port candidate unless the plan records a concrete
+  blocker.
 - If baseline code seeds the first candidate, provenance, license/notice,
   copied files, and the first optimization delta are recorded before further
   mutation.
@@ -216,9 +247,49 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - When progress stalls, Humanize expands PR research autonomously. Prefer unread
   PR bundles, changed kernel files, linked tests, benchmarks, and profiler
   notes, guided by the current task context and existing attempt/lineage notes.
+- When profiling shows a candidate is more than 10x slower than the named
+  baseline and has a different bottleneck class, do not keep spending rounds on
+  the same lineage's local micro-tuning. The next round must either switch to a
+  baseline-derived parent or produce a design-reset document explaining why that
+  is impossible.
+- Experimental GPU kernels that can hang must have timeout-bounded bring-up
+  milestones. A timeout marks that lineage rejected until a minimal executable
+  tile validates the suspected protocol, descriptor, layout, memory, and
+  synchronization semantics.
 - Stop only when all ACs are met, or when `ncu-report` evidence shows the kernel is
   already beyond 85% of the relevant peak and no low-effort implementation edit
   remains.
+
+## Baseline-Derived Default
+
+Use this policy when refining kernel plans and writing round contracts:
+
+- `standalone` means the candidate is self-contained in the optimization repo;
+  it does not mean independent invention.
+- A named baseline is an allowed implementation parent by default.
+- The source framework checkout stays read-only. Copying, porting, or
+  specializing public source into the standalone repo is allowed when provenance
+  and license/notice are recorded.
+- Do not create a pending user decision for baseline code seeding unless there
+  is an actual conflict: unclear license, unavailable source, incompatible user
+  wording, or a requested implementation stack that cannot reasonably host the
+  baseline-derived code.
+- If the baseline uses a DSL or helper library for hardware-critical details,
+  prefer porting those canonical helpers or using the same library over
+  handwritten guesses.
+
+## Progress And Timeout Gates
+
+- If an attempt times out or hangs, reproduce the failure with the smallest
+  shape/tile under a hard timeout before any target-size benchmark. Record the
+  rejected lineage and the suspected root-cause surface.
+- If two consecutive reviews identify the same mainline blocker, the next
+  round must be a design-reset or parent-selection round, not another broad
+  implementation pass.
+- If a candidate remains more than 10x slower than the baseline after a correct
+  tensor-core-class attempt, treat further same-lineage tuning as evidence
+  maintenance unless `ncu-report` names a specific low-risk edit with plausible
+  order-of-magnitude impact.
 
 ## NCU Report Evidence
 
