@@ -1,0 +1,2130 @@
+diff --git a/examples/gemm_sm100/gemm_mxfp8_blockscaled_1d1d.py b/examples/gemm_sm100/gemm_mxfp8_blockscaled_1d1d.py
+new file mode 100644
+index 0000000000..c451a8856d
+--- /dev/null
++++ b/examples/gemm_sm100/gemm_mxfp8_blockscaled_1d1d.py
+@@ -0,0 +1,703 @@
++# MXFP8 Block-Scaled GEMM on SM100
++# Blockscale size: (M, N, K) = (1, 1, 128)
++
++import argparse
++import torch
++import tilelang
++import tilelang.language as T
++from tilelang.carver.arch import driver
++from tilelang.profiler import do_bench
++
++
++@tilelang.jit
++def mxfp8_blockscaled_gemm(
++    A,
++    B,
++    SFA,
++    SFB,
++    block_M,
++    block_N,
++    block_K,
++    in_dtype,
++    out_dtype,
++    accum_dtype,
++    num_stages,
++    sf_granularity_k=128,
++):
++    """1D-1D Block-scaled MXFP8 GEMM.
++
++    A:   [M, K] in FP8 (E4M3 or E5M2)
++    B:   [K, N] in FP8 (E4M3 or E5M2)
++    SFA: [(K / sf_granularity_k) / 4) * M] in uint32
++         Group-major packed E8M0 scale factors for A.
++    SFB: [(K / sf_granularity_k) / 4) * N] in uint32
++         Group-major packed E8M0 scale factors for B.
++    """
++    M, N, K = T.const("M, N, K")
++
++    k_iters = T.ceildiv(K, block_K)
++    # Load 4 K-blocks of SF at once → load every 4 iterations
++    sf_load_period = sf_granularity_k * 4 // block_K
++    sf_k_groups = T.ceildiv(T.ceildiv(K, sf_granularity_k), 4)
++
++    A: T.Tensor[[M, K], in_dtype]
++    B: T.Tensor[[K, N], in_dtype]
++    SFA: T.Tensor[[sf_k_groups * M], T.uint32]
++    SFB: T.Tensor[[sf_k_groups * N], T.uint32]
++    C = T.empty((M, N), out_dtype)
++
++    with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=128) as (bx, by):
++        # Data shared memory (pipelined)
++        A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
++        B_shared = T.alloc_shared((num_stages, block_K, block_N), in_dtype)
++
++        # Scale factor shared memory — one uint32 per row/column, packing 4 K-blocks.
++        SFA_shared = T.alloc_shared((num_stages, block_M), "uint32")
++        SFB_shared = T.alloc_shared((num_stages, block_N), "uint32")
++
++        # Accumulator in tensor memory
++        C_tmem = T.alloc_tmem([block_M, block_N], accum_dtype)
++
++        # Scale factors in tensor memory (TMEM has 128 rows / 32-bit cells)
++        SFA_tmem = T.alloc_tmem([block_M, block_M // 128 * 4], "uint32")
++        SFB_tmem = T.alloc_tmem([block_M, block_N // 128 * 4], "uint32")
++
++        # Output buffers
++        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++        C_shared = T.alloc_shared((block_M, block_N), out_dtype)
++
++        # Barriers
++        loaded = T.alloc_barrier([32] * num_stages)
++        with_sf_full = T.alloc_barrier([32] * num_stages)
++        consumed = T.alloc_barrier([1] * num_stages)
++        tmem_full = T.alloc_barrier([1])
++
++        tx = T.get_thread_binding()
++        T.use_swizzle(8)
++
++        if tx < 32:
++            # Warp 0: TMA load
++            for k in T.serial(k_iters):
++                T.mbarrier_wait_parity(consumed[k % num_stages], ((k // num_stages) & 1) ^ 1)
++                T.tma_copy(
++                    A[bx * block_M : (bx + 1) * block_M, k * block_K : (k + 1) * block_K],
++                    A_shared[k % num_stages, :, :],
++                    barrier=loaded[k % num_stages],
++                )
++                T.tma_copy(
++                    B[k * block_K : (k + 1) * block_K, by * block_N : (by + 1) * block_N],
++                    B_shared[k % num_stages, :, :],
++                    barrier=loaded[k % num_stages],
++                )
++                # Load one packed uint32 SF word every sf_load_period iterations.
++                if k % sf_load_period == 0:
++                    sf_group_idx = k // sf_load_period
++                    T.tma_copy(
++                        SFA[sf_group_idx * M + bx * block_M : sf_group_idx * M + (bx + 1) * block_M],
++                        SFA_shared[k % num_stages, :],
++                        barrier=loaded[k % num_stages],
++                    )
++                    T.tma_copy(
++                        SFB[sf_group_idx * N + by * block_N : sf_group_idx * N + (by + 1) * block_N],
++                        SFB_shared[k % num_stages, :],
++                        barrier=loaded[k % num_stages],
++                    )
++                T.mbarrier_arrive(loaded[k % num_stages])
++
++        elif tx < 64:
++            # Warp 1: MMA issue + UTCCP
++            for k in T.serial(k_iters):
++                stage = k % num_stages
++                phase = (k // num_stages) & 1
++                T.mbarrier_wait_parity(loaded[stage], phase)
++                T.mbarrier_wait_parity(with_sf_full[stage], phase)
++
++                if k % sf_load_period == 0:
++                    T.tcgen05_cp_warpx4(SFA_shared[stage, :], SFA_tmem)
++                    T.tcgen05_cp_warpx4(SFB_shared[stage, :], SFB_tmem)
++
++                # sf_id selects which of the 4 packed E8M0 values to use
++                T.tcgen05_gemm_blockscaled(
++                    A_shared[stage, :, :],
++                    B_shared[stage, :, :],
++                    C_tmem,
++                    SFA_tmem,
++                    SFB_tmem,
++                    mbar=consumed[stage],
++                    clear_accum=k == 0,
++                    sf_a_id=k % sf_load_period,
++                    sf_b_id=k % sf_load_period,
++                )
++
++            T.tcgen05_mma_arrive(tmem_full)
++
++        elif tx < 96:
++            # Warp 2: scale-factor transpose
++            for k in T.serial(k_iters):
++                stage = k % num_stages
++                phase = (k // num_stages) & 1
++                T.mbarrier_wait_parity(loaded[stage], phase)
++
++                if k % sf_load_period == 0:
++                    T.tcgen05_sf_warp_transpose(SFA_shared[stage, :])
++                    T.tcgen05_sf_warp_transpose(SFB_shared[stage, :])
++                    T.fence_proxy_async()
++                T.mbarrier_arrive(with_sf_full[stage])
++
++        # Epilogue: all warps
++        T.mbarrier_wait_parity(tmem_full, 0)
++        T.sync_threads()
++
++        T.copy(C_tmem, C_local)
++        T.copy(C_local, C_shared)
++        T.copy(C_shared, C[bx * block_M, by * block_N])
++
++    return C
++
++
++@tilelang.jit
++def mxfp8_blockscaled_gemm_2cta(
++    A,
++    B,
++    SFA,
++    SFB,
++    block_M,
++    block_N,
++    block_K,
++    in_dtype,
++    out_dtype,
++    accum_dtype,
++    num_stages,
++    sf_granularity_k=128,
++):
++    M, N, K = T.const("M, N, K")
++
++    assert block_M == 128
++    assert block_N == 256
++    assert block_K == 128
++    assert sf_granularity_k == 128
++
++    half_N = block_N // 2
++    k_iters = T.ceildiv(K, block_K)
++    sf_load_period = sf_granularity_k * 4 // block_K
++    sf_k_groups = T.ceildiv(T.ceildiv(K, sf_granularity_k), 4)
++    assert sf_load_period == 4
++
++    A: T.Tensor[[M, K], in_dtype]
++    B: T.Tensor[[K, N], in_dtype]
++    SFA: T.Tensor[[sf_k_groups * M], T.uint32]
++    SFB: T.Tensor[[sf_k_groups * N], T.uint32]
++    C = T.empty((M, N), out_dtype)
++
++    with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=128, cluster_dims=2) as (bx, by):
++        cta_id = T.block_rank_in_cluster()
++        T.assume(cta_id < 2)
++
++        A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
++        B_shared = T.alloc_shared((num_stages, block_K, half_N), in_dtype)
++        SFA_shared = T.alloc_shared((num_stages, block_M), "uint32")
++        SFB_shared = T.alloc_shared((num_stages, block_N), "uint32")
++
++        C_tmem = T.alloc_tmem([block_M, block_N], accum_dtype)
++        SFA_tmem = T.alloc_tmem([block_M, 4], "uint32")
++        SFB_tmem = T.alloc_tmem([block_M, 8], "uint32")
++
++        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++        C_shared = T.alloc_shared((block_M, block_N), out_dtype)
++
++        loaded = T.alloc_barrier([32] * num_stages)
++        with_sf_full = T.alloc_cluster_barrier([32 * 2] * num_stages)
++        consumed = T.alloc_cluster_barrier([1] * num_stages)
++        tmem_full = T.alloc_barrier([1])
++
++        tx = T.get_thread_binding()
++        warp_idx = tx // 32
++        T.use_swizzle(16)
++
++        if warp_idx == 0:
++            for k in T.serial(k_iters):
++                stage = k % num_stages
++                phase = (k // num_stages) & 1
++                T.mbarrier_wait_parity(consumed[stage], phase ^ 1)
++                T.tma_copy(
++                    A[bx * block_M : (bx + 1) * block_M, k * block_K : (k + 1) * block_K],
++                    A_shared[stage, :, :],
++                    barrier=loaded[stage],
++                )
++                T.tma_copy(
++                    B[
++                        k * block_K : (k + 1) * block_K,
++                        (by * block_N + cta_id * half_N) : (by * block_N + (cta_id + 1) * half_N),
++                    ],
++                    B_shared[stage, :, :],
++                    barrier=loaded[stage],
++                )
++                if k % sf_load_period == 0:
++                    sf_group_idx = k // sf_load_period
++                    T.tma_copy(
++                        SFA[sf_group_idx * M + bx * block_M : sf_group_idx * M + (bx + 1) * block_M],
++                        SFA_shared[stage, :],
++                        barrier=loaded[stage],
++                    )
++                    T.tma_copy(
++                        SFB[sf_group_idx * N + by * block_N : sf_group_idx * N + (by + 1) * block_N],
++                        SFB_shared[stage, :],
++                        barrier=loaded[stage],
++                    )
++                T.mbarrier_arrive(loaded[stage])
++
++        elif warp_idx == 1 and cta_id == 0:
++            for k in T.serial(k_iters):
++                stage = k % num_stages
++                phase = (k // num_stages) & 1
++                T.mbarrier_wait_parity(with_sf_full[stage], phase)
++                if k % sf_load_period == 0:
++                    T.tcgen05_cp_warpx4(SFA_shared[stage, :], SFA_tmem, use_2cta=True)
++                    T.tcgen05_cp_warpx4(SFB_shared[stage, :], SFB_tmem, use_2cta=True)
++
++                T.tcgen05_gemm_blockscaled(
++                    A_shared[stage, :, :],
++                    B_shared[stage, :, :],
++                    C_tmem,
++                    SFA_tmem,
++                    SFB_tmem,
++                    mbar=consumed[stage],
++                    clear_accum=k == 0,
++                    sf_a_id=k % sf_load_period,
++                    sf_b_id=k % sf_load_period,
++                    use_2cta=True,
++                )
++            T.tcgen05_mma_arrive(tmem_full, arrive_2cta=True)
++
++        elif warp_idx == 2:
++            for k in T.serial(k_iters):
++                stage = k % num_stages
++                phase = (k // num_stages) & 1
++                T.mbarrier_wait_parity(loaded[stage], phase)
++                if k % sf_load_period == 0:
++                    T.tcgen05_sf_warp_transpose(SFA_shared[stage, :])
++                    T.tcgen05_sf_warp_transpose(SFB_shared[stage, :])
++                    T.fence_proxy_async()
++                T.mbarrier_arrive(with_sf_full[stage], 0)
++
++        T.mbarrier_wait_parity(tmem_full, 0)
++        T.copy(C_tmem, C_local)
++        T.copy(C_local, C_shared)
++        T.copy(C_shared, C[bx * block_M, by * block_N])
++
++    return C
++
++
++@tilelang.jit
++def mxfp8_blockscaled_gemm_2cta_persistent(
++    A,
++    B,
++    SFA,
++    SFB,
++    block_M,
++    block_N,
++    block_K,
++    in_dtype,
++    out_dtype,
++    accum_dtype,
++    num_stages,
++    sf_granularity_k=128,
++    use_tma_store=True,
++    store_block_N=64,
++):
++    M, N, K = T.const("M, N, K")
++
++    half_N = block_N // 2
++    k_iters = T.ceildiv(K, block_K)
++    sf_load_period = sf_granularity_k * 4 // block_K
++    sf_k_groups = T.ceildiv(T.ceildiv(K, sf_granularity_k), 4)
++
++    A: T.Tensor[[M, K], in_dtype]
++    B: T.Tensor[[K, N], in_dtype]
++    SFA: T.Tensor[[sf_k_groups * M], T.uint32]
++    SFB: T.Tensor[[sf_k_groups * N], T.uint32]
++    C = T.empty((M, N), out_dtype)
++
++    sm_num = driver.get_num_sms()
++    num_clusters = sm_num // 2
++    m_blocks = T.ceildiv(M, block_M)
++    m_clusters = m_blocks // 2
++    n_blocks = T.ceildiv(N, block_N)
++    assert K % (2 * block_K) == 0  # for simplicity
++    waves = T.ceildiv(m_blocks * n_blocks, sm_num)
++    group_size = 16  # in cluster
++    assert n_blocks % (2 * group_size) == 0  # Please adjust group_size if not satisfied
++
++    with T.Kernel(sm_num, threads=256, cluster_dims=2) as (block_id):
++        cta_id = T.block_rank_in_cluster()
++        T.assume(cta_id < 2)
++
++        A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
++        B_shared = T.alloc_shared((num_stages, block_K, half_N), in_dtype)
++        SFA_shared = T.alloc_shared((num_stages, block_M), "uint32")
++        SFB_shared = T.alloc_shared((num_stages, block_N), "uint32")
++
++        C_tmem = T.alloc_tmem([block_M, block_N], accum_dtype)
++        SFA_tmem = T.alloc_tmem([block_M, block_M // 128 * 4], "uint32")
++        SFB_tmem = T.alloc_tmem([block_M, block_N // 128 * 4], "uint32")
++
++        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++        C_local_cast = T.alloc_fragment((block_M, block_N), out_dtype)
++        C_shared = T.alloc_shared((block_M, store_block_N), out_dtype)
++
++        loaded = T.alloc_barrier([32] * num_stages)
++        with_sf_full = T.alloc_cluster_barrier([32 * 2] * num_stages)
++        consumed = T.alloc_cluster_barrier([1] * num_stages)
++        tmem_full = T.alloc_cluster_barrier([1])
++        tmem_empty = T.alloc_cluster_barrier([128 * 2])
++
++        tx = T.get_thread_binding()
++        warp_idx = tx // 32
++
++        if warp_idx == 0:
++            for w in T.unroll(waves):
++                cluster_id = block_id // 2
++                tile_id = num_clusters * w + cluster_id
++                bx_cluster = (tile_id // group_size) % m_clusters
++                bx = bx_cluster * 2 + cta_id
++                by = (tile_id % group_size) + (tile_id // group_size) // m_clusters * group_size
++
++                if bx * block_M < M and by * block_N < N:
++                    for k in T.serial(k_iters):
++                        phase = w * k_iters + k
++                        stage = phase % num_stages
++                        parity = (phase // num_stages) & 1
++                        T.mbarrier_wait_parity(consumed[stage], parity ^ 1)
++                        T.tma_copy(
++                            A[bx * block_M : (bx + 1) * block_M, k * block_K : (k + 1) * block_K],
++                            A_shared[stage, :, :],
++                            barrier=loaded[stage],
++                        )
++                        T.tma_copy(
++                            B[
++                                k * block_K : (k + 1) * block_K,
++                                by * block_N + cta_id * half_N : by * block_N + (cta_id + 1) * half_N,
++                            ],
++                            B_shared[stage, :, :],
++                            barrier=loaded[stage],
++                        )
++                        if k % sf_load_period == 0:
++                            sf_group_idx = k // sf_load_period
++                            T.tma_copy(
++                                SFA[sf_group_idx * M + bx * block_M : sf_group_idx * M + (bx + 1) * block_M],
++                                SFA_shared[stage, :],
++                                barrier=loaded[stage],
++                            )
++                            T.tma_copy(
++                                SFB[sf_group_idx * N + by * block_N : sf_group_idx * N + (by + 1) * block_N],
++                                SFB_shared[stage, :],
++                                barrier=loaded[stage],
++                            )
++                        T.mbarrier_arrive(loaded[stage])
++
++        elif warp_idx == 1 and cta_id == 0:
++            for w in T.unroll(waves):
++                cluster_id = block_id // 2
++                tile_id = num_clusters * w + cluster_id
++                bx_cluster = (tile_id // group_size) % m_clusters
++                bx = bx_cluster * 2 + cta_id
++                by = (tile_id % group_size) + (tile_id // group_size) // m_clusters * group_size
++
++                if bx * block_M < M and by * block_N < N:
++                    T.mbarrier_wait_parity(tmem_empty, (w & 1) ^ 1)
++                    for k in T.serial(k_iters):
++                        phase = w * k_iters + k
++                        stage = phase % num_stages
++                        parity = (phase // num_stages) & 1
++                        T.mbarrier_wait_parity(with_sf_full[stage], parity)
++                        if k % sf_load_period == 0:
++                            T.tcgen05_cp_warpx4(SFA_shared[stage, :], SFA_tmem, use_2cta=True)
++                            T.tcgen05_cp_warpx4(SFB_shared[stage, :], SFB_tmem, use_2cta=True)
++                        T.tcgen05_gemm_blockscaled(
++                            A_shared[stage, :, :],
++                            B_shared[stage, :, :],
++                            C_tmem,
++                            SFA_tmem,
++                            SFB_tmem,
++                            mbar=consumed[stage],
++                            clear_accum=k == 0,
++                            sf_a_id=k % sf_load_period,
++                            sf_b_id=k % sf_load_period,
++                            use_2cta=True,
++                        )
++                    T.tcgen05_mma_arrive(tmem_full, arrive_2cta=True)
++
++        elif warp_idx == 2:
++            for w in T.unroll(waves):
++                cluster_id = block_id // 2
++                tile_id = num_clusters * w + cluster_id
++                bx_cluster = (tile_id // group_size) % m_clusters
++                bx = bx_cluster * 2 + cta_id
++                by = (tile_id % group_size) + (tile_id // group_size) // m_clusters * group_size
++
++                if bx * block_M < M and by * block_N < N:
++                    for k in T.serial(k_iters):
++                        phase = w * k_iters + k
++                        stage = phase % num_stages
++                        parity = (phase // num_stages) & 1
++                        T.mbarrier_wait_parity(loaded[stage], parity)
++                        if k % sf_load_period == 0:
++                            T.tcgen05_sf_warp_transpose(SFA_shared[stage, :])
++                            T.tcgen05_sf_warp_transpose(SFB_shared[stage, :])
++                            T.fence_proxy_async()
++                        T.mbarrier_arrive(with_sf_full[stage], 0)
++
++        elif 128 <= tx < 256:
++            for w in T.unroll(waves):
++                cluster_id = block_id // 2
++                tile_id = num_clusters * w + cluster_id
++                bx_cluster = (tile_id // group_size) % m_clusters
++                bx = bx_cluster * 2 + cta_id
++                by = (tile_id % group_size) + (tile_id // group_size) // m_clusters * group_size
++
++                if bx * block_M < M and by * block_N < N:
++                    T.mbarrier_wait_parity(tmem_full, w & 1)
++                    T.copy(C_tmem, C_local)
++                    T.mbarrier_arrive(tmem_empty, 0)
++
++                    if use_tma_store:
++                        for i in T.unroll(T.ceildiv(block_N, store_block_N)):
++                            T.copy(C_local[:, i * store_block_N : (i + 1) * store_block_N], C_shared)
++                            T.copy(C_shared, C[bx * block_M, by * block_N + i * store_block_N])
++                    else:
++                        T.copy(C_local, C_local_cast)
++                        T.copy(C_local_cast, C[bx * block_M, by * block_N])
++    return C
++
++
++def unpack_sf_u32_1d(packed_sf, mn, sf_k_blocks):
++    sf_k_groups = (sf_k_blocks + 3) // 4
++    packed_2d = packed_sf.view(sf_k_groups, mn).T.contiguous().to(torch.int64)
++    unpacked = torch.empty((mn, sf_k_groups * 4), device=packed_sf.device, dtype=torch.uint8)
++    for i in range(4):
++        unpacked[:, i::4] = ((packed_2d >> (8 * i)) & 0xFF).to(torch.uint8)
++    return unpacked[:, :sf_k_blocks].contiguous()
++
++
++def pack_sf_u8_to_u32_1d(sf_u8):
++    assert sf_u8.dtype == torch.uint8
++    assert sf_u8.dim() == 2
++    mn, sf_k_padded = sf_u8.shape
++    assert sf_k_padded % 4 == 0
++    words = sf_u8.to(torch.int64)
++    packed = (words[:, 0::4] | (words[:, 1::4] << 8) | (words[:, 2::4] << 16) | (words[:, 3::4] << 24)).to(torch.uint32)
++    return packed.T.contiguous().reshape(-1)
++
++
++def quantize_fp8_with_packed_ue8m0(x, gran_k=128):
++    """DeepGEMM-style per-token FP8 quantization with UE8M0 scale factors.
++
++    Returns:
++        x_fp8: [MN, K] in float8_e4m3fn
++        sf_packed_u32: flattened group-major packed uint32 scale factors
++        sf_u8: [MN, ceil(K / gran_k)] unpacked E8M0 exponents
++    """
++
++    def ceil_div_int(x, y):
++        return (x + y - 1) // y
++
++    def align_up(x, y):
++        return ceil_div_int(x, y) * y
++
++    def ceil_to_ue8m0(x):
++        bits = x.abs().float().view(torch.int32)
++        exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).ne(0).to(torch.int32)
++        return (exp.clamp(1, 254) << 23).view(torch.float32)
++
++    assert x.dim() == 2
++    mn, k = x.shape
++    padded_k = align_up(k, gran_k)
++
++    x_padded = torch.zeros((mn, padded_k), device=x.device, dtype=x.dtype)
++    x_padded[:, :k] = x
++    x_view = x_padded.view(mn, padded_k // gran_k, gran_k)
++
++    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
++    sf = ceil_to_ue8m0(x_amax / 448.0)
++
++    x_fp8 = (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn)
++    x_fp8 = x_fp8.view(mn, padded_k)[:, :k].contiguous()
++
++    sf_u8 = (sf.contiguous().view(torch.int32) >> 23).to(torch.uint8)
++    sf_k_blocks = sf_u8.shape[1]
++    sf_k_padded = align_up(sf_k_blocks, 4)
++    if sf_k_padded != sf_k_blocks:
++        sf_u8_padded = torch.full((mn, sf_k_padded), 127, device=x.device, dtype=torch.uint8)
++        sf_u8_padded[:, :sf_k_blocks] = sf_u8
++    else:
++        sf_u8_padded = sf_u8
++
++    sf_packed_u32 = pack_sf_u8_to_u32_1d(sf_u8_padded)
++    return x_fp8, sf_packed_u32, sf_u8
++
++
++def blockscaled_gemm_ref(a, b, sfa_packed, sfb_packed, sf_granularity_k=128):
++    """Torch reference for block-scaled MXFP8 GEMM.
++
++    Args:
++        a: [M, K] FP8 tensor
++        b: [K, N] FP8 tensor
++        sfa_packed: [(sf_k_blocks / 4) * M] uint32 packed E8M0 scale factors for A
++        sfb_packed: [(sf_k_blocks / 4) * N] uint32 packed E8M0 scale factors for B
++        sf_granularity_k: number of K elements per scale factor block (default 128)
++
++    Returns:
++        [M, N] float32 result
++    """
++    M, K = a.shape
++    K2, N = b.shape
++    assert K == K2
++    sf_k_blocks = (K + sf_granularity_k - 1) // sf_granularity_k
++    sfa_unpacked = unpack_sf_u32_1d(sfa_packed, M, sf_k_blocks)
++    sfb_unpacked = unpack_sf_u32_1d(sfb_packed, N, sf_k_blocks)
++
++    a_f32 = a.to(torch.float32)
++    b_f32 = b.to(torch.float32)
++
++    # E8M0 exponent to float scale: 2^(exp - 127)
++    sfa_scales = torch.pow(2.0, sfa_unpacked.to(torch.float32) - 127.0)  # [M, sf_k_blocks]
++    sfb_scales = torch.pow(2.0, sfb_unpacked.to(torch.float32) - 127.0)  # [N, sf_k_blocks]
++
++    c = torch.zeros(M, N, device=a.device, dtype=torch.float32)
++    for bi in range(sf_k_blocks):
++        k_start = bi * sf_granularity_k
++        k_end = min(k_start + sf_granularity_k, K)
++        # Scale A block: [M, block_k] * [M, 1]
++        a_block = a_f32[:, k_start:k_end] * sfa_scales[:, bi : bi + 1]
++        # Scale B block: [block_k, N] * [1, N]  (sfb is [N, blocks], transpose for broadcast)
++        b_block = b_f32[k_start:k_end, :] * sfb_scales[:, bi : bi + 1].T
++        c += a_block @ b_block
++    return c
++
++
++def cosine_similarity(a, b):
++    a_flat = a.flatten().float()
++    b_flat = b.flatten().float()
++    return (a_flat @ b_flat) / (a_flat.norm() * b_flat.norm())
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--use-e2e-quant-path", action="store_true", default=True)
++    parser.add_argument("--persistent", action="store_true", default=True)
++    parser.add_argument("--enable-2cta", action="store_true", default=True)
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++
++    M, N, K = 8192, 8192, 8192
++    block_M, block_N, block_K = 128, 256, 128
++    in_dtype, out_dtype, accum_dtype = T.float8_e4m3fn, T.bfloat16, T.float
++    use_e2e_quant_path = args.use_e2e_quant_path
++    persistent = args.persistent
++    enable_2cta = args.enable_2cta
++    num_stages = 6 if enable_2cta else 4
++    if persistent:
++        assert enable_2cta
++        kernel = mxfp8_blockscaled_gemm_2cta_persistent
++    else:
++        kernel = mxfp8_blockscaled_gemm_2cta if enable_2cta else mxfp8_blockscaled_gemm
++    sf_granularity_k = 128
++    assert sf_granularity_k == 128
++
++    if use_e2e_quant_path:
++        # End-to-end path:
++        #   fp16/bf16 source tensors -> per-token FP8 quantization with UE8M0 SF
++        #   -> pack 4 SF entries into one uint32 -> blockscaled GEMM
++        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
++        w_nt = torch.randn(N, K, device="cuda", dtype=torch.float16)
++
++        a, sfa, _ = quantize_fp8_with_packed_ue8m0(x, gran_k=sf_granularity_k)
++        b_nt, sfb, _ = quantize_fp8_with_packed_ue8m0(w_nt, gran_k=sf_granularity_k)
++        b = b_nt.T.contiguous()
++    else:
++        a = torch.randn(M, K, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
++        b = torch.randn(K, N, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
++
++        # E8M0 scale factors: one uint32 per row per 4 K-blocks.
++        sf_k_blocks = (K + sf_granularity_k - 1) // sf_granularity_k
++
++        # Pad to multiple of 4 (UTCCP loads 4 K-blocks at a time)
++        sf_k_padded = ((sf_k_blocks + 3) // 4) * 4
++        sfa_u8 = torch.randint(127 - 5, 127 + 5, (M, sf_k_padded), device="cuda", dtype=torch.uint8)
++        sfb_u8 = torch.randint(127 - 5, 127 + 5, (N, sf_k_padded), device="cuda", dtype=torch.uint8)
++        sfa = pack_sf_u8_to_u32_1d(sfa_u8)
++        sfb = pack_sf_u8_to_u32_1d(sfb_u8)
++
++    c = kernel(
++        a,
++        b,
++        sfa,
++        sfb,
++        block_M,
++        block_N,
++        block_K,
++        in_dtype,
++        out_dtype,
++        accum_dtype,
++        num_stages,
++        sf_granularity_k,
++    )
++    print(
++        kernel.get_kernel_source(
++            a,
++            b,
++            sfa,
++            sfb,
++            block_M,
++            block_N,
++            block_K,
++            in_dtype,
++            out_dtype,
++            accum_dtype,
++            num_stages,
++            sf_granularity_k,
++        )
++    )
++
++    if use_e2e_quant_path:
++        # For the end-to-end quantization path, compare against the reference with bf16 gemm
++        ref_c = (x.float() @ w_nt.float().T).to(torch.bfloat16)
++    else:
++        ref_c = blockscaled_gemm_ref(a, b, sfa, sfb, sf_granularity_k).to(torch.bfloat16)
++    sim = cosine_similarity(c, ref_c)
++
++    print(f"Output shape: {c.shape}, dtype: {c.dtype}")
++    print(f"E2E quant path: {use_e2e_quant_path}")
++    print(f"{c=}, {ref_c=}")
++    # print(f"Max abs error: {(c.float() - ref_c.float()).abs().max().item():.6f}")
++    print(f"Cosine similarity: {sim.item():.6f}")
++    if use_e2e_quant_path:
++        assert 1 - sim < 1e-3  # err tolerance from DeepGEMM
++        print("e2e check passed ✅")
++
++    tl_latency = do_bench(
++        lambda: kernel(
++            a,
++            b,
++            sfa,
++            sfb,
++            block_M,
++            block_N,
++            block_K,
++            in_dtype,
++            out_dtype,
++            accum_dtype,
++            num_stages,
++            sf_granularity_k,
++        ),
++        backend="cupti",
++    )
++    print(f"Tilelang MXFP8 latency: {tl_latency} ms")
++    print(f"TFLOPs: {2 * M * N * K / (tl_latency / 1e3) / 1e12:.2f}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/op/builtin.cc b/src/op/builtin.cc
+index 0b1e20d4be..1d1aa368ce 100644
+--- a/src/op/builtin.cc
++++ b/src/op/builtin.cc
+@@ -217,6 +217,21 @@ TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_mma_ts)
+     .set_attr<TCallEffectKind>("TCallEffectKind",
+                                Integer(CallEffectKind::kOpaque));
+ 
++TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_mma_blockscaled_ss)
++    .set_num_inputs(16)
++    .set_attr<TCallEffectKind>("TCallEffectKind",
++                               Integer(CallEffectKind::kOpaque));
++
++TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_cp_warpx4)
++    .set_num_inputs(3)
++    .set_attr<TCallEffectKind>("TCallEffectKind",
++                               Integer(CallEffectKind::kOpaque));
++
++TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_sf_warp_transpose)
++    .set_num_inputs(1)
++    .set_attr<TCallEffectKind>("TCallEffectKind",
++                               Integer(CallEffectKind::kOpaque));
++
+ TIR_DEFINE_TL_BUILTIN(deallocate_tmem)
+     .set_num_inputs(1)
+     .set_attr<TCallEffectKind>("TCallEffectKind",
+diff --git a/src/op/builtin.h b/src/op/builtin.h
+index 68c41843c3..2d28eb75bb 100644
+--- a/src/op/builtin.h
++++ b/src/op/builtin.h
+@@ -379,6 +379,21 @@ TVM_DLL const Op &ptx_tcgen05_mma_ss();
+  */
+ TVM_DLL const Op &ptx_tcgen05_mma_ts();
+ 
++/*!
++ * \brief tvm intrinsic for tcgen05 block-scaled mma shared-shared instructions.
++ */
++TVM_DLL const Op &ptx_tcgen05_mma_blockscaled_ss();
++
++/*!
++ * \brief tvm intrinsic for tcgen05 copy warpx4 (smem to tmem).
++ */
++TVM_DLL const Op &ptx_tcgen05_cp_warpx4();
++
++/*!
++ * \brief tvm intrinsic for scale factor warp transpose in shared memory.
++ */
++TVM_DLL const Op &ptx_tcgen05_sf_warp_transpose();
++
+ /*!
+  * \brief Frontend TMEM deallocation marker.
+  *
+diff --git a/src/op/copy.cc b/src/op/copy.cc
+index 2eb8bef602..4f8500684c 100644
+--- a/src/op/copy.cc
++++ b/src/op/copy.cc
+@@ -1242,6 +1242,10 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
+   }
+   // Currently tcgen05.cp is not supported
+   // TODO (mzw) Support tcgen05.cp
++
++  // NOTE(wt): For copying scaling factor from SMEM to TMEM,
++  // please use `T.tcgen05_cp_warpx4` instead,
++  // as blockscaled GEMM on SM100 requires 4 duplicated 32-row sf.
+   ICHECK(!is_cp)
+       << "Copy from shared memory to tensor memory is not supported yet";
+   // Extract loop variables and ranges
+diff --git a/src/op/gemm.cc b/src/op/gemm.cc
+index 7ba7c01ce2..5472b33386 100644
+--- a/src/op/gemm.cc
++++ b/src/op/gemm.cc
+@@ -86,6 +86,18 @@ Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+   }
+   node->cCoords_ = Array<PrimExpr>(
+       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
++  if (args.size() > 19) {
++    node->sfaRegion_ = NormalizeToBufferRegion(args[19]);
++  }
++  if (args.size() > 20) {
++    node->sfbRegion_ = NormalizeToBufferRegion(args[20]);
++  }
++  if (args.size() > 21) {
++    node->sfAId_ = args[21].as<PrimExpr>().value();
++  }
++  if (args.size() > 22) {
++    node->sfBId_ = args[22].as<PrimExpr>().value();
++  }
+   node->annotations_ = annotations;
+   data_ = std::move(node);
+ }
+@@ -97,6 +109,12 @@ AccessRegions GemmNode::GetAccessRegions() const {
+   if (!is_one(clearAccum_)) {
+     result.reads.push_back(cRegion_);
+   }
++  if (sfaRegion_.defined()) {
++    result.reads.push_back(sfaRegion_);
++  }
++  if (sfbRegion_.defined()) {
++    result.reads.push_back(sfbRegion_);
++  }
+   result.writes.push_back(cRegion_);
+   return result;
+ }
+@@ -568,6 +586,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+                                            scale_in_a, scale_in_b);
+         return Integer(static_cast<int64_t>(desc));
+       });
++  refl::GlobalDef().def("tl.get_tcgen5_blockscaled_instr_desc",
++                        [](int atom_m, int atom_n, DataType ab_dtype,
++                           bool a_is_k_major, bool b_is_k_major, int scale_in_a,
++                           int scale_in_b, int a_sf_id, int b_sf_id) {
++                          uint32_t desc = GetTCGEN5BlockScaledInstrDesc(
++                              atom_m, atom_n, ab_dtype, a_is_k_major,
++                              b_is_k_major, scale_in_a, scale_in_b, a_sf_id,
++                              b_sf_id);
++                          return Integer(static_cast<int64_t>(desc));
++                        });
+ }
+ 
+ } // namespace tl
+diff --git a/src/op/gemm.h b/src/op/gemm.h
+index 2c78f54760..26b6678402 100644
+--- a/src/op/gemm.h
++++ b/src/op/gemm.h
+@@ -149,6 +149,8 @@ class GemmNode : public TileOperatorNode {
+   bool isTcgen05_ = false;
+   mutable GemmWarpPolicy policy_;
+   Map<String, ObjectRef> annotations_;
++  BufferRegion sfaRegion_, sfbRegion_;
++  PrimExpr sfAId_, sfBId_;
+ 
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Gemm", GemmNode, TileOperatorNode);
+ 
+@@ -178,7 +180,11 @@ class GemmNode : public TileOperatorNode {
+         .def_ro("isWgmma", &GemmNode::isWgmma_)
+         .def_ro("isTcgen05", &GemmNode::isTcgen05_)
+         .def_ro("policy", &GemmNode::policy_)
+-        .def_ro("annotations", &GemmNode::annotations_);
++        .def_ro("annotations", &GemmNode::annotations_)
++        .def_ro("sfaRegion", &GemmNode::sfaRegion_)
++        .def_ro("sfbRegion", &GemmNode::sfbRegion_)
++        .def_ro("sfAId", &GemmNode::sfAId_)
++        .def_ro("sfBId", &GemmNode::sfBId_);
+   }
+ 
+   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+diff --git a/src/op/tcgen5_meta.h b/src/op/tcgen5_meta.h
+index 2f1b5790ff..9effa12f63 100644
+--- a/src/op/tcgen5_meta.h
++++ b/src/op/tcgen5_meta.h
+@@ -239,6 +239,66 @@ inline uint32_t GetTCGEN5InstrDesc(int atom_m, int atom_n, int atom_k,
+   return desc;
+ }
+ 
++// Build block-scaled instruction descriptor for mxf8f6f4.block_scale
++// Bit layout: InstrDescriptorBlockScaled (see CUTLASS mma_sm100_desc.hpp)
++inline uint32_t GetTCGEN5BlockScaledInstrDesc(int atom_m, int atom_n,
++                                              DataType ab_dtype,
++                                              bool a_is_k_major,
++                                              bool b_is_k_major, int scale_in_a,
++                                              int scale_in_b, int a_sf_id,
++                                              int b_sf_id) {
++  ICHECK(atom_m % 16 == 0) << "atom_m must be divisible by 16";
++  ICHECK(atom_n % 8 == 0) << "atom_n must be divisible by 8";
++  ICHECK(scale_in_a == 1 || scale_in_a == -1);
++  ICHECK(scale_in_b == 1 || scale_in_b == -1);
++
++  // a_format / b_format for MXF8F6F4: E4M3=0, E5M2=1
++  auto encode_mxfp_dtype = [&](DataType dtype) -> uint32_t {
++    if (dtype.is_float8_e4m3fn() || dtype.is_float8_e4m3fnuz() ||
++        dtype.is_float8_e4m3()) {
++      return 0u; // E4M3
++    } else if (dtype.is_float8_e5m2fnuz() || dtype.is_float8_e5m2()) {
++      return 1u; // E5M2
++    }
++    LOG(FATAL) << "Unsupported dtype for block-scaled descriptor: " << dtype;
++    return 0u;
++  };
++
++  auto set_bits = [](uint32_t value, int start, int width) -> uint32_t {
++    uint32_t mask = (width == 32) ? 0xFFFFFFFFu : ((1u << width) - 1);
++    return (value & mask) << start;
++  };
++
++  uint32_t a_format = encode_mxfp_dtype(ab_dtype);
++  uint32_t b_format = a_format;
++  uint32_t a_neg = (scale_in_a == -1) ? 1u : 0u;
++  uint32_t b_neg = (scale_in_b == -1) ? 1u : 0u;
++  uint32_t a_major = a_is_k_major ? 0u : 1u;
++  uint32_t b_major = b_is_k_major ? 0u : 1u;
++  uint32_t n_dim = static_cast<uint32_t>(atom_n >> 3);
++  uint32_t m_dim = static_cast<uint32_t>(atom_m >> 4);
++
++  uint32_t desc = 0;
++  desc |= set_bits(0, 0, 2); // sparse_id2
++  desc |= set_bits(0, 2, 1); // sparse_flag
++  // bit 3 reserved
++  desc |= set_bits(static_cast<uint32_t>(b_sf_id), 4, 2); // b_sf_id
++  // bit 6 reserved
++  desc |= set_bits(a_format, 7, 3);  // a_format
++  desc |= set_bits(b_format, 10, 3); // b_format
++  desc |= set_bits(a_neg, 13, 1);    // a_negate
++  desc |= set_bits(b_neg, 14, 1);    // b_negate
++  desc |= set_bits(a_major, 15, 1);  // a_major
++  desc |= set_bits(b_major, 16, 1);  // b_major
++  desc |= set_bits(n_dim, 17, 6);    // n_dim
++  desc |= set_bits(1, 23, 1);        // scale_format = 1 (E8M0)
++  desc |= set_bits(m_dim, 24, 5);    // m_dim
++  desc |= set_bits(static_cast<uint32_t>(a_sf_id), 29, 2); // a_sf_id
++  desc |= set_bits(0, 31, 1);                              // k_size = 0 (K32)
++
++  return desc;
++}
++
+ } // namespace tl
+ } // namespace tvm
+ 
+diff --git a/src/target/codegen_cuda.cc b/src/target/codegen_cuda.cc
+index 317b01370e..20a5fa5515 100644
+--- a/src/target/codegen_cuda.cc
++++ b/src/target/codegen_cuda.cc
+@@ -2866,6 +2866,88 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
+     replacer.register_rule("(mask3)", mask3);
+     tcgen05_call = replacer.rewrite(tcgen05_call);
+     this->stream << tcgen05_call;
++  } else if (op->op.same_as(tl::ptx_tcgen05_mma_blockscaled_ss())) {
++    ICHECK_EQ(op->args.size(), 17U)
++        << "ptx_tcgen05_mma_blockscaled_ss expects 17 arguments";
++    std::string kind_dtype = Downcast<StringImm>(op->args[0])->value;
++    std::string a_desc = this->PrintExpr(op->args[1]);
++    std::string A_offset = this->PrintExpr(op->args[2]);
++    std::string b_desc = this->PrintExpr(op->args[3]);
++    std::string B_offset = this->PrintExpr(op->args[4]);
++    std::string c_ref = this->PrintExpr(op->args[5]);
++    std::string c_offset = this->PrintExpr(op->args[6]);
++    PrimExpr desc_expr = op->args[7];
++    std::string scale_out = this->PrintExpr(op->args[8]);
++    std::string sfa_ref = this->PrintExpr(op->args[9]);
++    std::string sfa_offset = this->PrintExpr(op->args[10]);
++    std::string sfb_ref = this->PrintExpr(op->args[11]);
++    std::string sfb_offset = this->PrintExpr(op->args[12]);
++    // args[13], [14] reserved for future mask/flags
++    bool enable_ws = Downcast<Bool>(op->args[15])->value;
++    bool enable_2cta = Downcast<Bool>(op->args[16])->value;
++    ICHECK(!(enable_ws && enable_2cta))
++        << "Block-scaled TCGEN05 does not support combining .ws and 2CTA";
++
++    auto dtype_enum = tl::codegen::ptx::DTypeFromString(kind_dtype);
++
++    need_tcgen05mma_instruction_h_ = true;
++    this->PrintIndent();
++    std::string tcgen05_call =
++        "tl::(tcgen05_name)<(ABType), (USE_2CTA)>(uint64_t((desc_a) + "
++        "(A_offset)), "
++        "uint64_t((desc_b) + (B_offset)), (*reinterpret_cast<uint32_t*>((C))) "
++        "+ (C_offset), "
++        "(scale_out), static_cast<uint32_t>((desc_val)), "
++        "(*reinterpret_cast<uint32_t*>((SFA))) + (SFA_offset), "
++        "(*reinterpret_cast<uint32_t*>((SFB))) + (SFB_offset));\n";
++    tl::codegen::Replacer replacer;
++    replacer.register_rule("(ABType)",
++                           tl::codegen::ptx::DTypeEnumToString(dtype_enum));
++    replacer.register_rule("(USE_2CTA)", enable_2cta ? "true" : "false");
++    replacer.register_rule("(desc_a)", a_desc);
++    replacer.register_rule("(A_offset)", A_offset);
++    replacer.register_rule("(desc_b)", b_desc);
++    replacer.register_rule("(B_offset)", B_offset);
++    replacer.register_rule("(C)", c_ref);
++    replacer.register_rule("(C_offset)", c_offset);
++    replacer.register_rule("(tcgen05_name)",
++                           enable_ws ? "tcgen05mma_blockscaled_ws_ss"
++                                     : "tcgen05mma_blockscaled_ss");
++    replacer.register_rule("(scale_out)", scale_out);
++    replacer.register_rule("(desc_val)", this->PrintExpr(desc_expr));
++    replacer.register_rule("(SFA)", sfa_ref);
++    replacer.register_rule("(SFA_offset)", sfa_offset);
++    replacer.register_rule("(SFB)", sfb_ref);
++    replacer.register_rule("(SFB_offset)", sfb_offset);
++    tcgen05_call = replacer.rewrite(tcgen05_call);
++    this->stream << tcgen05_call;
++  } else if (op->op.same_as(tl::ptx_tcgen05_cp_warpx4())) {
++    ICHECK_EQ(op->args.size(), 3U)
++        << "ptx_tcgen05_cp_warpx4 expects 3 arguments";
++    need_tcgen05_common_h_ = true;
++    // arg[0] = smem pointer, arg[1] = tmem data pointer, arg[2] = tmem column
++    // offset
++    std::string smem_ptr = this->PrintExpr(op->args[0]);
++    std::string tmem_ptr = this->PrintExpr(op->args[1]);
++    std::string tmem_col_offset = this->PrintExpr(op->args[2]);
++    bool use_2cta = false;
++    if (op->annotations.find("use_2cta") != op->annotations.end()) {
++      use_2cta = Downcast<Bool>(op->annotations["use_2cta"])->value;
++    }
++    this->PrintIndent();
++    this->stream << "tl::tcgen05_cp<" << (use_2cta ? "true" : "false") << ">("
++                 << "tl::make_sf_smem_desc(reinterpret_cast<void*>(" << smem_ptr
++                 << ")), "
++                 << "(*reinterpret_cast<uint32_t*>(" << tmem_ptr << ")) + "
++                 << tmem_col_offset << ");\n";
++  } else if (op->op.same_as(tl::ptx_tcgen05_sf_warp_transpose())) {
++    ICHECK_EQ(op->args.size(), 1U)
++        << "ptx_tcgen05_sf_warp_transpose expects 1 argument";
++    need_tcgen05_common_h_ = true;
++    std::string smem_ptr = this->PrintExpr(op->args[0]);
++    this->PrintIndent();
++    this->stream << "tl::tcgen05_sf_warp_transpose(reinterpret_cast<uint32_t*>("
++                 << smem_ptr << "));\n";
+   } else if (op->op.same_as(tl::tcgen05_ld())) {
+     ICHECK_EQ(op->args.size(), 6U) << "tcgen05_ld expects 6 arguments";
+     need_tcgen05_common_h_ = true;
+diff --git a/src/tl_templates/cuda/instruction/tcgen05mma.h b/src/tl_templates/cuda/instruction/tcgen05mma.h
+index 2e1a8ec9da..7a8d831bfa 100644
+--- a/src/tl_templates/cuda/instruction/tcgen05mma.h
++++ b/src/tl_templates/cuda/instruction/tcgen05mma.h
+@@ -526,4 +526,82 @@ TL_DEVICE void tcgen05mma_ws_ss<DataType::kFloat8_e5m2>(
+       desc_a, desc_b, tmem_c, scalec, desc_val, mask0, mask1, mask2, mask3);
+ }
+ 
++// ============================================================================
++// Block-scaled MMA variants:
++// tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale Used for MXFP8
++// block-scaled GEMM with scale factors in TMEM.
++// ============================================================================
++
++// Generic declaration: unsupported by default
++template <DataType C_type, bool use_2cta = false>
++TL_DEVICE void tcgen05mma_blockscaled_ss(uint64_t const & /*desc_a*/,
++                                         uint64_t const & /*desc_b*/,
++                                         uint32_t const & /*tmem_c*/,
++                                         uint32_t const & /*scalec*/,
++                                         uint32_t const & /*desc_val*/,
++                                         uint32_t const & /*tmem_sfa*/,
++                                         uint32_t const & /*tmem_sfb*/) {
++  static_assert(
++      always_false_v<std::integral_constant<int, static_cast<int>(C_type)>>,
++      "tl::tcgen05mma_blockscaled_ss: unsupported accumulator type");
++}
++
++// FP8 E4M3 block-scaled
++template <>
++TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
++    uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
++    uint32_t const &scalec, uint32_t const &desc_val, uint32_t const &tmem_sfa,
++    uint32_t const &tmem_sfb) {
++  if (cute::elect_one_sync()) {
++    asm volatile(
++        "{\n\t"
++        ".reg .pred p;\n\t"
++        "setp.ne.b32 p, %4, 0;\n\t"
++        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], %1, %2, "
++        "%3, [%5], [%6], p; \n\t"
++        "}\n"
++        :
++        : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val), "r"(scalec),
++          "r"(tmem_sfa), "r"(tmem_sfb));
++  }
++}
++
++template <>
++TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, true>(
++    uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
++    uint32_t const &scalec, uint32_t const &desc_val, uint32_t const &tmem_sfa,
++    uint32_t const &tmem_sfb) {
++  if (cute::elect_one_sync()) {
++    asm volatile(
++        "{\n\t"
++        ".reg .pred p;\n\t"
++        "setp.ne.b32 p, %4, 0;\n\t"
++        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], %1, %2, "
++        "%3, [%5], [%6], p; \n\t"
++        "}\n"
++        :
++        : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val), "r"(scalec),
++          "r"(tmem_sfa), "r"(tmem_sfb));
++  }
++}
++
++// FP8 E5M2 maps to same instruction
++template <>
++TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e5m2, false>(
++    uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
++    uint32_t const &scalec, uint32_t const &desc_val, uint32_t const &tmem_sfa,
++    uint32_t const &tmem_sfb) {
++  tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
++      desc_a, desc_b, tmem_c, scalec, desc_val, tmem_sfa, tmem_sfb);
++}
++
++template <>
++TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e5m2, true>(
++    uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
++    uint32_t const &scalec, uint32_t const &desc_val, uint32_t const &tmem_sfa,
++    uint32_t const &tmem_sfb) {
++  tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, true>(
++      desc_a, desc_b, tmem_c, scalec, desc_val, tmem_sfa, tmem_sfb);
++}
++
+ } // namespace tl
+diff --git a/src/tl_templates/cuda/tcgen_05.h b/src/tl_templates/cuda/tcgen_05.h
+index 700aa3ba7a..85e7e491db 100644
+--- a/src/tl_templates/cuda/tcgen_05.h
++++ b/src/tl_templates/cuda/tcgen_05.h
+@@ -86,4 +86,55 @@ TL_DEVICE void tcgen05_mma_arrive(void const *smem_ptr,
+   }
+ }
+ 
++// UTCCP: Copy scale factors from shared memory to tensor memory.
++// Must be called by one warp; only one elected thread issues the instruction.
++template <bool use_2cta = false>
++TL_DEVICE void tcgen05_cp(uint64_t const &smem_desc, uint32_t const &tmem_col) {
++  if (cute::elect_one_sync()) {
++    if constexpr (use_2cta) {
++      asm volatile("tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
++                   :
++                   : "r"(tmem_col), "l"(smem_desc));
++    } else {
++      asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
++                   :
++                   : "r"(tmem_col), "l"(smem_desc));
++    }
++  }
++}
++
++// Warp-level transpose of 128 uint32 elements in shared memory for UTCCP.
++// Each warp (32 threads) transposes a 4x32 block in-place.
++// Must be called by exactly one warp. Call __syncwarp() is embedded.
++TL_DEVICE void tcgen05_sf_warp_transpose(uint32_t *smem_ptr) {
++  const uint32_t lane = threadIdx.x % 32;
++  uint32_t values[4];
++#pragma unroll
++  for (uint32_t i = 0; i < 4; ++i)
++    values[i] = smem_ptr[(i ^ (lane >> 3)) * 32 + lane];
++  __syncwarp();
++#pragma unroll
++  for (uint32_t i = 0; i < 4; ++i)
++    smem_ptr[lane * 4 + (i ^ (lane >> 3))] = values[i];
++}
++
++// Build a SMEM descriptor for UTCCP scale factor copy (no swizzle, K-major)
++// SBO = 128 bytes (stride between atoms on MN), LBO = 0 (single K atom)
++TL_DEVICE uint64_t make_sf_smem_desc(void *smem_ptr) {
++  uint32_t uint_ptr = smem_ptr_to_uint(smem_ptr);
++  // SmemDescriptor bit layout:
++  // [0,14): start_address >> 4
++  // [16,30): leading_byte_offset >> 4 = 0
++  // [32,46): stride_byte_offset >> 4 = 128/16 = 8
++  // [46,48): version = 1 (SM100)
++  // [61,64): layout_type = 0 (SWIZZLE_NONE)
++  uint64_t desc = 0;
++  desc |= static_cast<uint64_t>(uint_ptr >> 4) & 0x3FFFull; // start_address
++  // leading_byte_offset = 0 (bits [16,30))
++  desc |= static_cast<uint64_t>(8u) << 32; // stride_byte_offset >> 4 = 8
++  desc |= static_cast<uint64_t>(1u) << 46; // version = 1
++  // layout_type = 0 (SWIZZLE_NONE), base_offset = 0, lbo_mode = 0
++  return desc;
++}
++
+ } // namespace tl
+diff --git a/tilelang/intrinsics/tcgen05_macro_generator.py b/tilelang/intrinsics/tcgen05_macro_generator.py
+index a8c4d79ce9..b275a6f76d 100644
+--- a/tilelang/intrinsics/tcgen05_macro_generator.py
++++ b/tilelang/intrinsics/tcgen05_macro_generator.py
+@@ -565,6 +565,246 @@ def _warp_mma_ts(a_data, B_buf, C_local_buf, mbar):
+ 
+         return _warp_mma_ts(a_tmem_data, B_buf, C_local_buf, mbar)
+ 
++    def tcgen05mma_blockscaled(
++        self,
++        A_buf: Buffer,
++        B_buf: Buffer,
++        C_local_buf: Buffer,
++        SFA_tmem,
++        SFB_tmem,
++        mbar,
++        clear_accum: PrimExpr = False,
++        sf_a_id=0,
++        sf_b_id=0,
++    ):
++        """Emit a block-scaled TCGEN5MMA (SS variant with TMEM scale factors).
++
++        Uses ``tcgen05.mma.cta_group::1|2.kind::mxf8f6f4.block_scale`` PTX instruction.
++        Scale factors must already reside in tensor memory.
++        """
++        accum_dtype = self.accum_dtype
++        m_dim = self.block_row_warps * self.warp_row_tiles
++        micro_size_k = self.micro_size_k
++        k_dim, n_dim = self.chunk, self.block_col_warps * self.warp_col_tiles
++        scale_in_a = 1
++        scale_in_b = 1
++
++        assert k_dim >= micro_size_k
++
++        a_is_k_major = not self.a_transposed
++        b_is_k_major = self.b_transposed
++        a_swizzle_mode = self._determinate_swizzle_mode(A_buf, self.a_shared_layout)
++        b_swizzle_mode = self._determinate_swizzle_mode(B_buf, self.b_shared_layout)
++
++        elems_in_bits = DataType(self.a_dtype).bits
++        elems_in_bytes = elems_in_bits // 8
++        accum_dtype_in_bits = DataType(accum_dtype).bits
++
++        if len(self.meta) != 5:
++            self.get_tcgen5_mma_meta(m_dim, n_dim, k_dim, disable_2cta=False)
++        if len(self.meta) != 5:
++            raise ValueError(
++                f"Unsupported TCGEN5MMA configuration for block-scaled: M={m_dim}, N={n_dim}, "
++                f"K={k_dim}, A dtype={self.a_dtype}, accum dtype={self.accum_dtype}"
++            )
++        atom_m, atom_n, atom_k, _enable_ws, enable_2cta = (int(x) for x in self.meta)
++        enable_ws = 0
++        atom_m_per_cta = atom_m // 2 if enable_2cta else atom_m
++        n_dim_per_cta = n_dim // 2 if enable_2cta else n_dim
++
++        a_swizzle_atom_elems = a_swizzle_mode.swizzle_byte_size() // elems_in_bytes
++        b_swizzle_atom_elems = n_dim_per_cta if b_swizzle_mode.is_none() else b_swizzle_mode.swizzle_byte_size() // elems_in_bytes
++
++        a_leading_byte_offset = (8 * 8 * elems_in_bytes) if a_is_k_major else (8 * atom_m_per_cta * elems_in_bytes)
++        a_stride_byte_offset = (8 * k_dim * elems_in_bytes) if a_is_k_major else (8 * 8 * elems_in_bytes)
++        if not a_swizzle_mode.is_none():
++            if a_is_k_major:
++                a_leading_byte_offset = 16
++                a_stride_byte_offset = 8 * a_swizzle_mode.swizzle_byte_size()
++            else:
++                a_m_axis_atoms = atom_m_per_cta // a_swizzle_atom_elems
++                a_leading_byte_offset = k_dim * a_swizzle_mode.swizzle_byte_size() if a_m_axis_atoms > 1 else 0
++                a_stride_byte_offset = (
++                    8 * elems_in_bytes * a_swizzle_atom_elems if a_m_axis_atoms > 1 else 8 * elems_in_bytes * atom_m_per_cta
++                )
++
++        b_leading_byte_offset = (8 * 8 * elems_in_bytes) if b_is_k_major else (8 * n_dim_per_cta * elems_in_bytes)
++        b_stride_byte_offset = (8 * k_dim * elems_in_bytes) if b_is_k_major else (0 if n_dim_per_cta == 8 else (8 * 8 * elems_in_bytes))
++        if not b_swizzle_mode.is_none():
++            if b_is_k_major:
++                b_leading_byte_offset = 16
++                b_stride_byte_offset = 8 * b_swizzle_mode.swizzle_byte_size()
++            else:
++                b_n_axis_atoms = n_dim_per_cta // b_swizzle_atom_elems
++                b_leading_byte_offset = b_swizzle_mode.swizzle_byte_size() * k_dim if b_n_axis_atoms > 1 else 0
++                b_stride_byte_offset = (
++                    8 * elems_in_bytes * b_swizzle_atom_elems if b_n_axis_atoms > 1 else 8 * elems_in_bytes * n_dim_per_cta
++                )
++
++        ak_atom_size = max(a_swizzle_atom_elems // micro_size_k, 1)
++        bk_atom_size = max(b_swizzle_atom_elems // micro_size_k, 1)
++
++        base_instr_desc = self.get_tcgen5_blockscaled_instr_desc(
++            atom_m,
++            atom_n,
++            a_is_k_major,
++            b_is_k_major,
++            scale_in_a,
++            scale_in_b,
++            0,
++            0,
++        )
++
++        a_dtype_abbrv = self.a_dtype_abbrv
++        num_inst_m = m_dim // atom_m_per_cta
++        num_inst_n = n_dim // atom_n
++
++        def access_ptr_from(buffer_or_load_or_region, access_type: str = "r"):
++            if isinstance(buffer_or_load_or_region, Buffer):
++                return buffer_or_load_or_region.access_ptr(access_type)
++            elif isinstance(buffer_or_load_or_region, BufferLoad):
++                buffer_load = buffer_or_load_or_region
++                offset, stride = 0, 1
++                buffer = buffer_load.buffer
++                for i, shape in enumerate(reversed(buffer.shape)):
++                    indice = buffer_load.indices[len(buffer_load.indices) - i - 1]
++                    if isinstance(indice, tvm.tir.Ramp):
++                        offset += indice.base * stride
++                    elif isinstance(indice, (tvm.tir.IntImm, tvm.tir.PrimExpr)):
++                        offset += indice * stride
++                    else:
++                        raise ValueError(f"Unsupported index type: {type(indice)}")
++                    stride *= shape
++                return buffer.access_ptr(access_type, offset=offset)
++            elif isinstance(buffer_or_load_or_region, BufferRegion):
++                buffer_region = buffer_or_load_or_region
++                buffer = buffer_region.buffer
++                offset, stride = 0, 1
++                for i, shape in enumerate(reversed(buffer.shape)):
++                    offset += buffer_region.region[len(buffer_region.region) - i - 1].min * stride
++                    stride *= shape
++                return buffer.access_ptr(access_type, offset=offset)
++            else:
++                raise ValueError(f"Unsupported buffer type: {type(buffer_or_load_or_region)}")
++
++        if isinstance(SFA_tmem, BufferRegion):
++            sfa_data = SFA_tmem.buffer.data
++        elif isinstance(SFA_tmem, Buffer):
++            sfa_data = SFA_tmem.data
++        else:
++            raise ValueError(f"Unsupported SFA_tmem type: {type(SFA_tmem)}")
++
++        if isinstance(SFB_tmem, BufferRegion):
++            sfb_data = SFB_tmem.buffer.data
++        elif isinstance(SFB_tmem, Buffer):
++            sfb_data = SFB_tmem.data
++        else:
++            raise ValueError(f"Unsupported SFB_tmem type: {type(SFB_tmem)}")
++
++        @T.macro
++        def _warp_mma_blockscaled(A_buf, B_buf, C_local_buf, sfa_data, sfb_data, mbar):
++            desc_a = T.alloc_tcgen05_smem_desc()
++            desc_b = T.alloc_tcgen05_smem_desc()
++            A_ptr = access_ptr_from(A_buf, "r")
++            B_ptr = access_ptr_from(B_buf, "r")
++
++            T.initialize_tcgen05_descriptor(
++                desc_a,
++                A_ptr,
++                int(a_leading_byte_offset >> 4),
++                int(a_stride_byte_offset >> 4),
++                0,
++                False,
++                int(a_swizzle_mode),
++            )
++            T.initialize_tcgen05_descriptor(
++                desc_b,
++                B_ptr,
++                int(b_leading_byte_offset >> 4),
++                int(b_stride_byte_offset >> 4),
++                0,
++                False,
++                int(b_swizzle_mode),
++            )
++
++            tmem_col_step = atom_n // (128 // atom_m_per_cta)
++            _sf_a = tvm.tir.const(sf_a_id, "int32") if isinstance(sf_a_id, int) else sf_a_id
++            _sf_b = tvm.tir.const(sf_b_id, "int32") if isinstance(sf_b_id, int) else sf_b_id
++            runtime_instr_desc = base_instr_desc | (_sf_a << 29) | (_sf_b << 4)
++            for j in T.unroll(num_inst_n):
++                for i in T.unroll(num_inst_m):
++                    for ki in T.unroll(0, (k_dim // micro_size_k)):
++                        scale_out = T.Select(ki != 0, 1, T.Select(clear_accum, 0, 1))
++                        A_elem_offset = (
++                            (ki % ak_atom_size) * micro_size_k
++                            + i * atom_m_per_cta * a_swizzle_atom_elems
++                            + (ki // ak_atom_size) * m_dim * a_swizzle_atom_elems
++                            if a_is_k_major
++                            else i * atom_m_per_cta * k_dim + ki * a_swizzle_atom_elems * micro_size_k
++                        )
++                        B_elem_offset = (
++                            (ki // bk_atom_size) * n_dim_per_cta * b_swizzle_atom_elems
++                            + (ki % bk_atom_size) * micro_size_k
++                            + j * atom_n * b_swizzle_atom_elems
++                            if b_is_k_major
++                            else (
++                                ki * b_swizzle_atom_elems * micro_size_k
++                                + j * atom_n * (k_dim if n_dim_per_cta // b_swizzle_atom_elems > 1 else 1)
++                            )
++                        )
++
++                        A_byte_offset = A_elem_offset * elems_in_bytes
++                        B_byte_offset = B_elem_offset * elems_in_bytes
++                        C_offset = (i * n_dim + j * tmem_col_step) * accum_dtype_in_bits // 32
++
++                        T.ptx_tcgen05_mma_blockscaled_ss(
++                            a_dtype_abbrv,
++                            desc_a.data,
++                            A_byte_offset,
++                            desc_b.data,
++                            B_byte_offset,
++                            C_local_buf.data,
++                            C_offset,
++                            runtime_instr_desc,
++                            scale_out,
++                            sfa_data,
++                            0,
++                            sfb_data,
++                            0,
++                            0,
++                            0,
++                            enable_ws,
++                            enable_2cta,
++                        )
++            T.tcgen05_mma_arrive(mbar, arrive_2cta=enable_2cta)
++
++        return _warp_mma_blockscaled(A_buf, B_buf, C_local_buf, sfa_data, sfb_data, mbar)
++
++    def get_tcgen5_blockscaled_instr_desc(
++        self,
++        atom_m: int,
++        atom_n: int,
++        a_is_k_major: bool,
++        b_is_k_major: bool,
++        scale_in_a: int,
++        scale_in_b: int,
++        a_sf_id: int,
++        b_sf_id: int,
++    ) -> PrimExpr:
++        """Build the block-scaled instruction descriptor via FFI."""
++        desc = _ffi_api.get_tcgen5_blockscaled_instr_desc(
++            atom_m,
++            atom_n,
++            DataType(self.a_dtype),
++            a_is_k_major,
++            b_is_k_major,
++            scale_in_a,
++            scale_in_b,
++            a_sf_id,
++            b_sf_id,
++        )
++        return lift(desc)
++
+     def make_mma_load_layout(self, local_buf: Buffer, matrix: str = "A") -> T.Fragment:
+         raise NotImplementedError
+ 
+diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
+index 7dddc7a748..47b4ee037b 100644
+--- a/tilelang/language/__init__.py
++++ b/tilelang/language/__init__.py
+@@ -57,7 +57,13 @@
+ from tvm.script.parser.tir import allocate as allocate  # noqa: F401
+ from .copy_op import copy, async_copy, tma_copy, transpose, c2d_im2col  # noqa: F401
+ from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
+-from .gemm_op import gemm, wgmma_gemm, tcgen05_gemm  # noqa: F401
++from .gemm_op import (  # noqa: F401
++    gemm,
++    wgmma_gemm,
++    tcgen05_gemm,
++    tcgen05_gemm_blockscaled,
++    make_blockscaled_gemm_layout,
++)
+ from .experimental.gemm_sp import gemm_sp, gemm_sp_v2  # noqa: F401
+ from .fill_op import fill, clear  # noqa: F401
+ from .reduce_op import (
+diff --git a/tilelang/language/ast/ir.py b/tilelang/language/ast/ir.py
+index 49db2ca641..7865b74be7 100644
+--- a/tilelang/language/ast/ir.py
++++ b/tilelang/language/ast/ir.py
+@@ -1886,6 +1886,7 @@ def wrapped(*args, **kwargs):
+ ptx_wgmma_rs = _dtype_forward(_tir_op.ptx_wgmma_rs)
+ ptx_tcgen05_mma_ss = _dtype_forward(_tir_op.ptx_tcgen05_mma_ss)
+ ptx_tcgen05_mma_ts = _dtype_forward(_tir_op.ptx_tcgen05_mma_ts)
++ptx_tcgen05_mma_blockscaled_ss = _dtype_forward(_tir_op.ptx_tcgen05_mma_blockscaled_ss)
+ ptx_ldmatrix = _dtype_forward(_tir_op.ptx_ldmatrix)
+ ptx_cp_async = _dtype_forward(_tir_op.ptx_cp_async)
+ ptx_cp_async_bulk = _dtype_forward(_tir_op.ptx_cp_async_bulk)
+@@ -2138,6 +2139,7 @@ def wrapped(*args, **kwargs):
+     "ptx_wgmma_ss",
+     "ptx_wgmma_rs",
+     "ptx_tcgen05_mma_ss",
++    "ptx_tcgen05_mma_blockscaled_ss",
+     "ptx_ldmatrix",
+     "ptx_cp_async",
+     "ptx_cp_async_bulk",
+diff --git a/tilelang/language/builtin.py b/tilelang/language/builtin.py
+index da6bde0b37..21c8214b3a 100644
+--- a/tilelang/language/builtin.py
++++ b/tilelang/language/builtin.py
+@@ -2,15 +2,17 @@
+ 
+ from __future__ import annotations
+ 
++import tvm.script.parser.tir as T
+ from tilelang._typing import BufferLikeType, BufferLikeTypeTuple, BarrierType, DType
+ from tilelang import tvm as tvm
+ from tilelang.language import ptx_arrive_barrier, evaluate
++from tilelang.language.eager.builder import macro
+ from tilelang.language.kernel import get_thread_bindings, get_block_extents
+ from tilelang.utils.target import check_hip_availability
+ from tvm import DataType, tir
+ from tvm.runtime import convert
+ from tvm.tir import PrimExpr, Var, Call, BufferLoad, BufferRegion
+-from tilelang.utils.language import retrieve_ptr
++from tilelang.utils.language import retrieve_ptr, get_buffer_region_from_load, retrieve_buffer_and_offset
+ 
+ _IS_HIP_AVAILABLE = check_hip_availability()
+ 
+@@ -1233,6 +1235,81 @@ def tcgen05_after_thread_sync():
+     return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_after_thread_sync"))
+ 
+ 
++def _tcgen05_num_smem_chunks(smem_src, chunk_elems: int):
++    if isinstance(smem_src, tir.Buffer):
++        shape = list(smem_src.shape)
++    elif isinstance(smem_src, tir.BufferRegion):
++        shape = [r.extent for r in smem_src.region]
++    elif isinstance(smem_src, tir.BufferLoad):
++        region = get_buffer_region_from_load(smem_src)
++        if region is None:
++            raise TypeError("T.tcgen05_cp_warpx4 requires Buffer/BufferRegion-like scale-factor sources.")
++        shape = [r.extent for r in region.region]
++    else:
++        raise TypeError(f"Unsupported scale-factor buffer type: {type(smem_src)}")
++
++    total_elems = 1
++    for extent in shape:
++        if not isinstance(extent, tir.IntImm):
++            raise ValueError("Packed scale-factor helpers require a static extent.")
++        total_elems *= extent.value
++    if total_elems % chunk_elems != 0:
++        raise ValueError(f"Packed scale-factor helpers require total extent to be a multiple of {chunk_elems}, got {total_elems}.")
++    return total_elems // chunk_elems
++
++
++def tcgen05_cp_warpx4(smem_src, tmem_dst, tmem_col_offset=0, *, use_2cta: bool = False):
++    """Copy one or more packed scale-factor chunks from shared memory to tensor memory.
++
++    The helper lowers to one or more ``tcgen05.cp.cta_group::{1,2}.32x128b.warpx4``
++    instructions. For 1D packed ``uint32`` scale buffers, each 128-word chunk maps to
++    4 TMEM columns and the column offset is advanced automatically.
++    """
++    num_chunks = _tcgen05_num_smem_chunks(smem_src, 128)
++    if isinstance(tmem_dst, tir.Buffer):
++        tmem_ptr = tmem_dst.data
++    elif isinstance(tmem_dst, (BufferLoad, BufferRegion)):
++        tmem_ptr = tmem_dst.buffer.data
++    else:
++        tmem_ptr = tmem_dst
++    ann = {"use_2cta": 1} if use_2cta else None
++    buffer, base_offset = retrieve_buffer_and_offset(smem_src)
++
++    @macro
++    def _tcgen05_cp_warpx4_chunked(buffer, tmem_ptr, tmem_col_offset, base_offset):
++        for i in T.unroll(num_chunks):
++            chunk_ptr = buffer.access_ptr("r", offset=base_offset + i * 128)
++            tir.call_intrin(
++                "void",
++                tir.op.Op.get("tl.ptx_tcgen05_cp_warpx4"),
++                chunk_ptr,
++                tmem_ptr,
++                tmem_col_offset + i * 4,
++                annotations=ann,
++            )
++
++    return _tcgen05_cp_warpx4_chunked(buffer, tmem_ptr, tmem_col_offset, base_offset)
++
++
++def tcgen05_sf_warp_transpose(smem_src):
++    """Warp-level transpose for one or more packed scale-factor chunks in shared memory.
++
++    For 1D packed ``uint32`` scale buffers, the helper automatically applies the
++    transpose to each 128-word chunk in order.
++    """
++    num_chunks = _tcgen05_num_smem_chunks(smem_src, 128)
++
++    buffer, base_offset = retrieve_buffer_and_offset(smem_src)
++
++    @macro
++    def _tcgen05_sf_warp_transpose_chunked(buffer, base_offset):
++        for i in T.unroll(num_chunks):
++            chunk_ptr = buffer.access_ptr("rw", offset=base_offset + i * 128)
++            tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_sf_warp_transpose"), chunk_ptr)
++
++    return _tcgen05_sf_warp_transpose_chunked(buffer, base_offset)
++
++
+ def ptx_mma_sm70(
+     shape,
+     A_layout,
+diff --git a/tilelang/language/gemm_op.py b/tilelang/language/gemm_op.py
+index ed26d2e677..d5ec03728f 100644
+--- a/tilelang/language/gemm_op.py
++++ b/tilelang/language/gemm_op.py
+@@ -5,6 +5,7 @@
+ from tilelang._typing import BufferLikeType, BarrierType
+ from tilelang.tileop.base import GemmWarpPolicy
+ import tilelang.language as T
++from tilelang.layout import Layout
+ from tvm import tir
+ from tilelang.utils.language import (
+     to_buffer_region,
+@@ -258,7 +259,9 @@ def tcgen05_gemm(
+     compilation fails instead of silently falling back to another GEMM path.
+     """
+ 
+-    ann = {"use_2cta": int(use_2cta)} if use_2cta else None
++    ann = {"is_tcgen05": 1}
++    if use_2cta:
++        ann["use_2cta"] = 1
+     return _gemm_impl(
+         "tl.tileop.tcgen05_gemm",
+         A,
+@@ -273,3 +276,208 @@ def tcgen05_gemm(
+         mbar,
+         annotations=ann,
+     )
++
++
++def tcgen05_gemm_blockscaled(
++    A: BufferLikeType,
++    B: BufferLikeType,
++    C: BufferLikeType,
++    SFA_tmem: BufferLikeType,
++    SFB_tmem: BufferLikeType,
++    transpose_A: bool = False,
++    transpose_B: bool = False,
++    clear_accum=False,
++    wg_wait: int = 0,
++    mbar: BarrierType | None = None,
++    sf_a_id: int = 0,
++    sf_b_id: int = 0,
++    *,
++    use_2cta: bool = False,
++) -> tir.PrimExpr:
++    """Explicit Blackwell TCGEN05 block-scaled GEMM without an implicit wait.
++
++    This is the explicit asynchronous Blackwell TCGEN5MMA block-scaled
++    counterpart to `T.tcgen05_gemm(...)`. It never auto-emits an inlined
++    `mbarrier_wait_parity`, and compilation fails instead of silently falling
++    back if the requested ISA path is unavailable.
++
++    With ``use_2cta=True``, this lowers to the true 2CTA block-scaled TCGEN05
++    path only; there is no fallback or emulation. That mode requires
++    ``cluster_dims`` to be ``(2,1,1)`` or ``(1,2,1)``.
++
++    A and B are FP8 (E4M3/E5M2) in shared memory, C is the accumulator in
++    tensor memory, and SFA/SFB are E8M0 scale factors already resident in
++    tensor memory. As with `T.tcgen05_gemm(...)`, this API is explicit-async:
++    it issues the MMA and leaves synchronization to the user schedule.
++
++    Args:
++        A: FP8 input buffer A in shared memory.
++        B: FP8 input buffer B in shared memory.
++        C: Accumulator in tensor memory.
++        SFA_tmem: Scale factors for A in tensor memory.
++        SFB_tmem: Scale factors for B in tensor memory.
++        transpose_A: Whether A is MN-major. Default: False (K-major).
++        transpose_B: Whether B is K-major. Default: False (MN-major).
++        clear_accum: Whether to zero the accumulator.
++        wg_wait: Warp group wait identifier.
++        mbar: Mbarrier for MMA completion signaling.
++        sf_a_id: Scale factor ID for A (0-3).
++        sf_b_id: Scale factor ID for B (0-3).
++        use_2cta: Whether to request true ``cta_group::2`` lowering.
++    """
++
++    ann = {"use_2cta": int(use_2cta)} if use_2cta else None
++
++    # Re-read normalized regions below after let legalization.
++
++    def legalize(arg):
++        if isinstance(arg, tir.Var) and T.has_let_value(arg):
++            return T.get_let_value(arg).buffer
++        return arg
++
++    A = legalize(A)
++    B = legalize(B)
++    C = legalize(C)
++    SFA_tmem = legalize(SFA_tmem)
++    SFB_tmem = legalize(SFB_tmem)
++    mbar = legalize(mbar) if mbar is not None else None
++
++    A_region = to_buffer_region(A)
++    B_region = to_buffer_region(B)
++    C_region = to_buffer_region(C)
++    SFA_region = to_buffer_region(SFA_tmem)
++    SFB_region = to_buffer_region(SFB_tmem)
++
++    A_shape = retrieve_shape(A_region)
++    B_shape = retrieve_shape(B_region)
++    C_shape = retrieve_shape(C_region)
++
++    assert len(C_shape) == 2, "current only support C as a 2D tensor"
++    assert len(A_shape) >= 2, "current only support A as a 2D or higher-order tensor"
++    assert len(B_shape) >= 2, "current only support B as a 2D or higher-order tensor"
++
++    M, N = C_shape
++    M_A = A_shape[-1] if transpose_A else A_shape[-2]
++    N_B = B_shape[-2] if transpose_B else B_shape[-1]
++    K = A_shape[-2] if transpose_A else A_shape[-1]
++    K_B = B_shape[-1] if transpose_B else B_shape[-2]
++    assert prim_expr_equal(K, K_B), f"T.tcgen05_gemm_blockscaled K shape check failed: K_A = {K}, K_B = {K_B}"
++    if use_2cta:
++        assert prim_expr_equal(M_A, M) and prim_expr_equal(N_B * 2, N), (
++            f"T.tcgen05_gemm_blockscaled 2CTA shape check failed: M_A = {M_A}, expected M_C = {M}; N_B = {N_B}, expected N_C / 2 = {N} / 2"
++        )
++    else:
++        assert prim_expr_equal(N_B, N), f"T.tcgen05_gemm_blockscaled N shape check failed: N_B = {N_B}, N_C = {N}"
++
++    A_stride = retrieve_stride(A_region)
++    B_stride = retrieve_stride(B_region)
++    stride_a = A_stride[-2]
++    stride_b = B_stride[-2]
++
++    A_offset = retrieve_offset(A_region)
++    B_offset = retrieve_offset(B_region)
++    offset_a = A_offset[-1]
++    offset_b = B_offset[-1]
++
++    if mbar is not None:
++        assert isinstance(mbar, (tir.Buffer, tir.BufferLoad)), (
++            f"mbar for tcgen5mma must be a tir.Buffer or tir.BufferLoad, but got {type(mbar)}"
++        )
++        mbar = to_buffer_region(mbar, access_type="rw")
++
++    C_coords = [r.min for r in C_region.region]
++
++    # Convert BufferRegion to tl.region calls for arguments
++    A_arg = buffer_region_to_tile_region(A_region, "r", [r for r in A_shape])
++    B_arg = buffer_region_to_tile_region(B_region, "r", [r for r in B_shape])
++    C_arg = buffer_region_to_tile_region(C_region, "rw", [r for r in C_shape])
++    SFA_arg = buffer_region_to_tile_region(SFA_region, "r", list(retrieve_shape(SFA_region)))
++    SFB_arg = buffer_region_to_tile_region(SFB_region, "r", list(retrieve_shape(SFB_region)))
++
++    assert mbar is not None, "mbar is required for tcgen05_gemm_blockscaled"
++
++    # Ensure sf_a_id and sf_b_id are PrimExpr
++    if not isinstance(sf_a_id, tir.PrimExpr):
++        sf_a_id = tir.const(sf_a_id, dtype="int32")
++    if not isinstance(sf_b_id, tir.PrimExpr):
++        sf_b_id = tir.const(sf_b_id, dtype="int32")
++
++    # Block-scaled always uses Square policy (1x1 warp partition)
++    policy = GemmWarpPolicy.Square
++
++    return tir.call_intrin(
++        "handle",
++        tir.op.Op.get("tl.tileop.gemm"),
++        A_arg,
++        B_arg,
++        C_arg,
++        transpose_A,
++        transpose_B,
++        M,
++        N,
++        K,
++        policy,
++        clear_accum,
++        stride_a,
++        stride_b,
++        offset_a,
++        offset_b,
++        1,  # k_pack
++        wg_wait,
++        mbar,
++        C_coords[0],
++        C_coords[1],
++        SFA_arg,  # arg 19
++        SFB_arg,  # arg 20
++        sf_a_id,  # arg 21
++        sf_b_id,  # arg 22
++        annotations=ann,
++    )
++
++
++def make_blockscaled_gemm_layout(
++    C: BufferLikeType,
++    A: BufferLikeType,
++    transpose_A: bool = False,
++) -> Layout:
++    """Build the TMEM store layout for the C accumulator of a block-scaled GEMM.
++
++    Users must call ``T.annotate_layout({C_tmem: layout})`` with the returned layout
++    so that subsequent ``T.copy(C_tmem, ...)`` can be lowered correctly.
++
++    Args:
++        C: The TMEM accumulator buffer (block_M, block_N).
++        A: The FP8 operand A buffer (used to infer K and dtype).
++        transpose_A: Whether A is MN-major.
++
++    Returns:
++        A Layout object for C's TMEM storage.
++    """
++    from tilelang.intrinsics.tcgen05_macro_generator import TensorCoreIntrinEmitter
++
++    C_region = to_buffer_region(C)
++    A_region = to_buffer_region(A)
++
++    C_shape = retrieve_shape(C_region)
++    A_shape = retrieve_shape(A_region)
++
++    M, N = int(C_shape[0]), int(C_shape[1])
++    K = int(A_shape[-2] if transpose_A else A_shape[-1])
++    a_dtype = str(A_region.buffer.dtype)
++    accum_dtype = str(C_region.buffer.dtype)
++
++    emitter = TensorCoreIntrinEmitter(
++        a_dtype=a_dtype,
++        b_dtype=a_dtype,
++        accum_dtype=accum_dtype,
++        a_transposed=transpose_A,
++        b_transposed=False,
++        block_row_warps=1,
++        block_col_warps=1,
++        warp_row_tiles=M,
++        warp_col_tiles=N,
++        chunk=K,
++    )
++
++    c_buf = C_region.buffer if isinstance(C_region, tir.BufferRegion) else C
++    return emitter.make_mma_store_layout(c_buf)
+diff --git a/tilelang/language/tir/ir.py b/tilelang/language/tir/ir.py
+index 6fab09ae51..384be21ccc 100644
+--- a/tilelang/language/tir/ir.py
++++ b/tilelang/language/tir/ir.py
+@@ -292,6 +292,7 @@ def wrapped(*args, **kwargs):
+ ptx_wgmma_rs = _dtype_forward(_tir_op.ptx_wgmma_rs)
+ ptx_tcgen05_mma_ss = _dtype_forward(_tir_op.ptx_tcgen05_mma_ss)
+ ptx_tcgen05_mma_ts = _dtype_forward(_tir_op.ptx_tcgen05_mma_ts)
++ptx_tcgen05_mma_blockscaled_ss = _dtype_forward(_tir_op.ptx_tcgen05_mma_blockscaled_ss)
+ ptx_ldmatrix = _tir_op.ptx_ldmatrix
+ ptx_cp_async = _dtype_forward(_tir_op.ptx_cp_async)
+ ptx_cp_async_bulk = _dtype_forward(_tir_op.ptx_cp_async_bulk)
+diff --git a/tilelang/language/tir/op.py b/tilelang/language/tir/op.py
+index ca70d63673..0aee38da35 100644
+--- a/tilelang/language/tir/op.py
++++ b/tilelang/language/tir/op.py
+@@ -1253,6 +1253,78 @@ def ptx_tcgen05_mma_ts(
+     )
+ 
+ 
++def ptx_tcgen05_mma_blockscaled_ss(
++    kind_dtype,
++    desc_a,
++    A_offset,
++    desc_b,
++    B_offset,
++    C_ptr,
++    C_offset,
++    desc_val,
++    scale_out,
++    sfa_ptr,
++    sfa_offset,
++    sfb_ptr,
++    sfb_offset,
++    reserved0=0,
++    reserved1=0,
++    variant=False,
++    enable_2cta=False,
++):
++    """TVM intrinsic for tcgen05.mma block-scaled (mxf8f6f4.block_scale) instructions.
++
++    Block-scaled TCGEN05 is explicit-async and carries an explicit ``enable_2cta``
++    flag, analogous to the regular SS/TS TCGEN05 intrinsics. There is no
++    fallback path if 2CTA is requested.
++
++    Positional args:
++    kind_dtype, desc_a, A_offset, desc_b, B_offset, C_ptr, C_offset,
++    desc_val, scale_out, sfa_ptr, sfa_offset, sfb_ptr, sfb_offset,
++    reserved0, reserved1, enable_ws, enable_2cta.
++    """
++
++    if enable_2cta and isinstance(variant, str):
++        v_check = variant.lower()
++        if v_check in ("ws", "warp_specialized", "warp-specialized"):
++            raise ValueError("ptx_tcgen05_mma_blockscaled_ss: .ws and 2CTA cannot be combined")
++    elif enable_2cta and bool(variant):
++        raise ValueError("ptx_tcgen05_mma_blockscaled_ss: .ws and 2CTA cannot be combined")
++
++    if isinstance(variant, str):
++        v = variant.lower()
++        if v in ("ws", "warp_specialized", "warp-specialized"):
++            enable_ws = True
++        elif v in ("default", "std", "ss"):
++            enable_ws = False
++        else:
++            raise ValueError(f"ptx_tcgen05_mma_blockscaled_ss: unknown variant: {variant}")
++    else:
++        enable_ws = bool(variant)
++
++    return call_intrin(
++        "handle",
++        _tvm_op.Op.get("tl.ptx_tcgen05_mma_blockscaled_ss"),
++        kind_dtype,
++        desc_a,
++        A_offset,
++        desc_b,
++        B_offset,
++        C_ptr,
++        C_offset,
++        desc_val,
++        scale_out,
++        sfa_ptr,
++        sfa_offset,
++        sfb_ptr,
++        sfb_offset,
++        reserved0,
++        reserved1,
++        enable_ws,
++        enable_2cta,
++    )
++
++
+ def mma_store(dtype, m, n, dst_ptr, src_ptr, src_offset, dst_stride):
+     """TVM intrinsic for storing the result of PTX MMA into a destination pointer
+ 
+diff --git a/tilelang/tileop/gemm/__init__.py b/tilelang/tileop/gemm/__init__.py
+index a24545103c..a2290b0191 100644
+--- a/tilelang/tileop/gemm/__init__.py
++++ b/tilelang/tileop/gemm/__init__.py
+@@ -122,6 +122,14 @@ def wg_wait(self):
+     def is_tcgen05(self):
+         return getattr(self, "isTcgen05", False)
+ 
++    @property
++    def sf_a_id(self):
++        return self.sfAId
++
++    @property
++    def sf_b_id(self):
++        return self.sfBId
++
+     def infer_layout(self, target: Target, thread_nums: int):
+         """Infer the layout for the GEMM operation based on target architecture."""
+         gemm_inst = self._select_gemm_instruction(thread_nums, target)
+diff --git a/tilelang/tileop/gemm/gemm_base.py b/tilelang/tileop/gemm/gemm_base.py
+index 2e6d15b59b..95f69bbfa6 100644
+--- a/tilelang/tileop/gemm/gemm_base.py
++++ b/tilelang/tileop/gemm/gemm_base.py
+@@ -172,6 +172,26 @@ def C_coords(self):
+             return [zero, zero]
+         return [coords[i] for i in range(len(coords))]
+ 
++    @property
++    def SFARegion(self):
++        return getattr(self.gemm_node, "sfaRegion", None)
++
++    @property
++    def SFBRegion(self):
++        return getattr(self.gemm_node, "sfbRegion", None)
++
++    @property
++    def sf_a_id(self) -> PrimExpr:
++        return getattr(self.gemm_node, "sfAId", tvm.tir.const(0, T.int32))
++
++    @property
++    def sf_b_id(self) -> PrimExpr:
++        return getattr(self.gemm_node, "sfBId", tvm.tir.const(0, T.int32))
++
++    @property
++    def is_blockscaled(self) -> bool:
++        return self.SFARegion is not None and self.SFBRegion is not None
++
+     def get_region_base_offsets(self, region):
+         """
+         Get the base offset (start index) for each dimension from a BufferRegion.
+diff --git a/tilelang/tileop/gemm/gemm_tcgen05.py b/tilelang/tileop/gemm/gemm_tcgen05.py
+index 4fa5815a51..f1e373ef9b 100644
+--- a/tilelang/tileop/gemm/gemm_tcgen05.py
++++ b/tilelang/tileop/gemm/gemm_tcgen05.py
+@@ -35,7 +35,8 @@
+ class GemmTCGEN5(GemmBase):
+     """GEMM operator for Blackwell (SM100) TCGEN5MMA instructions.
+ 
+-    Supports the SS (Shared-Shared) and TS (TensorMemory-Shared) variants.
++    Supports the SS (Shared-Shared) and TS (TensorMemory-Shared) variants,
++    as well as block-scaled MXFP8 GEMM when SFA/SFB scale factors are present.
+     Layout inference and lowering are dispatched based on the memory scopes
+     of operands A and B.
+     """
+@@ -57,8 +58,13 @@ def infer_layout(self, target: Target, thread_nums: int):
+ 
+         For SS: both A and B get swizzled shared-memory layouts.
+         For TS: A and C get TMEM store layouts, B gets a swizzled shared-memory layout.
++        For block-scaled: same as SS (A and B get swizzle, C gets TMEM store layout).
+         """
+-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.TCGEN5MMA)
++        # Block-scaled GEMM keeps a 1x1 warp partition even when using cta_group::2.
++        if self.is_blockscaled:
++            m_warp, n_warp = 1, 1
++        else:
++            m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.TCGEN5MMA)
+         warp_row_tiles = int(self.M // m_warp)
+         warp_col_tiles = int(self.N // n_warp)
+         mma_emitter = TensorCoreIntrinEmitter(
+@@ -80,7 +86,7 @@ def infer_layout(self, target: Target, thread_nums: int):
+         use_2cta = bool(annotations.get("use_2cta", 0))
+         mma_emitter.get_tcgen5_mma_meta(self.M, self.N, self.K, disable_2cta=not use_2cta)
+ 
+-        if self.is_gemm_ss():
++        if self.is_blockscaled or self.is_gemm_ss():
+             a_continuity = self.K if a_is_k_major else self.M
+             b_continuity = self.K if b_is_k_major else int(self.B.shape[-1])  # don't use N, as it may be for 2cta
+ 
+@@ -109,7 +115,11 @@ def lower(
+     ):
+         """Lower the GEMM tile-op into a TIR prim_func containing TCGEN5MMA calls."""
+         thread_nums = thread_bounds.extent
+-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.TCGEN5MMA)
++        # Block-scaled GEMM keeps a 1x1 warp partition even when using cta_group::2.
++        if self.is_blockscaled:
++            m_warp, n_warp = 1, 1
++        else:
++            m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.TCGEN5MMA)
+         warp_row_tiles = int(self.M // m_warp)
+         warp_col_tiles = int(self.N // n_warp)
+         mma_emitter = TensorCoreIntrinEmitter(
+@@ -130,6 +140,9 @@ def lower(
+         if self.B in layout_map:
+             mma_emitter._assign_b_shared_layout(layout_map[self.B])
+ 
++        if self.is_blockscaled:
++            return self._lower_blockscaled(mma_emitter, thread_bounds, thread_var, mbar_phase_expr)
++
+         if not (self.is_gemm_ss() or self.is_gemm_ts()):
+             raise ValueError(f"TCGEN5MMA supports gemm_ss and gemm_ts, got A scope {self.A.scope()}, B scope {self.B.scope()}")
+ 
+@@ -196,3 +209,82 @@ def _gemm_ss() -> None:
+             if analyzer.can_prove(thread_bounds.extent == warp_size)
+             else _Simplify(_gemm_ss_cond, inline_let=True)
+         )
++
++    def _lower_blockscaled(self, mma_emitter, thread_bounds, thread_var, mbar_phase_expr: tir.PrimExpr | None = None):
++        """Lower block-scaled MXFP8 GEMM to TIR.
++
++        Block-scaled GEMM follows explicit-async TCGEN5MMA semantics: the MMA
++        issue posts completion to `mbar`, and the user (or pipeline pass) is
++        responsible for waiting on that barrier at the consumption point. We
++        therefore never auto-emit `mbarrier_wait_parity` here. This mirrors the
++        `is_tcgen05=True` branch of `_gemm_ss`. `mbar_phase_expr` is accepted
++        for API consistency with the rest of the `GemmPyNode.Lower` chain and
++        so that a future synchronous block-scaled path can use it without
++        needing another signature change.
++        """
++        mbar = self.mbar
++        if mbar is None:
++            raise ValueError("Block-scaled GEMM requires a valid mbarrier")
++        mbarptr = retrieve_ptr(mbar, "rw")
++
++        A_shared = self.ARegion
++        B_shared = self.BRegion
++        C_local = self.C
++        clear_accum = self.clear_accum
++        SFA_tmem = self.SFARegion.buffer
++        SFB_tmem = self.SFBRegion.buffer
++        sf_a_id = self.sf_a_id
++        sf_b_id = self.sf_b_id
++        # NOTE: mbar_phase_expr is intentionally unused in the current
++        # frontend, which always requests explicit-async semantics. Keep the
++        # parameter so the signature matches `_gemm_ss` and the call site in
++        # `lower()` does not need a special case.
++        del mbar_phase_expr
++
++        annotations = getattr(self.gemm_node, "annotations", {})
++        use_2cta = bool(annotations.get("use_2cta", 0))
++        mma_emitter.get_tcgen5_mma_meta(self.M, self.N, self.K, disable_2cta=not use_2cta)
++        _atom_m, _atom_n, _atom_k, _enable_ws, enable_2cta = (int(x) for x in mma_emitter.meta)
++
++        analyzer = Analyzer()
++        warp_size = 32
++        assert analyzer.can_prove(thread_bounds.min % warp_size == 0 and thread_bounds.extent % warp_size == 0), (
++            "Block-scaled GEMM requires thread bounds aligned to warps."
++        )
++        cluster_cond = not enable_2cta or T.block_rank_in_cluster() == 0
++
++        @T.prim_func
++        def _gemm_blockscaled_cond() -> None:
++            if cluster_cond and thread_var // 32 == thread_bounds.min // warp_size:
++                mma_emitter.tcgen05mma_blockscaled(
++                    A_shared,
++                    B_shared,
++                    C_local,
++                    SFA_tmem,
++                    SFB_tmem,
++                    mbarptr,
++                    clear_accum,
++                    sf_a_id,
++                    sf_b_id,
++                )
++
++        @T.prim_func
++        def _gemm_blockscaled() -> None:
++            if cluster_cond:
++                mma_emitter.tcgen05mma_blockscaled(
++                    A_shared,
++                    B_shared,
++                    C_local,
++                    SFA_tmem,
++                    SFB_tmem,
++                    mbarptr,
++                    clear_accum,
++                    sf_a_id,
++                    sf_b_id,
++                )
++
++        return (
++            _Simplify(_gemm_blockscaled, inline_let=True)
++            if analyzer.can_prove(thread_bounds.extent == warp_size)
++            else _Simplify(_gemm_blockscaled_cond, inline_let=True)
++        )
+diff --git a/tilelang/utils/language.py b/tilelang/utils/language.py
+index 9a9fa217a6..53a5730ca2 100644
+--- a/tilelang/utils/language.py
++++ b/tilelang/utils/language.py
+@@ -335,6 +335,43 @@ def retrieve_ptr(
+     raise ValueError(f"Unsupported retrieve_ptr argument type: {type(obj)} for object {obj}")
+ 
+ 
++def retrieve_buffer_and_offset(obj: BufferLikeType) -> tuple[Buffer, PrimExpr | int]:
++    """
++    Retrieve the underlying buffer together with its logical element offset.
++
++    - Buffer -> (buffer, 0)
++    - BufferRegion -> (buffer, offset from region minima)
++    - BufferLoad -> (buffer, offset from indices or derived region minima)
++
++    This is useful when callers need to build custom access patterns from a
++    common buffer base rather than materializing a full `access_ptr` directly.
++    """
++    if isinstance(obj, tir.Buffer):
++        return obj, 0
++
++    if isinstance(obj, tir.BufferRegion):
++        buffer, region = obj.buffer, obj.region
++        strides = retrieve_stride(obj)
++        offset = 0
++        for i, r in enumerate(region):
++            offset += r.min * strides[i]
++        return buffer, offset
++
++    if isinstance(obj, tir.BufferLoad):
++        region = get_buffer_region_from_load(obj)
++        if region is not None:
++            return retrieve_buffer_and_offset(region)
++
++        buffer = obj.buffer
++        strides = retrieve_stride(obj)
++        offset = 0
++        for i, idx in enumerate(obj.indices):
++            offset += idx * strides[i]
++        return buffer, offset
++
++    raise ValueError(f"Unsupported retrieve_buffer_and_offset argument type: {type(obj)} for object {obj}")
++
++
+ def retrieve_offset(obj: BufferLikeType) -> list:
+     """
+     Retrieve per-dimension minima offsets.

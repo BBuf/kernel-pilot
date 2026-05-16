@@ -1,0 +1,1808 @@
+diff --git a/cub/cub/thread/thread_operators.cuh b/cub/cub/thread/thread_operators.cuh
+index 6ff66091882..65d4c9ab944 100644
+--- a/cub/cub/thread/thread_operators.cuh
++++ b/cub/cub/thread/thread_operators.cuh
+@@ -553,6 +553,15 @@ inline constexpr bool is_simd_enabled_cuda_operator =
+   is_cuda_std_plus_mul_v<Op, T> || //
+   is_cuda_std_bitwise_v<Op, T>;
+ 
++// TODO: enable FP32 min/max (SM100a/SM100f)
++template <typename Op, typename T, typename UnqualifiedOp = ::cuda::std::remove_cvref_t<Op>>
++inline constexpr bool is_redux_enabled_cuda_operator =
++  ::cuda::std::is_integral_v<T> && //
++  sizeof(T) <= sizeof(unsigned) && //
++  (is_cuda_minimum_maximum_v<UnqualifiedOp, T> || //
++   is_cuda_std_plus_v<UnqualifiedOp, T> || //
++   is_cuda_std_bitwise_v<UnqualifiedOp, T>);
++
+ template <typename Op, typename T = void>
+ inline constexpr bool is_cuda_binary_operator =
+   is_cuda_minimum_maximum_v<Op, T> || //
+diff --git a/cub/cub/warp/specializations/warp_reduce_batched_wspro.cuh b/cub/cub/warp/specializations/warp_reduce_batched_wspro.cuh
+new file mode 100644
+index 00000000000..ced8ae49f3d
+--- /dev/null
++++ b/cub/cub/warp/specializations/warp_reduce_batched_wspro.cuh
+@@ -0,0 +1,185 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++//! @file
++//! cub::warp_reduce_batched_wspro provides WSPRO-based batched parallel reduction of items partitioned across a CUDA
++//! thread warp.
++
++#pragma once
++
++#include <cub/config.cuh>
++
++#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
++#  pragma GCC system_header
++#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
++#  pragma clang system_header
++#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
++#  pragma system_header
++#endif // no system header
++
++#include <cub/util_arch.cuh>
++#include <cub/util_ptx.cuh>
++#include <cub/util_type.cuh>
++// Next two for REDUX helpers
++#include <cub/thread/thread_operators.cuh>
++#include <cub/warp/specializations/warp_reduce_shfl.cuh>
++
++#include <cuda/__cmath/ceil_div.h>
++#include <cuda/__cmath/pow2.h>
++#include <cuda/__ptx/instructions/get_sreg.h>
++#include <cuda/__utility/static_for.h>
++#include <cuda/__warp/warp_shuffle.h>
++#include <cuda/std/array>
++#include <cuda/std/cstdint>
++
++CUB_NAMESPACE_BEGIN
++
++namespace detail
++{
++//! @brief WarpReduceBatchedWspro provides WSPRO (Warp Shuffle Parallel Reduction Optimization) based
++//!        batched parallel reduction of items partitioned across a CUDA thread warp.
++//!
++//! @tparam T
++//!   Data type being reduced
++//!
++//! @tparam Batches
++//!   Number of arrays to reduce in batch
++//!
++//! @tparam LogicalWarpThreads
++//!   Number of threads per logical warp (must be a power-of-two)
++template <typename T, int Batches, int LogicalWarpThreads, bool SyncPhysicalWarp>
++struct warp_reduce_batched_wspro
++{
++  static_assert(::cuda::is_power_of_two(LogicalWarpThreads), "LogicalWarpThreads must be a power of two");
++  static_assert(LogicalWarpThreads > 0 && LogicalWarpThreads <= warp_threads,
++                "LogicalWarpThreads must be in the range [1, 32]");
++  static_assert(Batches >= 0, "Batches must be >= 0");
++
++  //---------------------------------------------------------------------
++  // Constants and type definitions
++  //---------------------------------------------------------------------
++
++  //! Whether the logical warp size and the physical warp size coincide
++  static constexpr auto is_arch_warp = (LogicalWarpThreads == warp_threads);
++
++  static constexpr auto max_out_per_thread = ::cuda::ceil_div(Batches, LogicalWarpThreads);
++
++  //! Shared memory storage layout type
++  using TempStorage = NullType;
++
++  int physical_lane_id;
++  int logical_lane_id;
++  int logical_warp_id;
++
++  ::cuda::std::uint32_t member_mask;
++
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE warp_reduce_batched_wspro(TempStorage& /*temp_storage*/)
++      : physical_lane_id(static_cast<int>(::cuda::ptx::get_sreg_laneid()))
++      , logical_lane_id(is_arch_warp ? physical_lane_id : physical_lane_id % LogicalWarpThreads)
++      , logical_warp_id(is_arch_warp ? 0 : (physical_lane_id / LogicalWarpThreads))
++      , member_mask(SyncPhysicalWarp ? 0xFFFFFFFFu : cub::WarpMask<LogicalWarpThreads>(logical_warp_id))
++  {}
++
++  template <bool ToBlocked, typename InputT, typename OutputT, typename ReductionOp>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void Reduce(const InputT& inputs, OutputT& outputs, ReductionOp reduction_op)
++  {
++    // Dispatch to more efficient intrinsics when applicable
++    // For more batches, WSPRO gives significantly better throughput, while latency is only slightly better for
++    // REDUX. For subwarps both throughput and latency are worse with REDUX independent of the number of batches. This
++    // might be a codegen issue.
++    constexpr bool redux_performs_better = is_arch_warp && Batches <= 8;
++    if constexpr (is_redux_enabled_cuda_operator<ReductionOp, T> && redux_performs_better)
++    {
++      NV_IF_TARGET(NV_PROVIDES_SM_80, (ReduceRedux<ToBlocked>(inputs, outputs, reduction_op); return;))
++    }
++
++    // Needed in case of outputs aliasing inputs
++    ::cuda::std::array<T, max_out_per_thread> intermediate_outputs;
++
++    ::cuda::static_for<0, max_out_per_thread>([&](auto out_idx) {
++      constexpr auto first_idx      = out_idx * LogicalWarpThreads;
++      intermediate_outputs[out_idx] = RecurseReductionTree<ToBlocked, first_idx>(inputs, reduction_op);
++    });
++
++    _CCCL_PRAGMA_UNROLL_FULL()
++    for (int i = 0; i < max_out_per_thread; ++i)
++    {
++      outputs[i] = intermediate_outputs[i];
++    }
++  }
++
++  template <bool ToBlocked, typename InputT, typename OutputT, typename ReductionOp>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void ReduceRedux(const InputT& inputs, OutputT& outputs, ReductionOp reduction_op)
++  {
++    // Needed to avoid compiler error on "/ 0" and improve compile time.
++    if constexpr (Batches != 0)
++    {
++      // Needed in case of outputs aliasing inputs
++      ::cuda::std::array<T, max_out_per_thread> intermediate_outputs;
++
++      // Can't use the full member mask given SyncPhysicalWarp==true because it affects the result of the reduction.
++      const auto reduce_mask = cub::WarpMask<LogicalWarpThreads>(logical_warp_id);
++      _CCCL_PRAGMA_UNROLL_FULL()
++      for (int i = 0; i < Batches; ++i)
++      {
++        auto result         = cub::detail::reduce_op_sync(inputs[i], reduce_mask, reduction_op);
++        const auto out_lane = ToBlocked ? i / max_out_per_thread : i % LogicalWarpThreads;
++        const auto out_idx  = ToBlocked ? i % max_out_per_thread : i / LogicalWarpThreads;
++        if (logical_lane_id == out_lane)
++        {
++          intermediate_outputs[out_idx] = result;
++        }
++      }
++
++      _CCCL_PRAGMA_UNROLL_FULL()
++      for (int i = 0; i < max_out_per_thread; ++i)
++      {
++        outputs[i] = intermediate_outputs[i];
++      }
++    }
++  }
++
++  template <bool ToBlocked, int BaseIdxStriped, int PrevStride = LogicalWarpThreads, typename InputT, typename ReductionOp>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE T RecurseReductionTree(const InputT& inputs, ReductionOp reduction_op)
++  {
++    // "Transpose" index
++    constexpr auto base_idx_blocked =
++      BaseIdxStriped / LogicalWarpThreads + (BaseIdxStriped % LogicalWarpThreads) * max_out_per_thread;
++    constexpr auto base_idx = ToBlocked ? base_idx_blocked : BaseIdxStriped;
++    // Important: By catching out-of-range indices at all levels instead of just at the base level we avoid unnecessary
++    // shuffles.
++    if constexpr (base_idx >= Batches)
++    {
++      // Dummy value needed when Batches is not an integer multiple of LogicalWarpThreads.
++      // In that case some shuffles have no second batch to exchange against, so we exchange a dummy value.
++      // Chose to use the last batch to avoid relying on default construction of T.
++      return inputs[Batches - 1];
++    }
++    else if constexpr (PrevStride == 1)
++    {
++      // Recursion base case
++      return inputs[base_idx];
++    }
++    // Explicit "else" branch needed to avoid compiler error on "% 0" and improve compile time.
++    else
++    {
++      constexpr auto stride             = PrevStride / 2;
++      constexpr auto offset_idx_striped = BaseIdxStriped + stride;
++
++      const auto base_value   = RecurseReductionTree<ToBlocked, BaseIdxStriped, stride>(inputs, reduction_op);
++      const auto offset_value = RecurseReductionTree<ToBlocked, offset_idx_striped, stride>(inputs, reduction_op);
++
++      // Each left lane exchanges its offset value against a right lane's base value
++      const auto is_left_lane = (logical_lane_id % PrevStride) < stride;
++      const auto keep_value   = is_left_lane ? base_value : offset_value;
++      auto exch_value         = is_left_lane ? offset_value : base_value;
++      exch_value              = ::cuda::device::warp_shuffle_xor(exch_value, stride, member_mask);
++      // While the current implementation is possibly faster, another conditional swap here would allow for
++      // non-commutative reductions which might be useful for (segmented) scan operations.
++      return static_cast<T>(reduction_op(exch_value, keep_value));
++    }
++  }
++};
++} // namespace detail
++
++CUB_NAMESPACE_END
+diff --git a/cub/cub/warp/warp_reduce_batched.cuh b/cub/cub/warp/warp_reduce_batched.cuh
+new file mode 100644
+index 00000000000..46252ceb4fe
+--- /dev/null
++++ b/cub/cub/warp/warp_reduce_batched.cuh
+@@ -0,0 +1,467 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++//! @file
++//! @rst
++//! The ``cub::WarpReduceBatched`` class provides :ref:`collective <collective-primitives>` methods for
++//! performing batched parallel reductions of multiple arrays partitioned across a CUDA thread warp.
++//! @endrst
++
++#pragma once
++
++#include <cub/config.cuh>
++
++#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
++#  pragma GCC system_header
++#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
++#  pragma clang system_header
++#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
++#  pragma system_header
++#endif // no system header
++
++#include <cub/detail/type_traits.cuh>
++#include <cub/util_type.cuh>
++#include <cub/warp/specializations/warp_reduce_batched_wspro.cuh>
++
++#include <cuda/__cmath/ceil_div.h>
++#include <cuda/__cmath/pow2.h>
++#include <cuda/std/__functional/operations.h>
++#include <cuda/std/__iterator/readable_traits.h>
++#include <cuda/std/__type_traits/is_same.h>
++
++CUB_NAMESPACE_BEGIN
++
++//! @rst
++//! The ``WarpReduceBatched`` class provides :ref:`collective <collective-primitives>` methods for performing
++//! batched parallel reductions of multiple batches of items partitioned across a CUDA thread warp.
++//!
++//! Overview
++//! ++++++++
++//!
++//! - A `reduction <http://en.wikipedia.org/wiki/Reduce_(higher-order_function)>`__ (or *fold*) uses a binary combining
++//!   operator to compute a single aggregate from a list of input elements. Parallel reductions are in general only
++//!   deterministic when the reduction operator is both commutative and associative.
++//! - Supports "logical" warps smaller than the physical warp size (e.g., logical warps of 8 threads).
++//! - This primitive performs batched reductions taking one item per batch per thread.
++//! - Results are distributed among the threads. When there are more batches than logical warp threads, results can be
++//!   distributed among threads in either striped or blocked manner.
++//! - The number of batches must be non-negative. Compile-time and register pressure increase with the number of
++//!   batches.
++//!
++//! Performance Characteristics
++//! +++++++++++++++++++++++++++
++//!
++//! - Uses special instructions when applicable (e.g., warp ``SHFL`` instructions).
++//! - Uses synchronization-free communication between warp lanes when applicable.
++//! - Should generally give much better performance than sequential ``WarpReduce`` calls independent of blocked or
++//! striped output arrangements.
++//! - Achieves peak efficiency when the number of batches is a multiple of the number of logical warp threads.
++//! - For smaller than physical warp size logical warps, using ``SyncPhysicalWarp = true`` should in general give better
++//! performance than ``SyncPhysicalWarp = false``.
++//!   Note that it can cause a deadlock if not all non-exited logical warps from the same physical warp participate in
++//!   the reduction (due to branches).
++//! - Any uneven number of batches is less efficient than the next higher even number.
++//! - For more batches than logical warp threads, the striped output can be slightly more performant than blocked output
++//!   depending on the number of batches and the number of logical warp threads.
++//! - Blocked output should generally give much better performance than converting striped output to blocked using e.g.
++//! ``WarpExchange::StripedToBlocked()``.
++//! - For types of less than 4 bytes future optimization might let blocked output outperform striped output.
++//!
++//! Simple Example
++//! +++++++++++++++
++//!
++//! @warpcollective{WarpReduceBatched}
++//!
++//! The code snippet below illustrates reduction of 3 batches across 32 threads in each of 2 warps:
++//!
++//! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++//!     :language: c++
++//!     :dedent:
++//!     :start-after: example-begin warp-reduce-batched-overview
++//!     :end-before: example-end warp-reduce-batched-overview
++//!
++//! @endrst
++//!
++//! @tparam T
++//!   The reduction input/output element type
++//!
++//! @tparam Batches
++//!   The number of batches to reduce. Also corresponds to the size of the range of inputs for each thread.
++//!
++//! @tparam LogicalWarpThreads
++//!   **[optional]** The number of threads per "logical" warp (may be less than the number of
++//!   hardware warp threads but has to be a power of two).  Default is the warp size of the targeted CUDA
++//!   compute-capability (e.g., 32 threads for SM80).
++//!
++template <typename T, int Batches, int LogicalWarpThreads = detail::warp_threads, bool SyncPhysicalWarp = false>
++class WarpReduceBatched
++{
++  static_assert(::cuda::is_power_of_two(LogicalWarpThreads), "LogicalWarpThreads must be a power of two");
++  static_assert(LogicalWarpThreads > 0 && LogicalWarpThreads <= detail::warp_threads,
++                "LogicalWarpThreads must be in the range [1, 32]");
++  static_assert(Batches >= 0, "Batches must be >= 0");
++
++#ifndef _CCCL_DOXYGEN_INVOKED // Do not document
++
++public:
++  //! Internal specialization.
++  using InternalWarpReduceBatched = detail::warp_reduce_batched_wspro<T, Batches, LogicalWarpThreads, SyncPhysicalWarp>;
++
++#endif // _CCCL_DOXYGEN_INVOKED
++
++private:
++  static constexpr auto max_out_per_thread = ::cuda::ceil_div(Batches, LogicalWarpThreads);
++
++  template <class InputT, class OutputT, class ReductionOp>
++  _CCCL_DEVICE _CCCL_FORCEINLINE void check_constraints()
++  {
++    static_assert(detail::is_fixed_size_random_access_range_v<InputT>,
++                  "InputT must support the subscript operator[] and have a compile-time size");
++    static_assert(detail::is_fixed_size_random_access_range_v<OutputT>,
++                  "OutputT must support the subscript operator[] and have a compile-time size");
++    static_assert(detail::static_size_v<InputT> == Batches, "Input size must match Batches");
++    static_assert(detail::static_size_v<OutputT> == max_out_per_thread,
++                  "Output size must match ceil_div(Batches, LogicalWarpThreads)");
++    // These restrictions could be relaxed to allow type-conversions
++    static_assert(::cuda::std::is_same_v<::cuda::std::iter_value_t<InputT>, T>, "Input element type must match T");
++    static_assert(::cuda::std::is_same_v<::cuda::std::iter_value_t<OutputT>, T>, "Output element type must match T");
++    static_assert(detail::has_binary_call_operator<ReductionOp, T>::value,
++                  "ReductionOp must have the binary call operator: operator(T, T)");
++  };
++
++  //! Shared memory storage layout type for WarpReduceBatched
++  using _TempStorage = typename InternalWarpReduceBatched::TempStorage;
++
++  //! Shared storage reference
++  _TempStorage& temp_storage;
++
++public:
++  //! \smemstorage{WarpReduceBatched}
++  struct TempStorage : Uninitialized<_TempStorage>
++  {};
++
++  //! @name Collective constructors
++  //! @{
++
++  //! @rst
++  //! Collective constructor using the specified memory allocation as temporary storage.
++  //! Logical warp and lane identifiers are constructed from ``threadIdx.x``.
++  //! @endrst
++  //!
++  //! @param[in] temp_storage Reference to memory allocation having layout type TempStorage
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE WarpReduceBatched(TempStorage& temp_storage)
++      : temp_storage{temp_storage.Alias()}
++  {}
++
++  //! @}
++  //! @name Generic reductions
++  //! @{
++
++  //! @rst
++  //! Computes a warp-wide reduction for each batch in the calling warp using the specified binary reduction
++  //! functor.
++  //! Thread ``i`` returns the result for batch ``i``.
++  //! Returned items that have no corresponding input batch are invalid.
++  //! For more batches than logical warp threads or generic code that could result in zero batches, use
++  //! ``ReduceToStriped()`` or ``ReduceToBlocked()`` instead.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 3 batches across 16 threads in the branched-off first logical warp
++  //! (using ``cuda::std::array`` inputs and outputs):
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-reduce
++  //!     :end-before: example-end warp-reduce-batched-reduce
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam ReductionOp
++  //!   **[inferred]** Binary reduction operator type having member
++  //!   ``T operator()(const T &a, const T &b)``
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @param[in] reduction_op
++  //!   Binary reduction operator
++  //!
++  //! @return
++  //!   The reduction of the input values of the batch corresponding to the logical lane.
++  template <typename InputT, typename ReductionOp>
++  [[nodiscard]] _CCCL_DEVICE_API _CCCL_FORCEINLINE T Reduce(const InputT& inputs, ReductionOp reduction_op)
++  {
++    static_assert(max_out_per_thread == 1,
++                  "For Batches > LogicalWarpThreads (or Batches == 0), use ReduceToStriped() or ReduceToBlocked()");
++
++    ::cuda::std::array<T, 1> output;
++    // ReduceToBlocked() and ReduceToStriped() do the same for max_out_per_thread == 1.
++    ReduceToStriped(inputs, output, reduction_op);
++    return output[0];
++  }
++
++  //! @rst
++  //! Computes a warp-wide reduction for each batch in the calling warp using the specified binary reduction
++  //! functor. The user must provide an output range of ``max_out_per_thread = ceil_div(Batches, LogicalWarpThreads)``
++  //! items. Logical lane ``i`` stores results in its output range in a striped manner:
++  //! ``outputs[0]`` = result of batch ``i``, ``outputs[1]`` = result of batch ``i + LogicalWarpThreads``, etc.
++  //! Items in the output range that have no corresponding input batch are invalid.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 3 batches across 2 threads in every second logical warp
++  //! (using ``cuda::std::array`` inputs and outputs):
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-reduce-to-striped
++  //!     :end-before: example-end warp-reduce-batched-reduce-to-striped
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam OutputT
++  //!   **[inferred]** The data type to hold results having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam ReductionOp
++  //!   **[inferred]** Binary reduction operator type having member
++  //!   ``T operator()(const T &a, const T &b)``
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @param[out] outputs
++  //!   Statically-sized output range holding ``ceil_div(Batches, LogicalWarpThreads)`` items
++  //!
++  //! @param[in] reduction_op
++  //!   Binary reduction operator
++  template <typename InputT, typename OutputT, typename ReductionOp>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void
++  ReduceToStriped(const InputT& inputs, OutputT& outputs, ReductionOp reduction_op)
++  {
++    check_constraints<InputT, OutputT, ReductionOp>();
++    InternalWarpReduceBatched{temp_storage}.template Reduce</* ToBlocked = */ false>(inputs, outputs, reduction_op);
++  }
++
++  //! @rst
++  //! Computes a warp-wide reduction for each batch in the calling warp using the specified binary reduction
++  //! functor. The user must provide an output range of ``max_out_per_thread = ceil_div(Batches, LogicalWarpThreads)``
++  //! items. Logical lane *i* stores results in its output range in a blocked manner:
++  //! ``outputs[0]`` = result of batch ``i * max_out_per_thread``, ``outputs[1]`` = result of batch
++  //! ``i * max_out_per_thread + 1``, etc.
++  //! Items in the output range that have no corresponding input batch are invalid.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 3 batches across 2 threads in every second logical warp
++  //! (using ``cuda::std::array`` inputs and outputs):
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-reduce-to-blocked
++  //!     :end-before: example-end warp-reduce-batched-reduce-to-blocked
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam OutputT
++  //!   **[inferred]** The data type to hold results having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam ReductionOp
++  //!   **[inferred]** Binary reduction operator type having member
++  //!   ``T operator()(const T &a, const T &b)``
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @param[out] outputs
++  //!   Statically-sized output range holding ``ceil_div(Batches, LogicalWarpThreads)`` items
++  //!
++  //! @param[in] reduction_op
++  //!   Binary reduction operator
++  template <typename InputT, typename OutputT, typename ReductionOp>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void
++  ReduceToBlocked(const InputT& inputs, OutputT& outputs, ReductionOp reduction_op)
++  {
++    check_constraints<InputT, OutputT, ReductionOp>();
++    InternalWarpReduceBatched{temp_storage}.template Reduce</* ToBlocked = */ true>(inputs, outputs, reduction_op);
++  }
++
++  //! @}
++  //! @name Sum reductions
++  //! @{
++  //! @rst
++  //! Computes a warp-wide sum for each batch in the calling warp.
++  //! Thread ``i`` returns the result for batch ``i``.
++  //! Returned items that have no corresponding input batch are invalid.
++  //! For more batches than logical warp threads or generic code that could result in zero batches, use
++  //! ``SumToStriped()`` or ``SumToBlocked()`` instead.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 3 batches across 4 threads in each of 2 logical warps
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-sum
++  //!     :end-before: example-end warp-reduce-batched-sum
++  //!
++  //! @smemwarpreuse
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @return
++  //!   The sum of the input values of the batch corresponding to the logical lane.
++  template <typename InputT>
++  [[nodiscard]] _CCCL_DEVICE_API _CCCL_FORCEINLINE T Sum(const InputT& inputs)
++  {
++    return Reduce(inputs, ::cuda::std::plus<>{});
++  }
++
++  //! @rst
++  //! Computes a warp-wide sum for each batch in the calling warp.
++  //! The user must provide an output range of ``max_out_per_thread = ceil_div(Batches, LogicalWarpThreads)`` items.
++  //! Logical lane ``i`` stores results in its output range in a striped manner:
++  //! ``outputs[0]`` = result of batch ``i``, ``outputs[1]`` = result of batch ``i + LogicalWarpThreads``, etc.
++  //! Items in the output range that have no corresponding input batch are invalid.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 5 batches across 2 threads in each of 4 logical warps
++  //! meaning more than one output per thread (using ``cuda::std::span`` inputs and outputs):
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-sum-to-striped
++  //!     :end-before: example-end warp-reduce-batched-sum-to-striped
++  //!
++  //! @smemwarpreuse
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam OutputT
++  //!   **[inferred]** The data type to hold results having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @param[out] outputs
++  //!   Statically-sized output range holding ``ceil_div(Batches, LogicalWarpThreads)`` items
++  template <typename InputT, typename OutputT>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void SumToStriped(const InputT& inputs, OutputT& outputs)
++  {
++    ReduceToStriped(inputs, outputs, ::cuda::std::plus<>{});
++  }
++
++  //! @rst
++  //! Computes a warp-wide sum for each batch in the calling warp.
++  //! The user must provide an output range of ``max_out_per_thread = ceil_div(Batches, LogicalWarpThreads)`` items.
++  //! Logical lane *i* stores results in its output range in a blocked manner:
++  //! ``outputs[0]`` = result of batch ``i * max_out_per_thread``, ``outputs[1]`` = result of batch
++  //! ``i * max_out_per_thread + 1``, etc.
++  //! Items in the output range that have no corresponding input batch are invalid.
++  //!
++  //! .. versionadded:: 3.4.0
++  //!    First appears in CUDA Toolkit 13.4.
++  //!
++  //! @smemwarpreuse
++  //!
++  //! Snippet
++  //! +++++++
++  //!
++  //! The code snippet below illustrates reduction of 5 batches across 2 threads in each of 4 logical warps
++  //! meaning more than one output per thread (using ``cuda::std::span`` inputs and outputs):
++  //!
++  //! .. literalinclude:: ../../../cub/test/warp/catch2_test_warp_reduce_batched_api.cu
++  //!     :language: c++
++  //!     :dedent:
++  //!     :start-after: example-begin warp-reduce-batched-sum-to-blocked
++  //!     :end-before: example-end warp-reduce-batched-sum-to-blocked
++  //!
++  //! @smemwarpreuse
++  //!
++  //! @endrst
++  //!
++  //! @tparam InputT
++  //!   **[inferred]** The data type to be reduced having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @tparam OutputT
++  //!   **[inferred]** The data type to hold results having member
++  //!   ``operator[](int i)`` and must be statically-sized (``size()`` method or static array)
++  //!
++  //! @param[in] inputs
++  //!   Statically-sized input range holding ``Batches`` items
++  //!
++  //! @param[out] outputs
++  //!   Statically-sized output range holding ``ceil_div(Batches, LogicalWarpThreads)`` items
++  template <typename InputT, typename OutputT>
++  _CCCL_DEVICE_API _CCCL_FORCEINLINE void SumToBlocked(const InputT& inputs, OutputT& outputs)
++  {
++    ReduceToBlocked(inputs, outputs, ::cuda::std::plus<>{});
++  }
++
++  //! @}
++};
++
++CUB_NAMESPACE_END
+diff --git a/cub/test/warp/catch2_test_warp_reduce_batched.cu b/cub/test/warp/catch2_test_warp_reduce_batched.cu
+new file mode 100644
+index 00000000000..b229ba763ef
+--- /dev/null
++++ b/cub/test/warp/catch2_test_warp_reduce_batched.cu
+@@ -0,0 +1,762 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++#include <cub/util_macro.cuh>
++#include <cub/warp/warp_reduce.cuh>
++#include <cub/warp/warp_reduce_batched.cuh>
++
++#include <cuda/cmath>
++#include <cuda/functional>
++#include <cuda/iterator>
++#include <cuda/ptx>
++#include <cuda/std/functional>
++#include <cuda/std/limits>
++#include <cuda/std/mdspan>
++#include <cuda/std/span>
++#include <cuda/std/type_traits>
++
++#include <numeric>
++
++#include <test_util.h>
++
++#include <c2h/catch2_test_helper.h>
++#include <c2h/check_results.cuh>
++#include <c2h/custom_type.h>
++#include <c2h/operator.cuh>
++
++// %PARAM% TEST_TYPES types 0:1:2
++
++inline constexpr int warp_size  = 32;
++inline constexpr int block_size = 2 * warp_size;
++
++// 2D layout: num_batches x batch_size (row-major). Single type with dynamic extents for kernels and host.
++template <typename T>
++using input_2d_mdspan_t = cuda::std::mdspan<T, cuda::std::dextents<int, 2>>;
++
++enum class WarpReduceBatchedMode
++{
++  SingleOut,
++  ToStriped,
++  ToBlocked
++};
++
++template <WarpReduceBatchedMode Mode,
++          bool SyncPhysicalWarp,
++          int Batches,
++          int LogicalWarpThreads,
++          typename T,
++          typename ReductionOp>
++__global__ void
++warp_reduce_batched_kernel(input_2d_mdspan_t<T> input_md, cuda::std::span<T> output, ReductionOp reduction_op)
++{
++  using warp_reduce_batched_t = cub::WarpReduceBatched<T, Batches, LogicalWarpThreads, SyncPhysicalWarp>;
++  __shared__ typename warp_reduce_batched_t::TempStorage temp_storage[block_size / LogicalWarpThreads];
++  const int tid             = threadIdx.x;
++  const int logical_warp_id = tid / LogicalWarpThreads;
++  const int lane_id         = tid % LogicalWarpThreads;
++
++  auto inputs = cuda::std::array<T, Batches>{};
++  for (int batch_idx = 0; batch_idx < Batches; ++batch_idx)
++  {
++    inputs[batch_idx] = input_md(logical_warp_id * Batches + batch_idx, lane_id);
++  }
++
++  constexpr int out_per_thread = cuda::ceil_div(Batches, LogicalWarpThreads);
++  auto outputs                 = cuda::std::array<T, out_per_thread>{};
++  if constexpr (Mode == WarpReduceBatchedMode::SingleOut)
++  {
++    outputs[0] = warp_reduce_batched_t{temp_storage[logical_warp_id]}.Reduce(inputs, reduction_op);
++  }
++  if constexpr (Mode == WarpReduceBatchedMode::ToBlocked)
++  {
++    warp_reduce_batched_t{temp_storage[logical_warp_id]}.ReduceToBlocked(inputs, outputs, reduction_op);
++  }
++  if constexpr (Mode == WarpReduceBatchedMode::ToStriped)
++  {
++    warp_reduce_batched_t{temp_storage[logical_warp_id]}.ReduceToStriped(inputs, outputs, reduction_op);
++  }
++
++  for (int idx = 0; idx < out_per_thread; ++idx)
++  {
++    const auto batch_idx =
++      (Mode == WarpReduceBatchedMode::ToBlocked)
++        ? (idx + lane_id * out_per_thread)
++        : (idx * LogicalWarpThreads + lane_id);
++    if (batch_idx < Batches)
++    {
++      output[logical_warp_id * Batches + batch_idx] = outputs[idx];
++    }
++  }
++}
++
++template <WarpReduceBatchedMode Mode, bool SyncPhysicalWarp, int Batches, int LogicalWarpThreads, typename T>
++__global__ void sum_batched_kernel(input_2d_mdspan_t<T> input_md, cuda::std::span<T> output)
++{
++  using warp_reduce_batched_t = cub::WarpReduceBatched<T, Batches, LogicalWarpThreads, SyncPhysicalWarp>;
++  __shared__ typename warp_reduce_batched_t::TempStorage temp_storage[block_size / LogicalWarpThreads];
++  const int tid             = threadIdx.x;
++  const int logical_warp_id = tid / LogicalWarpThreads;
++  const int lane_id         = tid % LogicalWarpThreads;
++
++  auto inputs = cuda::std::array<T, Batches>{};
++  for (int batch_idx = 0; batch_idx < Batches; ++batch_idx)
++  {
++    inputs[batch_idx] = input_md(logical_warp_id * Batches + batch_idx, lane_id);
++  }
++
++  constexpr int out_per_thread = cuda::ceil_div(Batches, LogicalWarpThreads);
++  auto outputs                 = cuda::std::array<T, out_per_thread>{};
++  if constexpr (Mode == WarpReduceBatchedMode::SingleOut)
++  {
++    outputs[0] = warp_reduce_batched_t{temp_storage[logical_warp_id]}.Sum(inputs);
++  }
++  if constexpr (Mode == WarpReduceBatchedMode::ToBlocked)
++  {
++    warp_reduce_batched_t{temp_storage[logical_warp_id]}.SumToBlocked(inputs, outputs);
++  }
++  if constexpr (Mode == WarpReduceBatchedMode::ToStriped)
++  {
++    warp_reduce_batched_t{temp_storage[logical_warp_id]}.SumToStriped(inputs, outputs);
++  }
++
++  for (int idx = 0; idx < out_per_thread; ++idx)
++  {
++    const auto batch_idx =
++      (Mode == WarpReduceBatchedMode::ToBlocked)
++        ? (idx + lane_id * out_per_thread)
++        : (idx * LogicalWarpThreads + lane_id);
++    if (batch_idx < Batches)
++    {
++      output[logical_warp_id * Batches + batch_idx] = outputs[idx];
++    }
++  }
++}
++
++template <WarpReduceBatchedMode Mode,
++          bool SyncPhysicalWarp,
++          int Batches,
++          int LogicalWarpThreads,
++          typename T,
++          typename ReductionOp>
++__global__ void
++warp_reduce_batched_cond_part_kernel(input_2d_mdspan_t<T> input_md, cuda::std::span<T> output, ReductionOp reduction_op)
++{
++  static_assert(LogicalWarpThreads < warp_size, "Need at least 2 logical warps per physical warp for this test");
++  using warp_reduce_batched_t = cub::WarpReduceBatched<T, Batches, LogicalWarpThreads>;
++  __shared__ typename warp_reduce_batched_t::TempStorage temp_storage[block_size / LogicalWarpThreads];
++
++  const int tid               = threadIdx.x;
++  const int logical_warp_id   = tid / LogicalWarpThreads;
++  const int lane_id           = tid % LogicalWarpThreads;
++  const bool is_participating = (logical_warp_id % 2 == 0);
++
++  if (is_participating)
++  {
++    const int participant_idx = logical_warp_id / 2;
++
++    auto inputs = cuda::std::array<T, Batches>{};
++    for (int batch_idx = 0; batch_idx < Batches; ++batch_idx)
++    {
++      inputs[batch_idx] = input_md(participant_idx * Batches + batch_idx, lane_id);
++    }
++
++    constexpr int out_per_thread = cuda::ceil_div(Batches, LogicalWarpThreads);
++    auto outputs                 = cuda::std::array<T, out_per_thread>{};
++    if constexpr (Mode == WarpReduceBatchedMode::SingleOut)
++    {
++      outputs[0] = warp_reduce_batched_t{temp_storage[logical_warp_id]}.Reduce(inputs, reduction_op);
++    }
++    if constexpr (Mode == WarpReduceBatchedMode::ToBlocked)
++    {
++      warp_reduce_batched_t{temp_storage[logical_warp_id]}.ReduceToBlocked(inputs, outputs, reduction_op);
++    }
++    if constexpr (Mode == WarpReduceBatchedMode::ToStriped)
++    {
++      warp_reduce_batched_t{temp_storage[logical_warp_id]}.ReduceToStriped(inputs, outputs, reduction_op);
++    }
++
++    for (int idx = 0; idx < out_per_thread; ++idx)
++    {
++      const auto batch_idx =
++        (Mode == WarpReduceBatchedMode::ToBlocked)
++          ? (idx + lane_id * out_per_thread)
++          : (idx * LogicalWarpThreads + lane_id);
++      if (batch_idx < Batches)
++      {
++        output[participant_idx * Batches + batch_idx] = outputs[idx];
++      }
++    }
++  }
++  // When SyncPhysicalWarp is true, the non-participating threads need to exit early to avoid expected deadlocks.
++  if constexpr (!SyncPhysicalWarp)
++  {
++    // Keep non-participating threads from exiting early to check for unexpected deadlocks.
++    __syncwarp();
++  }
++}
++
++_CCCL_DIAG_PUSH
++_CCCL_DIAG_SUPPRESS_MSVC(4244) // numeric(33): C: '=': conversion from 'int' to '_Ty', possible loss of data
++
++template <typename T, typename ReductionOp>
++void compute_host_reference(input_2d_mdspan_t<const T> input_md, cuda::std::span<T> output, ReductionOp op)
++{
++  const auto identity  = identity_v<ReductionOp, T>;
++  const int batches    = input_md.extent(0);
++  const int batch_size = input_md.extent(1);
++
++  for (int batch_idx = 0; batch_idx < batches; ++batch_idx)
++  {
++    const auto iter   = cuda::make_transform_iterator(cuda::make_counting_iterator(0), [input_md, batch_idx](int idx) {
++      return input_md(batch_idx, idx);
++    });
++    output[batch_idx] = static_cast<T>(std::accumulate(iter, iter + batch_size, identity, op));
++  }
++}
++
++_CCCL_DIAG_POP
++
++template <typename T, int N>
++void gen_bounded_input(c2h::seed_t seed, c2h::device_vector<T>& d_input)
++{
++  if constexpr (cuda::std::is_floating_point_v<T>)
++  {
++    // Small positive range to minimize floating point error in reductions
++    c2h::gen(seed, d_input, T(0.5), T(1.5));
++  }
++  else if constexpr (cuda::std::is_integral_v<T> && cuda::std::is_signed_v<T>)
++  {
++    // Avoid signed overflow when summing N elements
++    const T gen_max = cuda::std::numeric_limits<T>::max() / static_cast<T>(N);
++    c2h::gen(seed, d_input, -gen_max, gen_max);
++  }
++  else
++  {
++    c2h::gen(seed, d_input);
++  }
++}
++
++template <WarpReduceBatchedMode Mode,
++          int Batches,
++          int LogicalWarpThreads,
++          typename T,
++          typename ReductionOp,
++          bool ConvenienceOverload = false,
++          bool CondParticipation   = false,
++          bool SyncPhysicalWarp    = false>
++void test_warp_reduce_batched(ReductionOp reduction_op = ReductionOp{})
++{
++  CAPTURE(c2h::type_name<T>(), Batches, LogicalWarpThreads);
++
++  constexpr int num_logical_warps = block_size / LogicalWarpThreads;
++  constexpr int total_batches     = CondParticipation ? num_logical_warps * Batches / 2 : num_logical_warps * Batches;
++  constexpr int total_elements    = total_batches * LogicalWarpThreads;
++
++  c2h::device_vector<T> d_input(total_elements);
++  gen_bounded_input<T, LogicalWarpThreads>(C2H_SEED(10), d_input);
++
++  c2h::device_vector<T> d_output(total_batches);
++
++  input_2d_mdspan_t<T> d_input_md(thrust::raw_pointer_cast(d_input.data()), total_batches, LogicalWarpThreads);
++  cuda::std::span<T> d_output_span(thrust::raw_pointer_cast(d_output.data()), total_batches);
++  if constexpr (CondParticipation)
++  {
++    warp_reduce_batched_cond_part_kernel<Mode, SyncPhysicalWarp, Batches, LogicalWarpThreads>
++      <<<1, block_size>>>(d_input_md, d_output_span, reduction_op);
++  }
++  else
++  {
++    if constexpr (ConvenienceOverload && cuda::std::is_same_v<ReductionOp, cuda::std::plus<>>)
++    {
++      sum_batched_kernel<Mode, SyncPhysicalWarp, Batches, LogicalWarpThreads>
++        <<<1, block_size>>>(d_input_md, d_output_span);
++    }
++    else
++    {
++      warp_reduce_batched_kernel<Mode, SyncPhysicalWarp, Batches, LogicalWarpThreads>
++        <<<1, block_size>>>(d_input_md, d_output_span, reduction_op);
++    }
++  }
++
++  cudaError_t err = cudaPeekAtLastError();
++  REQUIRE(err == cudaSuccess);
++
++  err = cudaDeviceSynchronize();
++  REQUIRE(err == cudaSuccess);
++
++  // Host-side: construct mdspans once; pass to reference and verify
++  c2h::host_vector<T> h_input  = d_input;
++  c2h::host_vector<T> h_output = d_output;
++
++  c2h::host_vector<T> h_reference(total_batches);
++  input_2d_mdspan_t<const T> h_input_md(h_input.data(), total_batches, LogicalWarpThreads);
++  cuda::std::span<T> h_reference_span(h_reference.data(), total_batches);
++
++  compute_host_reference(h_input_md, h_reference_span, reduction_op);
++
++  verify_results(h_reference, h_output);
++}
++
++#if TEST_TYPES == 0
++using builtin_type_list = c2h::type_list<cuda::std::uint8_t, cuda::std::uint16_t>;
++#elif TEST_TYPES == 1
++using builtin_type_list = c2h::type_list<cuda::std::int32_t, cuda::std::int64_t>;
++#elif TEST_TYPES == 2
++using builtin_type_list = c2h::type_list<float, double>;
++#endif
++
++#if TEST_TYPES == 0
++using full_type_list = c2h::type_list<cuda::std::uint8_t, cuda::std::uint16_t, uchar3, short2>;
++#elif TEST_TYPES == 1
++using full_type_list =
++  c2h::type_list<cuda::std::int32_t,
++                 cuda::std::int64_t,
++#  if _CCCL_CTK_AT_LEAST(13, 0)
++                 ulonglong4_16a
++#  else // _CCCL_CTK_AT_LEAST(13, 0)
++                 ulonglong4
++#  endif // _CCCL_CTK_AT_LEAST(13, 0)
++                 >;
++#elif TEST_TYPES == 2
++using custom_t =
++  c2h::custom_type_t<c2h::accumulateable_t, c2h::equal_comparable_t, c2h::lexicographical_less_comparable_t>;
++
++using full_type_list = c2h::type_list<float, double, custom_t>;
++#endif // TEST_TYPES
++
++// (N, M) = (Batches, LogicalWarpThreads) for test parameterization
++template <int X, int Y>
++struct int_pair
++{
++  static constexpr int x = X;
++  static constexpr int y = Y;
++};
++
++// N=M configurations (best performance)
++using equal_nm_configs =
++  c2h::type_list<int_pair<1, 1>, int_pair<2, 2>, int_pair<4, 4>, int_pair<8, 8>, int_pair<16, 16>, int_pair<32, 32>>;
++
++// N!=M configurations
++using unequal_nm_configs = c2h::type_list<
++  int_pair<0, 32>,
++  int_pair<1, 32>,
++  int_pair<3, 32>,
++  int_pair<3, 16>,
++  int_pair<5, 16>,
++  int_pair<4, 8>,
++  int_pair<5, 8>,
++  int_pair<6, 8>,
++  int_pair<6, 4>,
++  int_pair<7, 4>,
++  int_pair<8, 4>,
++  int_pair<9, 4>,
++  int_pair<10, 4>,
++  int_pair<1, 2>,
++  int_pair<7, 2>,
++  int_pair<0, 1>,
++  int_pair<2, 1>>;
++
++// Sub-warp configurations (LogicalWarpThreads < 32, at least 2 logical warps per physical warp)
++using sub_warp_equal_configs = c2h::type_list<int_pair<2, 2>, int_pair<4, 4>, int_pair<8, 8>, int_pair<16, 16>>;
++
++using sub_warp_unequal_configs = c2h::type_list<int_pair<3, 16>, int_pair<4, 8>, int_pair<6, 4>, int_pair<1, 2>>;
++
++using unequal_nm_single_out_configs = c2h::type_list<int_pair<1, 32>, int_pair<3, 16>, int_pair<4, 8>, int_pair<1, 2>>;
++
++C2H_TEST("WarpReduceBatched::Reduce N=M sum", "[warp][reduce][batched]", full_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::SingleOut, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST(
++  "WarpReduceBatched::Reduce N!=M sum", "[warp][reduce][batched]", builtin_type_list, unequal_nm_single_out_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::SingleOut, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST(
++  "WarpReduceBatched::Reduce max with over-syncing", "[warp][reduce][batched]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::maximum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::SingleOut,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::Reduce min with over-syncing",
++         "[warp][reduce][batched]",
++         builtin_type_list,
++         unequal_nm_single_out_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::minimum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::SingleOut,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::Sum", "[warp][reduce][batched][convenience]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::SingleOut,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped N=M sum", "[warp][reduce][batched]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped N!=M sum", "[warp][reduce][batched]", builtin_type_list, unequal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped max with over-syncing",
++         "[warp][reduce][batched]",
++         builtin_type_list,
++         equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::maximum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped min with over-syncing",
++         "[warp][reduce][batched]",
++         builtin_type_list,
++         unequal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::minimum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::SumToStriped", "[warp][reduce][batched][convenience]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped with conditional participation N=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_equal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped with conditional participation N!=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_unequal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped with conditional participation and over-syncing N=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_equal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped with conditional participation and over-syncing N!=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_unequal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToStriped,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked N=M sum", "[warp][reduce][batched]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked N!=M sum", "[warp][reduce][batched]", builtin_type_list, unequal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked, num_batches, logical_warp_num_threads, value_t, op_t>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked max with over-syncing",
++         "[warp][reduce][batched]",
++         builtin_type_list,
++         equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::maximum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked min with over-syncing",
++         "[warp][reduce][batched]",
++         builtin_type_list,
++         unequal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::minimum<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = false;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::SumToBlocked", "[warp][reduce][batched][convenience]", builtin_type_list, equal_nm_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked with conditional participation N=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_equal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked with conditional participation N!=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_unequal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked with conditional participation and over-syncing N=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_equal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked with conditional participation and over-syncing N!=M sum",
++         "[warp][reduce][batched][lane_mask]",
++         builtin_type_list,
++         sub_warp_unequal_configs)
++{
++  using value_t                          = c2h::get<0, TestType>;
++  using op_t                             = cuda::std::plus<>;
++  constexpr int num_batches              = c2h::get<1, TestType>::x;
++  constexpr int logical_warp_num_threads = c2h::get<1, TestType>::y;
++  constexpr bool convenience_overload    = false;
++  constexpr bool cond_participation      = true;
++  constexpr bool sync_physical_warp      = true;
++  test_warp_reduce_batched<WarpReduceBatchedMode::ToBlocked,
++                           num_batches,
++                           logical_warp_num_threads,
++                           value_t,
++                           op_t,
++                           convenience_overload,
++                           cond_participation,
++                           sync_physical_warp>();
++}
+diff --git a/cub/test/warp/catch2_test_warp_reduce_batched_api.cu b/cub/test/warp/catch2_test_warp_reduce_batched_api.cu
+new file mode 100644
+index 00000000000..fface300ec4
+--- /dev/null
++++ b/cub/test/warp/catch2_test_warp_reduce_batched_api.cu
+@@ -0,0 +1,339 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++#include <cub/warp/warp_reduce_batched.cuh>
++
++#include <thrust/detail/raw_pointer_cast.h>
++#include <thrust/device_vector.h>
++#include <thrust/host_vector.h>
++
++#include <cuda/__functional/maximum.h>
++#include <cuda/std/array>
++#include <cuda/std/span>
++
++#include <c2h/catch2_test_helper.h>
++
++__global__ __launch_bounds__(64) void WarpReduceBatchedOverviewKernel(int* out)
++{
++  // example-begin warp-reduce-batched-overview
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 3>;
++
++  // Assume 64 threads per block, so 64 / 32 = 2 logical warps
++  // Each logical warp has its own TempStorage
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[2];
++
++  const int logical_warp_id = static_cast<int>(threadIdx.x) / 32;
++
++  int thread_data[3];
++  thread_data[0] = static_cast<int>(threadIdx.x) - 1;
++  thread_data[1] = static_cast<int>(threadIdx.x);
++  thread_data[2] = static_cast<int>(threadIdx.x) + 1;
++
++  int result = WarpReduceBatched{temp_storage[logical_warp_id]}.Reduce(thread_data, cuda::maximum{});
++  // results across threads: [30, 31, 32, ?, ?, ..., ?, 62, 63, 64, ?, ?, ..., ?]
++  // example-end warp-reduce-batched-overview
++
++  const int logical_lane_id = static_cast<int>(threadIdx.x) % 32;
++  if (logical_lane_id < 3)
++  {
++    out[logical_warp_id * 3 + logical_lane_id] = result;
++  }
++}
++
++C2H_TEST("WarpReduceBatched overview documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(6);
++
++  WarpReduceBatchedOverviewKernel<<<1, 64>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{30, 31, 32, 62, 63, 64};
++  REQUIRE(expected == d_out);
++}
++
++__global__ void WarpReduceBatchedReduceApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-reduce
++  // Can't allow for physical warp synchronization since only the first logical warp participates due to the
++  // conditional. The other threads (assuming there are more than 16 threads per block) can't exit early due to the
++  // barrier.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 3, 16>;
++
++  // Only the first logical warp participates, so only a single TempStorage is needed
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage;
++
++  int result{};
++  if (threadIdx.x < 16)
++  {
++    cuda::std::array<int, 3> inputs{};
++    inputs[0] = static_cast<int>(threadIdx.x) - 1;
++    inputs[1] = static_cast<int>(threadIdx.x);
++    inputs[2] = static_cast<int>(threadIdx.x) + 1;
++
++    result = WarpReduceBatched{temp_storage}.Reduce(inputs, cuda::maximum{});
++  }
++  // results across threads: [14, 15, 16, ?, ?, ..., ?, 0, 0, ..., 0]
++  __syncthreads();
++  // Can reuse TempStorage after the barrier.
++  // example-end warp-reduce-batched-reduce
++  _CCCL_ASSERT(threadIdx.x < 16 || result == 0, "");
++  if (threadIdx.x < 3)
++  {
++    out[threadIdx.x] = result;
++  }
++}
++
++C2H_TEST("WarpReduceBatched::Reduce documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(3);
++
++  WarpReduceBatchedReduceApiKernel<<<1, 64>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{14, 15, 16};
++  REQUIRE(expected == d_out);
++}
++
++__global__ __launch_bounds__(8) void WarpReduceBatchedReduceToStripedApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-reduce-to-striped
++  // Can't allow for physical warp synchronization since only every other logical warp participates.
++  // The other threads (assuming there are more than 2 threads per block) can't exit early due to the
++  // barrier.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 3, 2>;
++
++  // Assume 8 threads per block, so 8 / 2 = 4 logical warps
++  // Only every other logical warp participates, so only 2 TempStorage are needed
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[2];
++
++  const int logical_warp_id   = static_cast<int>(threadIdx.x) / 2;
++  const bool is_participating = logical_warp_id % 2 == 0;
++  const int participant_idx   = logical_warp_id / 2;
++
++  cuda::std::array<int, 2> results{};
++  if (is_participating)
++  {
++    cuda::std::array<int, 3> inputs{};
++    inputs[0] = static_cast<int>(threadIdx.x) - 1;
++    inputs[1] = static_cast<int>(threadIdx.x);
++    inputs[2] = static_cast<int>(threadIdx.x) + 1;
++
++    WarpReduceBatched{temp_storage[participant_idx]}.ReduceToStriped(inputs, results, cuda::maximum{});
++  }
++  // results across threads:
++  // [[0, 2], [1, ?], [0, 0], [0, 0], [4, 6], [5, ?], [0, 0], [0, 0]]
++  __syncthreads();
++  // Can reuse TempStorage after the barrier.
++  // example-end warp-reduce-batched-reduce-to-striped
++
++  _CCCL_ASSERT(is_participating || (results[0] == 0 && results[1] == 0), "");
++  if (is_participating)
++  {
++    int const logical_lane_id                  = static_cast<int>(threadIdx.x) % 2;
++    out[participant_idx * 3 + logical_lane_id] = results[0];
++    if (logical_lane_id == 0)
++    {
++      out[participant_idx * 3 + 2] = results[1];
++    }
++  }
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToStriped documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(6);
++
++  WarpReduceBatchedReduceToStripedApiKernel<<<1, 8>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{0, 1, 2, 4, 5, 6};
++  REQUIRE(expected == d_out);
++}
++
++__global__ __launch_bounds__(8) void WarpReduceBatchedReduceToBlockedApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-reduce-to-blocked
++  // Can't allow for physical warp synchronization since only every other logical warp participates.
++  // The other threads (assuming there are more than 2 threads per block) can't exit early due to the
++  // barrier.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 3, 2>;
++
++  // Assume 8 threads per block, so 8 / 2 = 4 logical warps
++  // Only every other logical warp participates, so only 2 TempStorage are needed
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[2];
++
++  const int logical_warp_id   = static_cast<int>(threadIdx.x) / 2;
++  const bool is_participating = logical_warp_id % 2 == 0;
++  const int participant_idx   = logical_warp_id / 2;
++
++  cuda::std::array<int, 2> results{};
++  if (is_participating)
++  {
++    cuda::std::array<int, 3> inputs{};
++    inputs[0] = static_cast<int>(threadIdx.x) - 1;
++    inputs[1] = static_cast<int>(threadIdx.x);
++    inputs[2] = static_cast<int>(threadIdx.x) + 1;
++
++    WarpReduceBatched{temp_storage[participant_idx]}.ReduceToBlocked(inputs, results, cuda::maximum{});
++  }
++  // results across threads:
++  // [[0, 1], [2, ?], [0, 0], [0, 0], [4, 5], [6, ?], [0, 0], [0, 0]]
++  __syncthreads();
++  // Can reuse TempStorage after the barrier.
++  // example-end warp-reduce-batched-reduce-to-blocked
++
++  _CCCL_ASSERT(is_participating || (results[0] == 0 && results[1] == 0), "");
++  if (is_participating)
++  {
++    int const logical_lane_id                      = static_cast<int>(threadIdx.x) % 2;
++    out[participant_idx * 3 + logical_lane_id * 2] = results[0];
++    if (logical_lane_id == 0)
++    {
++      out[participant_idx * 3 + 1] = results[1];
++    }
++  }
++}
++
++C2H_TEST("WarpReduceBatched::ReduceToBlocked documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(6);
++
++  WarpReduceBatchedReduceToBlockedApiKernel<<<1, 8>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{0, 1, 2, 4, 5, 6};
++  REQUIRE(expected == d_out);
++}
++
++__global__ __launch_bounds__(8) void WarpReduceBatchedSumApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-sum
++  // We can enable physical warp synchronization since all non-exited lanes do participate in the primitive.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 3, 4, true>;
++
++  // Assume 8 threads per block, so 8 / 4 = 2 logical warps
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[2];
++
++  const int logical_warp_id = static_cast<int>(threadIdx.x) / 4;
++
++  cuda::std::array<int, 3> inputs{};
++  inputs[0]  = static_cast<int>(threadIdx.x) - 1;
++  inputs[1]  = static_cast<int>(threadIdx.x);
++  inputs[2]  = static_cast<int>(threadIdx.x) + 1;
++  int result = WarpReduceBatched{temp_storage[logical_warp_id]}.Sum(inputs);
++  // results across threads:
++  // [2, 6, 10, ?, 18, 22, 26, ?]
++  // example-end warp-reduce-batched-sum
++  const int logical_lane_id = static_cast<int>(threadIdx.x) % 4;
++  if (logical_lane_id < 3)
++  {
++    out[logical_warp_id * 3 + logical_lane_id] = result;
++  }
++}
++
++C2H_TEST("WarpReduceBatched::Sum documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(6);
++
++  WarpReduceBatchedSumApiKernel<<<1, 8>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{2, 6, 10, 18, 22, 26};
++  REQUIRE(expected == d_out);
++}
++
++__global__ __launch_bounds__(8) void WarpReduceBatchedSumToStripedApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-sum-to-striped
++  // We can enable physical warp synchronization since all non-exited lanes do participate in the primitive.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 5, 2, true>;
++
++  // Assume 8 threads per block, so 8 / 2 = 4 logical warps
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[4];
++
++  const int logical_warp_id = static_cast<int>(threadIdx.x) / 2;
++
++  cuda::std::array<int, 5> thread_data{};
++  thread_data[0] = static_cast<int>(threadIdx.x) - 2;
++  thread_data[1] = static_cast<int>(threadIdx.x) - 1;
++  thread_data[2] = static_cast<int>(threadIdx.x);
++  thread_data[3] = static_cast<int>(threadIdx.x) + 1;
++  thread_data[4] = static_cast<int>(threadIdx.x) + 2;
++  // Use a static size spans to pick the first 3 elements as inputs and the last 2 elements as outputs (aliasing inputs)
++  cuda::std::span<int, 5> inputs{cuda::std::begin(thread_data), 5};
++  cuda::std::span<int, 3> results{cuda::std::begin(thread_data) + 2, 3};
++  WarpReduceBatched{temp_storage[logical_warp_id]}.SumToStriped(inputs, results);
++  // results across threads:
++  // [[-3, 1, 5], [-1, 3, ?], [1, 5, 9], [3, 7, ?], ..., [9, 13, 17], [11, 15, ?]]
++  // example-end warp-reduce-batched-sum-to-striped
++
++  const int logical_lane_id                      = static_cast<int>(threadIdx.x) % 2;
++  out[logical_warp_id * 5 + logical_lane_id]     = results[0];
++  out[logical_warp_id * 5 + 2 + logical_lane_id] = results[1];
++  if (logical_lane_id == 0)
++  {
++    out[logical_warp_id * 5 + 4] = results[2];
++  }
++}
++
++C2H_TEST("WarpReduceBatched::SumToStriped documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(20);
++
++  WarpReduceBatchedSumToStripedApiKernel<<<1, 8>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{-3, -1, 1, 3, 5, 1, 3, 5, 7, 9, 5, 7, 9, 11, 13, 9, 11, 13, 15, 17};
++  REQUIRE(expected == d_out);
++}
++
++__global__ __launch_bounds__(8) void WarpReduceBatchedSumToBlockedApiKernel(int* out)
++{
++  // example-begin warp-reduce-batched-sum-to-blocked
++  // We can enable physical warp synchronization since all non-exited lanes do participate in the primitive.
++  using WarpReduceBatched = cub::WarpReduceBatched<int, 5, 2, true>;
++
++  // Assume 8 threads per block, so 8 / 2 = 4 logical warps
++  __shared__ typename WarpReduceBatched::TempStorage temp_storage[4];
++
++  const int logical_warp_id = static_cast<int>(threadIdx.x) / 2;
++
++  cuda::std::array<int, 5> thread_data{};
++  thread_data[0] = static_cast<int>(threadIdx.x) - 2;
++  thread_data[1] = static_cast<int>(threadIdx.x) - 1;
++  thread_data[2] = static_cast<int>(threadIdx.x);
++  thread_data[3] = static_cast<int>(threadIdx.x) + 1;
++  thread_data[4] = static_cast<int>(threadIdx.x) + 2;
++  // Use a static size spans to pick the first 3 elements as inputs and the last 2 elements as outputs (aliasing inputs)
++  cuda::std::span<int, 5> inputs{cuda::std::begin(thread_data), 5};
++  cuda::std::span<int, 3> results{cuda::std::begin(thread_data) + 2, 3};
++  WarpReduceBatched{temp_storage[logical_warp_id]}.SumToBlocked(inputs, results);
++  // results across threads:
++  // [[-3, -1, 1], [3, 5, ?], [1, 3, 5], [7, 9, ?], ..., [9, 11, 13], [15, 17, ?]]
++  // example-end warp-reduce-batched-sum-to-blocked
++
++  const int logical_lane_id                          = static_cast<int>(threadIdx.x) % 2;
++  out[logical_warp_id * 5 + logical_lane_id * 3]     = results[0];
++  out[logical_warp_id * 5 + logical_lane_id * 3 + 1] = results[1];
++  if (logical_lane_id == 0)
++  {
++    out[logical_warp_id * 5 + 2] = results[2];
++  }
++}
++
++C2H_TEST("WarpReduceBatched::SumToBlocked documentation kernel", "[warp][reduce][batched]")
++{
++  c2h::device_vector<int> d_out(20);
++
++  WarpReduceBatchedSumToBlockedApiKernel<<<1, 8>>>(thrust::raw_pointer_cast(d_out.data()));
++  REQUIRE(cudaSuccess == cudaPeekAtLastError());
++  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
++
++  c2h::host_vector<int> expected{-3, -1, 1, 3, 5, 1, 3, 5, 7, 9, 5, 7, 9, 11, 13, 9, 11, 13, 15, 17};
++  REQUIRE(expected == d_out);
++}
+diff --git a/docs/cub/api_docs/warp_wide.rst b/docs/cub/api_docs/warp_wide.rst
+index 0fd1747435a..13327c34f96 100644
+--- a/docs/cub/api_docs/warp_wide.rst
++++ b/docs/cub/api_docs/warp_wide.rst
+@@ -17,5 +17,6 @@ These algorithms may only be invoked by ``1 <= n <= 32`` *consecutive* threads i
+ * :cpp:class:`cub::WarpLoad` loads a linear segment of items from memory into a CUDA warp
+ * :cpp:class:`cub::WarpMergeSort` sorts items partitioned across a CUDA warp
+ * :cpp:struct:`cub::WarpReduce` computes reduction of items partitioned across a CUDA warp
++* :cpp:struct:`cub::WarpReduceBatched` computes reduction of multiple batches of items partitioned across a CUDA warp
+ * :cpp:struct:`cub::WarpScan` computes a prefix scan of items partitioned across a CUDA warp
+ * :cpp:class:`cub::WarpStore` stores items partitioned across a CUDA warp to a linear segment of memory

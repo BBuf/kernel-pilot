@@ -1,0 +1,312 @@
+diff --git a/include/triton/Dialect/TritonGPU/Transforms/Passes.td b/include/triton/Dialect/TritonGPU/Transforms/Passes.td
+index 6cb5c963f42f..ddd1debb497e 100644
+--- a/include/triton/Dialect/TritonGPU/Transforms/Passes.td
++++ b/include/triton/Dialect/TritonGPU/Transforms/Passes.td
+@@ -61,7 +61,7 @@ def TritonGPUHoistTMEMAlloc : Pass<"tritongpu-hoist-tmem-alloc", "mlir::ModuleOp
+                            "mlir::scf::SCFDialect",
+                            "mlir::arith::ArithDialect"];
+   let options = [
+-    Option<"hoistOutOfIf", "hoist-out-of-if",
++    Option<"postPipeline", "post-pipeline",
+            "bool", /*default*/"false",
+            "Hoist TMEM allocations out of if statements">
+   ];
+diff --git a/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp b/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
+index 86e5e2e774f5..458bfc794935 100644
+--- a/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
+@@ -1,3 +1,6 @@
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/Dialect/UB/IR/UBOps.h"
+ #include "mlir/IR/Dominance.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+@@ -418,6 +421,107 @@ class RotateTMEMLoadInLoop : public OpRewritePattern<ttng::TMEMLoadOp> {
+   }
+ };
+ 
++// Helper: return true if the value is a constant boolean with the expected
++// value.
++static bool isConstBool(Value v, bool expected) {
++  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
++    if (auto attr = dyn_cast<BoolAttr>(cst.getValueAttr()))
++      return attr.getValue() == expected;
++  }
++  return false;
++}
++
++// Helper to detect if the use of an alloc fully overwrites it.
++struct AllocUse {
++  Operation *useOp;
++  MutableOperandRange dep;
++};
++
++static FailureOr<AllocUse> useOverwritesAlloc(ttng::TMEMAllocOp alloc,
++                                              BlockArgument tokArg) {
++  if (!tokArg.hasOneUse())
++    return failure();
++  OpOperand &onlyUse = *tokArg.use_begin();
++  Operation *useOp = onlyUse.getOwner();
++  if (auto store = dyn_cast<ttng::TMEMStoreOp>(useOp)) {
++    if (store.getDst() != alloc.getResult() ||
++        !isConstBool(store.getPred(), true))
++      return failure();
++    return AllocUse{useOp, store.getDepMutable()};
++  }
++  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(useOp)) {
++    if (onlyUse.get() == mma.getAccDep() &&
++        mma.getAccumulator() == alloc.getResult() &&
++        isConstBool(mma.useAccumulator(), false) &&
++        isConstBool(mma.getPredicate(), true))
++      return AllocUse{useOp, mma.getAccDepMutable()};
++  }
++  return failure();
++}
++
++class SinkTMemAlloc : public OpRewritePattern<ttng::TMEMAllocOp> {
++public:
++  using OpRewritePattern::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(ttng::TMEMAllocOp alloc,
++                                PatternRewriter &rewriter) const override {
++    // Only handle allocs that produce a token.
++    if (!alloc.getToken())
++      return failure();
++
++    // Find a forOp that takes the alloc token as an init arg.
++    // Limit to the simple case where the token has exactly one use.
++    if (!alloc.getToken().hasOneUse())
++      return failure();
++    OpOperand &tokUse = *alloc.getToken().use_begin();
++    auto userFor = dyn_cast<scf::ForOp>(tokUse.getOwner());
++    if (!userFor)
++      return failure();
++    scf::ForOp forOp = userFor;
++    if (forOp.getInitArgs().empty())
++      return failure();
++    auto firstInitIt = forOp.getInitArgsMutable().begin();
++    int baseOpNo = firstInitIt->getOperandNumber();
++    int tokIdx = tokUse.getOperandNumber() - baseOpNo;
++    assert(tokIdx >= 0 && tokIdx < (int)forOp.getInitArgs().size());
++
++    // Ensure the memory descriptor result of the alloc is only used inside the
++    // loop. Otherwise sinking would break users after the loop.
++    for (Operation *user : alloc.getResult().getUsers()) {
++      if (!forOp->isProperAncestor(user))
++        return failure();
++    }
++
++    BlockArgument tokArg = forOp.getRegionIterArg(tokIdx);
++
++    // Check if the op consuming the tocken fully overwrites the alloc. This
++    // means there is no loop carried values.
++    auto sinkable = useOverwritesAlloc(alloc, tokArg);
++    if (failed(sinkable))
++      return failure();
++    Operation *useOp = sinkable->useOp;
++
++    // Since the alloc is not used outside the loop its token should not be
++    // used.
++    assert(forOp.getResult(tokIdx).use_empty());
++
++    // Move the alloc just before the store to minimize live range inside the
++    // loop.
++    rewriter.moveOpBefore(alloc, useOp);
++    sinkable->dep.assign(alloc.getToken());
++
++    // Leave the token loop arguments to dead code.
++    auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
++    yield.setOperand(tokIdx, forOp.getRegionIterArg(tokIdx));
++    rewriter.setInsertionPoint(forOp);
++    auto poisonTok = ub::PoisonOp::create(
++        rewriter, forOp.getLoc(), forOp.getInitArgs()[tokIdx].getType());
++    forOp.getInitArgsMutable()[tokIdx].assign(poisonTok);
++
++    return success();
++  }
++};
++
+ // Given an operation that uses a token, return its forwarded token. This
+ // assumes the memory variable is not loop carried.
+ static Value getTokenFromOp(Operation *op) {
+@@ -529,7 +633,7 @@ struct HoistTMEMAlloc
+ 
+   void runOnOperation() override {
+     ModuleOp m = getOperation();
+-    if (!hoistOutOfIf) {
++    if (!postPipeline) {
+       SmallVector<ttng::MMAv5OpInterface> mmaOps;
+       m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
+       for (auto mmaOp : mmaOps) {
+@@ -553,7 +657,7 @@ struct HoistTMEMAlloc
+     patterns.add<RotateTMEMStoreInLoop, RotateTMEMLoadInLoop,
+                  CombineTMEMLoadAndStore, CombineTMEMStoreAndSelect,
+                  SinkTMEMLoad, RemoveUnusedTMEMLoad>(&getContext());
+-    if (hoistOutOfIf) {
++    if (postPipeline) {
+       patterns.add<CombineTMEMStoreAndAlloc, HoistTMEMAllocOutOfIf,
+                    TMEMLoadForwarding>(&getContext());
+     }
+@@ -562,6 +666,16 @@ struct HoistTMEMAlloc
+       llvm_unreachable("Failed to hoist tmem_store");
+     }
+ 
++    // Finally try to sink the alloc that can be to reduce tmem liveranges.
++    if (postPipeline) {
++      mlir::RewritePatternSet postPatterns(&getContext());
++      postPatterns.add<SinkTMemAlloc>(&getContext());
++      if (failed(
++              applyPatternsGreedily(getOperation(), std::move(postPatterns)))) {
++        signalPassFailure();
++      }
++    }
++
+     // TODO: currently some code assumes that a mutable tmem alloc doesn't have
+     // an initial value. As a workaround we break up the op in order to keep
+     // this form for the downstream passes. We should remove this once the
+diff --git a/test/TritonGPU/hoist-tmem-alloc.mlir b/test/TritonGPU/hoist-tmem-alloc.mlir
+index de1c01b0d50e..030dc47fc7a1 100644
+--- a/test/TritonGPU/hoist-tmem-alloc.mlir
++++ b/test/TritonGPU/hoist-tmem-alloc.mlir
+@@ -1,5 +1,5 @@
+ // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -canonicalize | FileCheck %s
+-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc="hoist-out-of-if=true" -canonicalize | FileCheck %s -check-prefix=HOIST-IF
++// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc="post-pipeline=true" -canonicalize | FileCheck %s -check-prefix=POST-PIPELINE
+ 
+ #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+ #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+@@ -44,6 +44,88 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ // -----
+ 
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++  // POST-PIPELINE-LABEL: @do_not_sink_alloc_to_predicated_mma
++  // POST-PIPELINE: %[[ACC_TM:.*]], %[[ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
++  // POST-PIPELINE: scf.for {{.*}} iter_args(%[[TOK:.*]] = %[[ALLOC_TOK]])
++  // POST-PIPELINE-NOT: ttng.tmem_alloc
++  // POST-PIPELINE:   %[[MMA_TOK:.*]] = ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[ACC_TM]][%[[TOK]]]
++  tt.func public @do_not_sink_alloc_to_predicated_mma(%A: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
++                                                      %B: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
++                                                      %pred: i1,
++                                                      %iters: i32) {
++    %false = arith.constant false
++    %c0_i32 = arith.constant 0 : i32
++    %c1_i32 = arith.constant 1 : i32
++    %acc_tm, %alloc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %res_tok = scf.for %i = %c0_i32 to %iters step %c1_i32 iter_args(%tok = %alloc_tok) -> (!ttg.async.token)  : i32 {
++      %mma_tok = ttng.tc_gen5_mma %A, %B, %acc_tm[%tok], %false, %pred : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++      scf.yield %mma_tok : !ttg.async.token
++    }
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++  // POST-PIPELINE-LABEL: @do_not_sink_alloc_to_predicated_store
++  // POST-PIPELINE: %[[ACC_TM:.*]], %[[ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
++  // POST-PIPELINE: scf.for {{.*}} iter_args(%[[TOK:.*]] = %[[ALLOC_TOK]])
++  // POST-PIPELINE-NOT: ttng.tmem_alloc
++  // POST-PIPELINE:   %[[STORE_TOK:.*]] = ttng.tmem_store {{.*}}, %[[ACC_TM]][%[[TOK]]], %{{.*}}
++  tt.func public @do_not_sink_alloc_to_predicated_store(%src: tensor<128x128xf32, #blocked>,
++                                                        %pred: i1,
++                                                        %iters: i32) {
++    %c0_i32 = arith.constant 0 : i32
++    %c1_i32 = arith.constant 1 : i32
++    %acc_tm, %alloc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %res_tok = scf.for %i = %c0_i32 to %iters step %c1_i32 iter_args(%tok = %alloc_tok) -> (!ttg.async.token)  : i32 {
++      %store_tok = ttng.tmem_store %src, %acc_tm[%tok], %pred : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++      scf.yield %store_tok : !ttg.async.token
++    }
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++  // POST-PIPELINE-LABEL: @sink_alloc_to_mma_use_acc_false
++  // POST-PIPELINE: scf.for
++  // POST-PIPELINE:   %[[ACC_TM:.*]], %[[ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
++  // POST-PIPELINE:   %[[MMA_TOK:.*]] = ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[ACC_TM]][%[[ALLOC_TOK]]]
++  tt.func public @sink_alloc_to_mma_use_acc_false(%A: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
++                                                  %B: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
++                                                  %iters: i32) {
++    %false = arith.constant false
++    %true = arith.constant true
++    %c0_i32 = arith.constant 0 : i32
++    %c1_i32 = arith.constant 1 : i32
++    // Allocate accumulator outside the loop; it will be sunk next to the MMA
++    %acc_tm, %alloc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %res_tok = scf.for %i = %c0_i32 to %iters step %c1_i32 iter_args(%tok = %alloc_tok) -> (!ttg.async.token)  : i32 {
++      // useAccumulator is false, so the accumulator source is ignored; the pattern
++      // should accept this as fully overwriting the allocation and sink the alloc here.
++      %mma_tok = ttng.tc_gen5_mma %A, %B, %acc_tm[%tok], %false, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++      scf.yield %mma_tok : !ttg.async.token
++    }
++    tt.return
++  }
++}
++
++// -----
++
+ #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+ #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+ #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+@@ -311,18 +393,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+ #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+-  // HOIST-IF-LABEL: @hoist_out_of_if
++  // POST-PIPELINE-LABEL: @hoist_out_of_if
+   tt.func public @hoist_out_of_if(%arg0: i1, %arg1: tensor<128x128xf32, #blocked>) -> tensor<128x128xf32, #blocked> {
+-    // HOIST-IF: %[[A:.+]], %[[T0:.+]] = ttng.tmem_alloc : ()
+-    // HOIST-IF: %[[T1:.+]] = ttng.tmem_store %{{.*}}, %[[A]][%[[T0]]]
+-    // HOIST-IF: %[[I:.+]] = scf.if %{{.+}} -> (!ttg.async.token) {
+-    // HOIST-IF:   %[[T2:.+]] = "write_to_tmem"
+-    // HOIST-IF:   scf.yield %[[T2]]
+-    // HOIST-IF: } else {
+-    // HOIST-IF:   scf.yield %[[T1]]
+-    // HOIST-IF: }
+-    // HOIST-IF: %[[L:.+]], %[[T4:.+]] = ttng.tmem_load %[[A]][%[[I]]
+-    // HOIST-IF: tt.return %[[L]]
++    // POST-PIPELINE: %[[A:.+]], %[[T0:.+]] = ttng.tmem_alloc : ()
++    // POST-PIPELINE: %[[T1:.+]] = ttng.tmem_store %{{.*}}, %[[A]][%[[T0]]]
++    // POST-PIPELINE: %[[I:.+]] = scf.if %{{.+}} -> (!ttg.async.token) {
++    // POST-PIPELINE:   %[[T2:.+]] = "write_to_tmem"
++    // POST-PIPELINE:   scf.yield %[[T2]]
++    // POST-PIPELINE: } else {
++    // POST-PIPELINE:   scf.yield %[[T1]]
++    // POST-PIPELINE: }
++    // POST-PIPELINE: %[[L:.+]], %[[T4:.+]] = ttng.tmem_load %[[A]][%[[I]]
++    // POST-PIPELINE: tt.return %[[L]]
+     %0 = scf.if %arg0 -> (tensor<128x128xf32, #blocked>) {
+       %result, %token = ttng.tmem_alloc %arg1 : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+       %1 = "write_to_tmem"(%result) : (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) -> !ttg.async.token
+@@ -343,10 +425,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+   tt.func public @forward_tmem_load(%m: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %t: !ttg.async.token) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) {
+     %true = arith.constant true
+     %result, %token0 = ttng.tmem_load %m[%t] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+-    // HOIST-IF-LABEL: @forward_tmem_load
+-    // HOIST-IF-SAME:    %[[ARG0:.+]]: !ttg.memdesc<128x128xf32,
+-    // HOIST-IF-SAME:    %[[ARG1:.+]]: !ttg.async.token
+-    // HOIST-IF-NEXT:    tt.return %[[ARG0]], %[[ARG1]]
++    // POST-PIPELINE-LABEL: @forward_tmem_load
++    // POST-PIPELINE-SAME:    %[[ARG0:.+]]: !ttg.memdesc<128x128xf32,
++    // POST-PIPELINE-SAME:    %[[ARG1:.+]]: !ttg.async.token
++    // POST-PIPELINE-NEXT:    tt.return %[[ARG0]], %[[ARG1]]
+     %result1, %token1 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+     %token2 = ttng.tmem_store %result, %result1[%token1], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+     tt.return %result1, %token2 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token

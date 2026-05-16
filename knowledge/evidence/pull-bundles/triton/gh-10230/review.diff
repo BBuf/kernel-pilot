@@ -1,0 +1,278 @@
+diff --git a/include/triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h b/include/triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h
+index 4c8091a1c604..fb588910b366 100644
+--- a/include/triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h
++++ b/include/triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h
+@@ -131,9 +131,17 @@ inline bool isTMALoad(Operation *op) {
+ // Determine if the operation can be lowered to an async load.
+ bool canBeAsyncLoad(Operation *op);
+ 
+-// Look for consecutive wait ops and combine them into a single wait op.
++// Fold consecutive wait ops of the same kind into a single wait.
++// `isCounterBarrier` returns true on ops that act as a hard boundary while
++// scanning forward (typically the producers whose tokens a later wait
++// consumes). `createWait` builds the merged wait from the union of operand
++// tokens and the minimum `num`.
+ void combineRedundantWaitOps(
+-    llvm::SmallSetVector<gpu::AsyncWaitOp, 8> &waitOps);
++    llvm::SmallSetVector<Operation *, 8> &waitOps,
++    llvm::function_ref<bool(Operation * /*candidate*/)> isCounterBarrier,
++    llvm::function_ref<Operation *(OpBuilder &, Location,
++                                   ValueRange /*operands*/, unsigned /*num*/)>
++        createWait);
+ 
+ // Get the type of the view of a multi-buffered tensor value.
+ gpu::MemDescType getBufferViewType(gpu::MemDescType allocTy,
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp
+index df0d5402a07b..a220484d110c 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp
+@@ -422,39 +422,48 @@ bool mlir::triton::canBeAsyncLoad(Operation *op) {
+ }
+ 
+ void mlir::triton::combineRedundantWaitOps(
+-    llvm::SmallSetVector<ttg::AsyncWaitOp, 8> &waitOps) {
+-  llvm::MapVector<ttg::AsyncWaitOp, ttg::AsyncWaitOp> toDelete;
+-  for (auto waitOp : waitOps) {
++    llvm::SmallSetVector<Operation *, 8> &waitOps,
++    llvm::function_ref<bool(Operation *)> isCounterBarrier,
++    llvm::function_ref<Operation *(OpBuilder &, Location, ValueRange, unsigned)>
++        createWait) {
++  llvm::MapVector<Operation *, Operation *> toDelete;
++  for (Operation *waitOp : waitOps) {
+     if (toDelete.count(waitOp))
+       continue;
+-    SmallVector<ttg::AsyncWaitOp> waitGroup = {waitOp};
+-    SmallVector<Value> depTokens = waitOp.getOperands();
+-    unsigned minWaitNumber = waitOp.getNum();
++    StringRef waitName = waitOp->getName().getStringRef();
++    auto getNum = [](Operation *op) {
++      return static_cast<unsigned>(
++          op->getAttrOfType<IntegerAttr>("num").getInt());
++    };
++    SmallVector<Operation *> waitGroup = {waitOp};
++    SmallVector<Value> depTokens(waitOp->getOperands().begin(),
++                                 waitOp->getOperands().end());
++    unsigned minWaitNumber = getNum(waitOp);
+     Operation *next = waitOp->getNextNode();
+-    // Stop if we reach the end of the block or if there is another commit group
+-    // or a branching op (forOp, ifOp, whileOp) in between the waits
+-    while (next &&
+-           !isa<ttg::AsyncCommitGroupOp, RegionBranchOpInterface>(next)) {
+-      if (auto nextWait = dyn_cast<ttg::AsyncWaitOp>(next)) {
+-        waitGroup.push_back(nextWait);
+-        minWaitNumber = std::min(minWaitNumber, nextWait.getNum());
+-        depTokens.append(nextWait.getOperands().begin(),
+-                         nextWait.getOperands().end());
++    // Stop at the end of the block, at any branching op (forOp, ifOp, whileOp),
++    // or at any caller-declared counter barrier.
++    while (next && !isa<RegionBranchOpInterface>(next) &&
++           !isCounterBarrier(next)) {
++      if (next->getName().getStringRef() == waitName) {
++        waitGroup.push_back(next);
++        minWaitNumber = std::min(minWaitNumber, getNum(next));
++        depTokens.append(next->getOperands().begin(),
++                         next->getOperands().end());
+       }
+       next = next->getNextNode();
+     }
+     if (waitGroup.size() == 1)
+       continue;
+     OpBuilder builder(waitGroup.front());
+-    auto newWaitOp = ttg::AsyncWaitOp::create(builder, waitOp.getLoc(),
+-                                              depTokens, minWaitNumber);
+-    for (auto waitOp : waitGroup) {
+-      toDelete[waitOp] = newWaitOp;
++    Operation *newWaitOp =
++        createWait(builder, waitOp->getLoc(), depTokens, minWaitNumber);
++    for (Operation *wo : waitGroup) {
++      toDelete[wo] = newWaitOp;
+     }
+   }
+-  for (auto waitOp : toDelete) {
+-    waitOp.first->replaceAllUsesWith(waitOp.second);
+-    waitOp.first->erase();
++  for (auto entry : toDelete) {
++    entry.first->replaceAllUsesWith(entry.second);
++    entry.first->erase();
+   }
+ }
+ 
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+index a267059c6315..18be9223750d 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+@@ -128,13 +128,18 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
+ /// Update wait op number by analyzing the number of async_commit_group ops
+ /// along all paths.
+ void mlir::triton::updateWaits(ModuleOp module) {
+-  llvm::SmallSetVector<ttg::AsyncWaitOp, 8> waitOps;
++  llvm::SmallSetVector<Operation *, 8> waitOps;
+   module.walk([&](ttg::AsyncWaitOp waitOp) {
+     int minNumCommits = minNumInterleavedCommitOps(waitOp);
+     waitOp.setNum(minNumCommits);
+     waitOps.insert(waitOp);
+   });
+-  tt::combineRedundantWaitOps(waitOps);
++  tt::combineRedundantWaitOps(
++      waitOps, [](Operation *op) { return isa<ttg::AsyncCommitGroupOp>(op); },
++      [](OpBuilder &b, Location loc, ValueRange operands,
++         unsigned num) -> Operation * {
++        return ttg::AsyncWaitOp::create(b, loc, operands, num);
++      });
+ }
+ 
+ // Add the given values as operands of the given wait, and replace all uses of
+diff --git a/test/TritonGPU/amd/amd-pipeline-tdm.mlir b/test/TritonGPU/amd/amd-pipeline-tdm.mlir
+index 713cb2c9281e..ed287ab3c4a1 100644
+--- a/test/TritonGPU/amd/amd-pipeline-tdm.mlir
++++ b/test/TritonGPU/amd/amd-pipeline-tdm.mlir
+@@ -58,17 +58,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
+ // CHECK: #[[$PADDED_C:.*]] = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [512, 64]}>
+ // CHECK-NOT: #ttg.padded_shared
+ 
++// The loop body and epilogue each emit two adjacent amdg.async_tdm_wait ops
++// (one per descriptor_load) which combineRedundantWaitOps folds into a single
++// wait taking both tokens; the matched two-operand wait below proves the fold.
+ // CHECK-LABEL: tt.func @matmul_kernel_make_tensor_descriptor
+ // CHECK: async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<512x32xf16, #[[$PADDED_A]]> -> !ttg.memdesc<512x32xf16, #[[$PADDED_A]], #smem, mutable>
+ // CHECK: ttg.async_commit_group tokens
+ // CHECK: async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<32x64xf16, #[[$PADDED_B]]> -> !ttg.memdesc<32x64xf16, #[[$PADDED_B]], #smem, mutable>
+ // CHECK: ttg.async_commit_group tokens
+ // CHECK: scf.for
++// CHECK: amdg.async_tdm_wait %{{[^,]+}}, %{{[^,]+}} {num = 0 : i32}
++// CHECK-NOT: amdg.async_tdm_wait
+ // CHECK: async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<512x32xf16, #[[$PADDED_A]]> -> !ttg.memdesc<512x32xf16, #[[$PADDED_A]], #smem, mutable>
+ // CHECK: ttg.async_commit_group tokens
+ // CHECK: async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<32x64xf16, #[[$PADDED_B]]> -> !ttg.memdesc<32x64xf16, #[[$PADDED_B]], #smem, mutable>
+ // CHECK: ttg.async_commit_group tokens
+ // CHECK: }
++// CHECK: amdg.async_tdm_wait %{{[^,]+}}, %{{[^,]+}} {num = 0 : i32}
++// CHECK-NOT: amdg.async_tdm_wait
+ // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<512x64xf16, #[[$PADDED_C]]>
+ 
+ // -----
+diff --git a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.td b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.td
+index b67cf14fc40c..147d79ed51c9 100644
+--- a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.td
++++ b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.td
+@@ -3,6 +3,21 @@
+ 
+ include "mlir/IR/OpBase.td"
+ 
++def TDMOpInterface : OpInterface<"TDMOpInterface"> {
++  let description = [{
++    Common interface for AMD TDM (Tensor DMA) data-movement operations.
++  }];
++
++  let cppNamespace = "::mlir::triton::amdgpu";
++
++  let methods = [
++    InterfaceMethod<
++      /*desc=*/"Get the tensor descriptor",
++      /*retType=*/"::mlir::Value",
++      /*methodName=*/"getDesc">
++  ];
++}
++
+ def BufferOpInterface : OpInterface<"BufferOpInterface"> {
+   let description = [{
+     This interface is implemented by buffer load/store operations.
+diff --git a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOps.td b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOps.td
+index 809c93e7f657..30e88e6f7022 100644
+--- a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOps.td
++++ b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOps.td
+@@ -748,7 +748,8 @@ def AsyncCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_copy_local_to_global", [
+ 
+ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments,
+     DeclareOpInterfaceMethods<MBarrierOpInterface>,
+-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
++    DeclareOpInterfaceMethods<PredicatedOpInterface>,
++    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+   let summary = "Copy data based on descriptor from global memory to local memory asynchronously";
+ 
+   let description = [{
+@@ -792,7 +793,8 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
+ //===----------------------------------------------------------------------===//
+ 
+ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments,
+-    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
++    DeclareOpInterfaceMethods<MBarrierOpInterface>,
++    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
+ 
+   let description = [{
+@@ -826,7 +828,8 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global",
+ //===----------------------------------------------------------------------===//
+ 
+ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
+-    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
++    DeclareOpInterfaceMethods<MBarrierOpInterface>,
++    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+   let summary = "Scatter data from local memory to non-contiguous global memory rows asynchronously";
+ 
+   let description = [{
+@@ -868,7 +871,8 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
+ 
+ def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather", [
+     DeclareOpInterfaceMethods<MBarrierOpInterface>,
+-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
++    DeclareOpInterfaceMethods<PredicatedOpInterface>,
++    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+   let summary = "Gather data from non-contiguous global memory rows to local memory asynchronously";
+ 
+   let description = [{
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/Pipeline.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/Pipeline.cpp
+index 17693a40ffd4..d54707d8afe2 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/Pipeline.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/Pipeline.cpp
+@@ -114,6 +114,36 @@ void expandLoops(ModuleOp moduleOp) {
+ 
+   tt::resolveMaskOp(moduleOp);
+ }
++
++// Fold consecutive waits of the same kind into a single wait.
++void combineWaitOps(ModuleOp moduleOp, bool useAsyncCopy) {
++  llvm::SmallSetVector<Operation *, 8> asyncWaitOps;
++  llvm::SmallSetVector<Operation *, 8> tdmWaitOps;
++  moduleOp.walk([&](Operation *op) {
++    if (useAsyncCopy && isa<ttg::AsyncWaitOp>(op))
++      asyncWaitOps.insert(op);
++    else if (isa<triton::amdgpu::AsyncTDMWait>(op))
++      tdmWaitOps.insert(op);
++  });
++
++  if (useAsyncCopy) {
++    tt::combineRedundantWaitOps(
++        asyncWaitOps,
++        [](Operation *op) { return isa<ttg::AsyncCommitGroupOp>(op); },
++        [](OpBuilder &b, Location loc, ValueRange operands,
++           unsigned num) -> Operation * {
++          return ttg::AsyncWaitOp::create(b, loc, operands, num);
++        });
++  }
++
++  tt::combineRedundantWaitOps(
++      tdmWaitOps,
++      [](Operation *op) { return isa<triton::amdgpu::TDMOpInterface>(op); },
++      [](OpBuilder &b, Location loc, ValueRange operands,
++         unsigned num) -> Operation * {
++        return triton::amdgpu::AsyncTDMWait::create(b, loc, operands, num);
++      });
++}
+ } // namespace
+ 
+ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
+@@ -137,12 +167,9 @@ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
+       if (family == tt::AMD::ISAFamily::CDNA3 ||
+           family == tt::AMD::ISAFamily::CDNA4) {
+         mlir::triton::updateWaits(moduleOp);
+-      } else {
+-        llvm::SmallSetVector<ttg::AsyncWaitOp, 8> waitOps;
+-        moduleOp.walk([&](ttg::AsyncWaitOp waitOp) { waitOps.insert(waitOp); });
+-        tt::combineRedundantWaitOps(waitOps);
+       }
+     }
++    combineWaitOps(moduleOp, useAsyncCopy);
+ 
+     tt::removePipeliningAttributes(moduleOp);
+   }

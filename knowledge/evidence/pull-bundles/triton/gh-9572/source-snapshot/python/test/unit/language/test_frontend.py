@@ -1,0 +1,1020 @@
+import functools
+import triton
+import triton.language as tl
+from triton._filecheck import filecheck_test, run_filecheck_test, run_parser
+from triton.compiler.errors import CompilationError
+import pytest
+from typing import NamedTuple
+
+# ===-----------------------------------------------------------------------===#
+# Unit Tests
+# ===-----------------------------------------------------------------------===#
+
+
+def doesnt_compile(kernel):
+
+    @functools.wraps(kernel)
+    def test_fn():
+        with pytest.raises(triton.CompilationError):
+            run_parser(kernel)
+
+    return test_fn
+
+
+@triton.jit
+def anchor(v):
+    pass
+
+
+@triton.aggregate
+class Pair:
+    first: tl.tensor
+    second: tl.tensor
+
+    @triton.jit
+    def get_first(self):
+        return self.first
+
+    def get_second(self, _semantic=None):
+        return self.second
+
+    @triton.jit
+    def unpack(self):
+        return self.get_first(), self.get_second()
+
+    def __getitem__(self, ind: tl.constexpr, _semantic=None):
+        if ind == 0:
+            return self.first
+        assert ind == 1
+        return self.second
+
+    def __setitem__(self, ind: tl.constexpr, value, _semantic=None):
+        if ind == 0:
+            self.first = value
+        assert ind == 1
+        self.second = value
+
+
+@doesnt_compile
+@triton.jit
+def test_assign_attribute():
+    scalar = 11
+    pair = Pair(tl.arange(0, 4), scalar)
+    pair.second = 42
+
+
+@doesnt_compile
+@triton.jit
+def test_augassign_attribute():
+    scalar = 11
+    pair = Pair(tl.arange(0, 4), scalar)
+    pair.second += 42
+
+
+@filecheck_test
+@triton.jit
+def test_retrieve_item():
+    # CHECK-LABEL: test_retrieve_item
+    # CHECK: %c11_i32 = arith.constant 11 : i32
+    # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
+    scalar = 11
+    pair = Pair(tl.arange(0, 4), scalar)
+    # CHECK-NEXT: call @{{.*}}anchor{{.*}}(%c11_i32)
+    anchor(pair[1])
+
+
+@doesnt_compile
+@triton.jit
+def test_assign_item():
+    scalar = 11
+    pair = Pair(tl.arange(0, 4), scalar)
+    pair[1] = 42
+
+
+@doesnt_compile
+@triton.jit
+def test_augassign_item():
+    scalar = 11
+    pair = Pair(tl.arange(0, 4), scalar)
+    pair[1] += 42
+
+
+@filecheck_test
+@triton.jit
+def test_jit_method():
+    # CHECK-LABEL: test_jit_method
+    # CHECK: %c11_i32 = arith.constant 11 : i32
+    # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
+    scalar = 11
+    # CHECK: [[V:%.*]]:2 = tt.call @{{.*}}unpack{{.*}}([[RANGE]], %c11_i32)
+    pair = Pair(tl.arange(0, 4), scalar)
+    a, b = pair.unpack()
+    # CHECK: call @{{.*}}anchor{{.*}}([[V]]#0)
+    anchor(a)
+    # CHECK: call @{{.*}}anchor{{.*}}([[V]]#1)
+    anchor(b)
+
+
+@triton.aggregate
+class TypeWithJitGetItem:
+    value: tl.tensor
+
+    @triton.jit
+    def __getitem__(self, ind):
+        return self.value
+
+
+@filecheck_test
+@triton.jit
+def test_jit_getitem():
+    # CHECK-LABEL: test_jit_getitem
+    # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
+    v = TypeWithJitGetItem(tl.arange(0, 4))
+    # CHECK: [[V:%.*]] = tt.call [[METHOD:@.*__getitem__.*]]([[RANGE]])
+    a = v[0]
+    # CHECK: call @{{.*}}anchor{{.*}}([[V]])
+    anchor(a)
+    # CHECK: tt.func private [[METHOD]]([[ARG0:%.*]]:
+    # CHECK: tt.return [[ARG0]]
+
+
+@triton.aggregate
+class TypeWithBuiltinInitializer:
+    value: tl.tensor
+
+    def __init__(self, _semantic=None):
+        self.value = tl.arange(0, 4, _semantic=_semantic)
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_initializers():
+    # CHECK-LABEL: test_aggregate_initializers
+    value = TypeWithBuiltinInitializer()
+    # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
+    # CHECK: call @{{.*}}anchor{{.*}}([[RANGE]])
+    anchor(value)
+
+
+def test_aggregate_auto_init_assigns_members():
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+        y: tl.constexpr
+
+    state = State(3, y=7)
+    assert isinstance(state.x, tl.constexpr)
+    assert isinstance(state.y, tl.constexpr)
+    assert state.x.value == 3
+    assert state.y.value == 7
+
+
+def test_aggregate_auto_init_with_tuples():
+
+    class Shape(NamedTuple):
+        x: tl.constexpr
+        y: tl.constexpr
+
+    @triton.aggregate
+    class State:
+        shape: tl.tuple
+        strides: tl.tuple
+
+    state = State(Shape(3, tl.constexpr(7)), (7, tl.constexpr(1)))
+    assert isinstance(state.shape, tl.tuple)
+    assert isinstance(state.shape.x, tl.constexpr)
+    assert isinstance(state.shape.y, tl.constexpr)
+    assert state.shape[0].value == 3
+    assert state.shape[1].value == 7
+
+    assert isinstance(state.strides, tl.tuple)
+    assert isinstance(state.strides[0], tl.constexpr)
+    assert isinstance(state.strides[1], tl.constexpr)
+    assert state.strides[0].value == 7
+    assert state.strides[1].value == 1
+
+
+def test_aggregate_auto_init_respects_user_defined_init():
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+
+        def __init__(self, x):
+            self.x = tl.constexpr(x + 1)
+
+    state = State(10)
+    assert state.x.value == 11
+
+
+@triton.jit
+def forward(arg):
+    return arg
+
+
+@triton.jit
+def list_of_functions_constexpr(arg, fns: tl.constexpr):
+    for i in tl.static_range(len(fns)):
+        fns[i](arg)
+
+
+@triton.jit
+def consume_varargs(*dims):
+    return dims[0]
+
+
+@filecheck_test
+@triton.jit
+def test_list_of_functions():
+    # CHECK-LABEL: test_list_of_functions
+    # CHECK: call @{{.*}}list_of_functions_constexpr{{.*}}cJITFunction(test_frontend:anchor){{.*}}cJITFunction(test_frontend:forward)
+
+    # CHECK: tt.func private @{{.*}}list_of_functions_constexpr
+    # CHECK-NEXT: call @{{.*}}anchor
+    # CHECK-NEXT: call @{{.*}}forward
+    list_of_functions_constexpr(tl.arange(0, 4), [anchor, forward])
+
+
+@filecheck_test
+@triton.jit
+def test_starred_varargs():
+    # CHECK-LABEL: test_starred_varargs
+    # CHECK: call @{{.*}}consume_varargs
+    dims: tl.constexpr = (1, 0)
+    consume_varargs(*dims)
+
+
+@triton.jit
+def accumulate(a, b):
+    return a + b
+
+
+# Check that we can call a function returning a value from a loop.
+@filecheck_test
+@triton.jit
+def test_call_in_loop():
+    # CHECK-LABEL: test_call_in_loop
+    acc = 0
+    # CHECK: scf.for
+    # CHECK:   call @{{.*}}accumulate
+    for i in range(10):
+        acc = accumulate(acc, i)
+
+
+@triton.aggregate
+class FunctionParent:
+
+    @triton.jit
+    def function_with_name():
+        pass
+
+
+@triton.jit
+def function_with_name():
+    pass
+
+
+@filecheck_test
+@triton.jit
+def test_function_name_mangling():
+    # CHECK-LABEL: test_function_name_mangling
+    # CHECK: call @test_frontend.function_with_name
+    # CHECK: call @test_frontend.FunctionParent.function_with_name
+    function_with_name()
+    FunctionParent.function_with_name()
+
+
+@triton.aggregate
+class AggregateWithConstexpr:
+    a: tl.tensor
+    b: tl.constexpr
+
+    @staticmethod
+    def create(a):
+        return AggregateWithConstexpr(a, tl.constexpr(42))
+
+    @triton.jit
+    def modify(self, a):
+        self.a = a
+        return self
+
+
+@triton.jit
+def add_rhs_constexpr(agg):
+    _ = agg.a + agg.b
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_with_constexpr():
+    # CHECK-LABEL: test_aggregate_with_constexpr
+    # CHECK: tt.call @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, c42>
+    agg = AggregateWithConstexpr.create(tl.arange(0, 4))
+    add_rhs_constexpr(agg)
+
+    # CHECK: tt.func private @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, c42>
+    # CHECK: %cst = arith.constant dense<42> : tensor<4xi32>
+    # CHECK: arith.addi %arg0, %cst : tensor<4xi32>
+
+
+@triton.aggregate
+class AggregateWithTuple:
+    a: tl.tuple
+
+    @staticmethod
+    @triton.jit
+    def create(a):
+        return AggregateWithTuple((a, ))
+
+
+@triton.jit
+def pass_tuple_aggregate(agg):
+    pass
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_with_tuple():
+    # CHECK-LABEL: test_aggregate_with_tuple
+    # CHECK: tt.call @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>"
+    agg = AggregateWithTuple.create(tl.arange(0, 4))
+    pass_tuple_aggregate(agg)
+    # CHECK: tt.func private @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>"
+
+
+@triton.constexpr_function
+def constexpr_function(x):
+    return x + 1
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_function_from_jit():
+    # CHECK-LABEL: test_constexpr_function
+    x: tl.constexpr = constexpr_function(7)
+    # CHECK: make_range {end = 8 : i32, start = 0 : i32}
+    tl.arange(0, x)
+
+
+def test_constexpr_function_from_python():
+    assert constexpr_function(7) == 8
+
+
+@triton.jit
+def swap(pair):
+    return pair.second, pair.first
+
+
+@doesnt_compile
+@triton.jit
+def test_assign_tuple_attrs_kernel():
+    p = Pair(tl.arange(0, 4), tl.arange(4, 8))
+    p.first, p.second = swap(p)
+
+
+@doesnt_compile
+@triton.jit
+def test_reassign_aggregate_with_constexpr():
+    agg = AggregateWithConstexpr.create(tl.arange(0, 4))
+    agg = agg.modify(tl.arange(4, 8))
+
+
+@triton.constexpr_function
+def make_shape(m, n):
+    return (m, n)
+
+
+@triton.constexpr_function
+def add_shape_dims(m, n):
+    return m + n
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_getitem():
+    # CHECK-LABEL: test_constexpr_getitem
+    # CHECK: make_range {end = 12 : i32, start = 4 : i32}
+    shape: tl.constexpr = make_shape(4, 8)
+    sum: tl.constexpr = add_shape_dims(shape[0], shape[1])
+    tl.arange(4, sum)
+
+
+@triton.constexpr_function
+def Box(T):
+
+    @triton.aggregate
+    class BoxImpl:
+        value: T
+
+        @triton.jit
+        def create(value):
+            return BoxImpl(value)
+
+    return BoxImpl
+
+
+def test_late_bound_class_reference():
+    TensorBox = Box(tl.tensor)
+
+    @triton.jit
+    def kernel():
+        # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
+        # CHECK: call @{{.*}}anchor{{.*}}([[RANGE]])
+        value = TensorBox(tl.arange(0, 4))
+        anchor(value)
+
+    run_filecheck_test(kernel)
+
+
+@triton.jit
+def recursive_reduce(x):
+    if x.shape[0] == 1:
+        return x
+    else:
+        x0, x1 = x.reshape((x.shape[0] // 2, 2)).split()
+        return recursive_reduce(x0) + recursive_reduce(x1)
+
+
+@filecheck_test
+@triton.jit
+def test_specialized_recursion():
+    # CHECK-LABEL: test_specialized_recursion
+    # CHECK: call {{.*}}recursive_reduce__i32S16S
+    x = tl.arange(0, 16)
+    recursive_reduce(x)
+
+    # CHECK: func {{.*}}recursive_reduce__i32S16S
+    # CHECK-COUNT-2: call {{.*}}recursive_reduce__i32S8S
+
+    # CHECK: func {{.*}}recursive_reduce__i32S8S
+    # CHECK-COUNT-2: call {{.*}}recursive_reduce__i32S4S
+
+    # CHECK: func {{.*}}recursive_reduce__i32S4S
+    # CHECK-COUNT-2: call {{.*}}recursive_reduce__i32S2S
+
+
+@triton.jit
+def trivial_return():
+    return
+
+
+@filecheck_test
+@triton.jit
+def test_call_in_while():
+    # CHECK-LABEL: test_call_in_while
+    i = 0
+    while i < 10:
+        if i == 5:
+            trivial_return()
+        else:
+            trivial_return()
+
+
+def test_return_in_while():
+
+    @triton.jit
+    def kernel():
+        i = 0
+        while i < 10:
+            if i == 5:
+                return
+            i += 1
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel)
+
+    assert "Cannot have `return` statements inside `while` or `for` statements in triton" in str(e.value)
+
+
+class TensorPtr(NamedTuple):
+    test: tl.constexpr
+
+
+class TestTuple(NamedTuple):
+    __test__ = False
+    test: TensorPtr
+
+
+@triton.jit
+def foo(test: TestTuple):
+    x: tl.constexpr = tl.constexpr(1)
+    for i in tl.range(x):
+        # Tests that it compiles and is usable.
+        tl.static_assert(test.test.test == 1)
+
+
+def test_tuple_constexpr():
+    test = TestTuple(test=TensorPtr(tl.constexpr(1)))
+    run_parser(foo, args=(test, ))
+
+
+@triton.jit
+def tuple_arg_identity(xs):
+    return xs
+
+
+def test_jit_call_tuple_of_tensors_plus_tuple_of_int():
+
+    @triton.jit
+    def kernel():
+        x0 = tl.program_id(0)
+        x1 = tl.program_id(1)
+        tuple_arg_identity((x0, x1)[:-1] + (1, ))
+
+    run_parser(kernel)
+
+
+@triton.aggregate
+class AggregateWithConstexprFunction:
+    val: tl.constexpr
+    val_squared: tl.constexpr
+
+    def __init__(self, val):
+        self.val = tl.constexpr(val)
+        self.val_squared = tl.constexpr(self.square_val())
+
+    @triton.constexpr_function
+    def square_val(self):
+        return self.val * self.val
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_constexpr_function():
+    agg = AggregateWithConstexprFunction(4)
+    # CHECK: call @{{.*}}anchor{{.*}}c4
+    anchor(agg.val)
+
+    # CHECK: call @{{.*}}anchor{{.*}}c16
+    anchor(agg.val_squared)
+
+    # CHECK: call @{{.*}}anchor{{.*}}c16
+    anchor(agg.square_val())
+
+
+@tl.core.builtin
+def make_list(*args, _semantic=None):
+    return list(args)
+
+
+@triton.constexpr_function
+def function_taking_list(arg):
+    return arg[1]
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_function_taking_list():
+    a: tl.constexpr = function_taking_list(make_list(4, 8, 16))
+    # CHECK: call @{{.*}}anchor{{.*}}c8
+    anchor(a)
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_min_max():
+    a: tl.constexpr = min(1, 2)
+    # CHECK: call @{{.*}}anchor{{.*}}c1
+    anchor(a)
+
+    b: tl.constexpr = min(1, 2, -3)
+    # CHECK: call @{{.*}}anchor{{.*}}c-3
+    anchor(b)
+
+    c: tl.constexpr = max(3, 4)
+    # CHECK: call @{{.*}}anchor{{.*}}c4
+    anchor(c)
+
+    d: tl.constexpr = max(3, 4, 5)
+    # CHECK: call @{{.*}}anchor{{.*}}c5
+    anchor(d)
+
+
+def test_constexpr_min_error():
+
+    @triton.jit
+    def min_kernel(a: tl.constexpr, b: tl.constexpr):
+        min(a, b)
+
+    with pytest.raises(CompilationError):
+        run_parser(min_kernel, args=(1.0, float("nan")))
+
+    with pytest.raises(CompilationError):
+        run_parser(min_kernel, args=(1.0, -0.0))
+
+
+def test_constexpr_max_error():
+
+    @triton.jit
+    def max_kernel(a: tl.constexpr, b: tl.constexpr):
+        max(a, b)
+
+    with pytest.raises(CompilationError):
+        run_parser(max_kernel, args=(1.0, float("nan")))
+
+    with pytest.raises(CompilationError):
+        run_parser(max_kernel, args=(1.0, -0.0))
+
+
+@filecheck_test
+@triton.jit
+def test_for_loop_iv_modification():
+    # CHECK: scf.for %[[I:.*]] = {{.*}} to {{.*}} step {{.*}} : i32 {
+    for i in range(4):
+        # CHECK: anchor{{.*}}%[[I]]
+        anchor(i)
+        # CHECK: %[[I2:.*]] = arith.addi %[[I]], %{{.*}} : i32
+        i += 1
+        # CHECK: anchor{{.*}}%[[I2]]
+        anchor(i)
+
+
+@pytest.mark.interpreter
+def test_constexpr_return():
+
+    @triton.jit
+    def get_constexpr_value():
+        return tl.constexpr(42)
+
+    @triton.jit
+    def test():
+        x: tl.constexpr = get_constexpr_value()
+        tl.static_assert(x == 42)
+
+    run_parser(test)
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_scalar_masks():
+    # CHECK-LABEL: test_atomic_scalar_masks
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), 1, tl.int32)
+    mask = offs >= 0
+    scalar_mask = True
+    constexpr_value: tl.constexpr = 1
+    constexpr_mask: tl.constexpr = True
+
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, val, mask=mask)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, constexpr_value, mask=constexpr_mask)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, val, mask=scalar_mask)
+
+    # CHECK: {{.*}} = tt.atomic_rmw exch, acq_rel, gpu
+    tl.atomic_xchg(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw max, acq_rel, gpu
+    tl.atomic_max(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    tl.atomic_min(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw and, acq_rel, gpu
+    tl.atomic_and(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw or, acq_rel, gpu
+    tl.atomic_or(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw xor, acq_rel, gpu
+    tl.atomic_xor(ptrs, 1, mask=True)
+
+
+@pytest.mark.interpreter
+def test_return_promotion():
+
+    @triton.jit
+    def signbit(x):
+        if x < 0:
+            return 1
+        else:
+            return 0
+
+    @triton.jit
+    def tuple_return(x):
+        if x < 0:
+            return 1, x
+        else:
+            return 0, x
+
+    @triton.jit
+    def kernel():
+        # constexpr if -> constexpr returned
+        a: tl.constexpr = signbit(-1)
+        tl.static_assert(a == 1)
+
+        # dynamic if -> promote to tensor
+        tmp = -1
+        tl.static_assert(signbit(tmp).type == tl.int32)
+
+        # constexpr if -> single return
+        b: tl.constexpr = tuple_return(-1)
+        tl.static_assert(b[0] == 1 and b[1] == -1)
+
+        c = tuple_return(tmp)
+        tl.static_assert(c.type == tl.tuple_type([tl.int32, tl.int32]))
+
+    run_parser(kernel)
+
+
+# ===-----------------------------------------------------------------------===#
+# Aggregate inheritance, __post_init__, and aggregate_replace tests
+# ===-----------------------------------------------------------------------===#
+
+
+def test_aggregate_field_inheritance():
+    """Child aggregate inherits parent fields."""
+
+    @triton.aggregate
+    class Base:
+        x: tl.constexpr
+
+    @triton.aggregate
+    class Child(Base):
+        y: tl.constexpr
+
+    child = Child(10, 20)
+    assert isinstance(child.x, tl.constexpr)
+    assert isinstance(child.y, tl.constexpr)
+    assert child.x.value == 10
+    assert child.y.value == 20
+
+
+def test_aggregate_multilevel_inheritance():
+    """Multi-level inheritance: grandparent -> parent -> child."""
+
+    @triton.aggregate
+    class GrandParent:
+        a: tl.constexpr
+
+    @triton.aggregate
+    class Parent(GrandParent):
+        b: tl.constexpr
+
+    @triton.aggregate
+    class Child(Parent):
+        c: tl.constexpr
+
+    child = Child(1, 2, 3)
+    assert child.a.value == 1
+    assert child.b.value == 2
+    assert child.c.value == 3
+
+
+def test_aggregate_inheritance_requires_aggregate_base():
+
+    class Base:
+        pass
+
+    with pytest.raises(TypeError, match="Aggregates can only inherit from other aggregates"):
+
+        @triton.aggregate
+        class Child(Base):
+            x: tl.constexpr
+
+
+def test_aggregate_field_inheritance_with_methods():
+    """Inherited methods work with inherited fields."""
+
+    @triton.aggregate
+    class Base:
+        x: tl.constexpr
+
+        @triton.constexpr_function
+        def get_x(self):
+            return self.x
+
+    @triton.aggregate
+    class Child(Base):
+        y: tl.constexpr
+
+    child = Child(10, 20)
+    assert child.get_x().value == 10
+
+
+def test_aggregate_default_values():
+    """Fields with default values can be omitted from constructor."""
+
+    @triton.aggregate
+    class WithDefaults:
+        x: tl.constexpr
+        y: tl.constexpr = tl.constexpr(42)
+
+    # Provide both
+    obj1 = WithDefaults(10, 20)
+    assert obj1.x.value == 10
+    assert obj1.y.value == 20
+
+    # Use default for y
+    obj2 = WithDefaults(10)
+    assert obj2.x.value == 10
+    assert obj2.y.value == 42
+
+
+def test_aggregate_replace():
+    """aggregate_replace creates a copy with modified fields."""
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+        y: tl.constexpr
+
+    original = State(10, 20)
+    modified = tl.aggregate_replace(original, x=30)
+
+    # Modified has the new value
+    assert modified.x.value == 30
+    assert modified.y.value == 20
+
+    # Original is unchanged
+    assert original.x.value == 10
+    assert original.y.value == 20
+
+
+def test_aggregate_replace_invalid_field():
+    """aggregate_replace raises on unknown field names."""
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+
+    obj = State(10)
+    with pytest.raises(TypeError, match="has no field 'z'"):
+        tl.aggregate_replace(obj, z=99)
+
+
+def test_aggregate_replace_non_aggregate():
+    """aggregate_replace raises on non-aggregate instances."""
+    with pytest.raises(TypeError, match="expects an aggregate instance"):
+        tl.aggregate_replace(42, x=1)
+
+
+def test_aggregate_inherited_defaults():
+    """Child inherits default values from parent fields."""
+
+    @triton.aggregate
+    class Base:
+        x: tl.constexpr = tl.constexpr(100)
+
+    @triton.aggregate
+    class Child(Base):
+        y: tl.constexpr
+
+    child = Child(y=7)
+    assert child.x.value == 100
+    assert child.y.value == 7
+
+
+def test_aggregate_string_annotations_resolved():
+    """String annotations (PEP 649 / forward refs) resolve via typing.get_type_hints.
+
+    On Python 3.13+ class annotations may be stored as strings rather than evaluated
+    types. _resolve_aggregate_fields walks the MRO directly, so it must call
+    typing.get_type_hints to resolve those strings — otherwise downstream
+    isinstance(value, ann) raises 'isinstance() arg 2 must be a type'.
+    """
+
+    @triton.aggregate
+    class StringAnnoBase:
+        x: "tl.constexpr"  # explicit string annotation — must resolve
+
+    @triton.aggregate
+    class StringAnnoChild(StringAnnoBase):
+        y: "tl.constexpr"  # inherited annotation chain must resolve too
+
+    child = StringAnnoChild(10, 20)
+    assert isinstance(child.x, tl.constexpr)
+    assert isinstance(child.y, tl.constexpr)
+    assert child.x.value == 10
+    assert child.y.value == 20
+
+
+def test_aggregate_default_value_auto_wrapped():
+    """A raw-int default (`y: tl.constexpr = 42`) is auto-wrapped to constexpr at init."""
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+        y: tl.constexpr = 42  # raw int default — no tl.constexpr() wrap
+
+    obj = State(10)
+    assert isinstance(obj.y, tl.constexpr)
+    assert obj.y.value == 42
+    # Explicit override still works.
+    obj2 = State(10, 99)
+    assert obj2.y.value == 99
+
+
+def test_aggregate_post_construction_immutable():
+    """Field assignment after construction is rejected (matches dataclasses(frozen=True))."""
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+        y: tl.constexpr
+
+    obj = State(10, 20)
+    with pytest.raises(AttributeError, match="cannot assign to field 'x' on immutable aggregate"):
+        obj.x = tl.constexpr(99)
+    # Original value unchanged.
+    assert obj.x.value == 10
+
+    # aggregate_replace() builds a modified copy without mutating the original.
+    new = tl.aggregate_replace(obj, x=tl.constexpr(77))
+    assert new.x.value == 77
+    assert obj.x.value == 10
+
+
+# ===-----------------------------------------------------------------------===#
+# IR-level checks for inheritance + replace (moved from test_core.py per
+# review feedback — frontend is sufficient since aggregates compile to flat
+# field structures, no GPU runtime needed to verify language semantics).
+# ===-----------------------------------------------------------------------===#
+
+
+@triton.aggregate
+class _AggInhBase:
+    data: tl.tensor
+    BLOCK: tl.constexpr
+
+
+@triton.aggregate
+class _AggInhChild(_AggInhBase):
+    bias: tl.tensor
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_inheritance_ir():
+    # CHECK-LABEL: test_aggregate_inheritance_ir
+    # CHECK: [[A:%.*]] = tt.make_range {end = 8 : i32, start = 0 : i32}
+    # CHECK: [[B:%.*]] = tt.make_range {end = 16 : i32, start = 8 : i32}
+    a = tl.arange(0, 8)
+    b = tl.arange(8, 16)
+    child = _AggInhChild(a, 8, b)
+    # Inherited base field flows through unchanged.
+    # CHECK: call @{{.*}}anchor{{.*}}([[A]])
+    anchor(child.data)
+    # Child-only field flows through unchanged.
+    # CHECK: call @{{.*}}anchor{{.*}}([[B]])
+    anchor(child.bias)
+
+
+@triton.aggregate
+class _AggMethodBase:
+    val: tl.tensor
+    BLOCK: tl.constexpr
+
+    @triton.jit
+    def doubled(self):
+        return self.val + self.val
+
+
+@triton.aggregate
+class _AggMethodChild(_AggMethodBase):
+    offset: tl.tensor
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_inherited_method_ir():
+    # CHECK-LABEL: test_aggregate_inherited_method_ir
+    # CHECK: [[V:%.*]] = tt.make_range {end = 8 : i32, start = 0 : i32}
+    # CHECK: [[O:%.*]] = tt.make_range {end = 16 : i32, start = 8 : i32}
+    v = tl.arange(0, 8)
+    o = tl.arange(8, 16)
+    child = _AggMethodChild(v, 8, o)
+    # The inherited method dispatches with mangling that includes the child type
+    # — confirms the method came from the base but operates over child layout.
+    # CHECK: [[D:%.*]] = tt.call @{{.*}}_AggMethodBase.doubled{{.*}}_AggMethodChild{{.*}}([[V]], [[O]])
+    d = child.doubled()
+    # CHECK: call @{{.*}}anchor{{.*}}([[D]])
+    anchor(d)
+    # CHECK: call @{{.*}}anchor{{.*}}([[O]])
+    anchor(child.offset)
+
+
+@triton.aggregate
+class _AggReplaceState:
+    vals: tl.tensor
+    BLOCK: tl.constexpr
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_replace_ir():
+    # CHECK-LABEL: test_aggregate_replace_ir
+    # CHECK: [[A:%.*]] = tt.make_range {end = 8 : i32, start = 0 : i32}
+    # CHECK: [[B:%.*]] = tt.make_range {end = 16 : i32, start = 8 : i32}
+    a = tl.arange(0, 8)
+    b = tl.arange(8, 16)
+    state = _AggReplaceState(a, 8)
+    state2 = tl.aggregate_replace(state, vals=b)
+    # Replaced field is the new tensor in the new aggregate.
+    # CHECK: call @{{.*}}anchor{{.*}}([[B]])
+    anchor(state2.vals)
+    # Original aggregate still references original tensor.
+    # CHECK: call @{{.*}}anchor{{.*}}([[A]])
+    anchor(state.vals)

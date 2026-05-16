@@ -1,0 +1,124 @@
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+index a267059c6315..7ac880e56e97 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+@@ -111,17 +111,22 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
+     return 0;
+   };
+ 
+-  if (waitOp->getNumOperands() != 1)
++  if (waitOp->getNumOperands() == 0)
+     return 0;
+-  Value val = waitOp->getOperand(0);
+-  // If the value resides in a region other than the region of the wait op, then
+-  // the wait op must be in some nested region. Measure the number of commits
+-  // between the definition value and the parent op.
+-  // TODO: We could measure commits in nested regions along the path if
+-  // necessary.
+-  while (waitOp->getParentRegion() != val.getParentRegion())
+-    waitOp = waitOp->getParentOp();
+-  int minCommits = minOverHistories(val, waitOp, 0);
++  // Multi-token waits: take the min of minOverHistories across operands. Both
++  // the captured `minCommitNumber` and the returned bailout-0s are folded in.
++  int minCommits = INT_MAX;
++  for (Value val : waitOp->getOperands()) {
++    Operation *anchor = waitOp;
++    // If the value resides in a region other than the region of the wait op,
++    // then the wait op must be in some nested region. Measure the number of
++    // commits between the definition value and the parent op.
++    // TODO: We could measure commits in nested regions along the path if
++    // necessary.
++    while (anchor->getParentRegion() != val.getParentRegion())
++      anchor = anchor->getParentOp();
++    minCommits = std::min(minCommits, minOverHistories(val, anchor, 0));
++  }
+   return minCommits;
+ }
+ 
+diff --git a/test/TritonGPU/amd/amd-block-pingpong-asyncmark-multi-token.mlir b/test/TritonGPU/amd/amd-block-pingpong-asyncmark-multi-token.mlir
+index 5a06a40b3459..8b0d2ffca9df 100644
+--- a/test/TritonGPU/amd/amd-block-pingpong-asyncmark-multi-token.mlir
++++ b/test/TritonGPU/amd/amd-block-pingpong-asyncmark-multi-token.mlir
+@@ -2,10 +2,10 @@
+ // RUN: triton-opt %s --tritonamdgpu-block-pingpong=num-stages=3 --tritonamdgpu-update-async-wait-count=gfx-arch=gfx950 | FileCheck %s
+ 
+ // BlockPingpong's transformTwoClusterWithLocalLoadAndAll combines per-operand
+-// ttg.async_waits into a single multi-token wait. The Pipeline pass's
+-// updateWaits already set each input wait's `num` to the in-flight commit-
+-// group count it can tolerate; the merged wait must preserve the *minimum*
+-// of those counts so the pipeline isn't accidentally serialized.
++// ttg.async_waits into a single multi-token wait, then reorders async copies
++// and commits around it. After the reorder the pass re-runs updateWaits, so
++// the merged wait's `num` is derived via minNumInterleavedCommitOps against
++// the post-reorder IR (with multi-token support added in the same patch).
+ //
+ // On asyncmark targets (CDNA3/CDNA4) this `num` lowers straight to
+ // rocdl.wait.asyncmark(N), and UpdateAsyncWaitCount is a no-op since PR #9883
+@@ -21,9 +21,14 @@
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+   // CHECK-LABEL: async_ns3_gemm_pingpong_multi_token
+   // The two per-operand waits in the input carry num=2 and num=1; pingpong
+-  // fuses them into a single multi-token wait that preserves min(2, 1) = 1.
++  // fuses them into a single multi-token wait whose num is recomputed against
++  // the post-reorder IR. In this synthetic test the tokens come from tt.func
++  // args (no prologue commit chain), so minNumInterleavedCommitOps bails to
++  // its conservative N=0; in a real kernel the chains terminate at prologue
++  // async_commit_groups and yield a tighter bound (e.g. 1 for a real
++  // gfx950 simple_persistent_matmul kernel).
+   // CHECK: scf.for
+-  // CHECK: ttg.async_wait %{{[^,]+}}, %{{[^,]+}} {num = 1 : i32}
++  // CHECK: ttg.async_wait %{{[^,]+}}, %{{[^,]+}} {num = 0 : i32}
+   tt.func public @async_ns3_gemm_pingpong_multi_token(
+       %arg0: i32,
+       %arg1: tensor<256x32x!tt.ptr<bf16>, #blocked>,
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp
+index 6ba914689209..b314bc9ba65b 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp
+@@ -9,6 +9,7 @@
+ #include "mlir/Pass/PassManager.h"
+ #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
++#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ 
+@@ -865,14 +866,15 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
+   auto newAsyncWaitOp = asyncWaitOps[0];
+   if (asyncWaitOps.size() > 1) {
+     SmallVector<Value> tokens;
+-    int32_t minNum = std::numeric_limits<int32_t>::max();
+     for (auto asyncWaitOp : asyncWaitOps) {
+       for (auto token : asyncWaitOp.getAsyncToken()) {
+         tokens.push_back(token);
+       }
+-      minNum = std::min<int32_t>(minNum, asyncWaitOp.getNum());
+     }
+-    newAsyncWaitOp = ttg::AsyncWaitOp::create(builder, loc, tokens, minNum);
++    // Drop pre-calculated mark_num and conservatively set 0 before
++    // updateWaits (in runOnOperation) re-evaluates against the token chain
++    // post-reorder.
++    newAsyncWaitOp = ttg::AsyncWaitOp::create(builder, loc, tokens, /*num=*/0);
+     for (auto asyncWaitOp : asyncWaitOps) {
+       asyncWaitOp.getResult().replaceAllUsesWith(newAsyncWaitOp.getResult());
+       asyncWaitOp->erase();
+@@ -1267,12 +1269,19 @@ struct TritonAMDGPUBlockPingpongPass
+ 
+   void runOnOperation() override {
+     ModuleOp m = getOperation();
++    bool transformed = false;
+     for (auto funcOp : m.getOps<tt::FuncOp>()) {
+       funcOp.walk([&](scf::ForOp forOp) {
+         Pingponger pingponger(forOp, ttg::lookupNumWarps(forOp), numStages);
+         pingponger.getDotPingponged();
++        transformed = true;
+       });
+     }
++    // Pingpong reorders async copies/commits around the merged ttg.async_wait,
++    // invalidating any `num` Pipeline.cpp set earlier. Recompute against the
++    // post-reorder IR.
++    if (transformed)
++      mlir::triton::updateWaits(m);
+   }
+ };
+ 

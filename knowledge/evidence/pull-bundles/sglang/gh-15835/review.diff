@@ -1,0 +1,1217 @@
+diff --git a/python/sglang/jit_kernel/benchmark/bench_qknorm.py b/python/sglang/jit_kernel/benchmark/bench_qknorm.py
+new file mode 100644
+index 000000000000..046fa02c09a5
+--- /dev/null
++++ b/python/sglang/jit_kernel/benchmark/bench_qknorm.py
+@@ -0,0 +1,130 @@
++import itertools
++import os
++from typing import Tuple
++
++import torch
++import triton
++import triton.testing
++
++IS_CI = (
++    os.getenv("CI", "false").lower() == "true"
++    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
++)
++
++alt_stream = torch.cuda.Stream()
++
++
++def sglang_aot_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from sgl_kernel import rmsnorm
++
++    head_dim = q.shape[-1]
++    q = q.view(-1, head_dim)
++    k = k.view(-1, head_dim)
++
++    current_stream = torch.cuda.current_stream()
++    alt_stream.wait_stream(current_stream)
++    rmsnorm(q, q_weight, out=q)
++    with torch.cuda.stream(alt_stream):
++        rmsnorm(k, k_weight, out=k)
++    current_stream.wait_stream(alt_stream)
++
++
++def sglang_jit_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from sglang.jit_kernel.norm import fused_inplace_qknorm
++
++    fused_inplace_qknorm(q, k, q_weight, k_weight)
++
++
++def flashinfer_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from flashinfer.norm import rmsnorm
++
++    rmsnorm(q, q_weight, out=q)
++    rmsnorm(k, k_weight, out=k)
++
++
++@torch.compile()
++def torch_impl_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    eps: float = 1e-6,
++) -> None:
++    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
++    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
++    q_norm = (q_mean + eps).rsqrt()
++    k_norm = (k_mean + eps).rsqrt()
++    q.copy_(q.float() * q_norm * q_weight.float())
++    k.copy_(k.float() * k_norm * k_weight.float())
++
++
++HEAD_DIM = 128
++DTYPE = torch.bfloat16
++DEVICE = "cuda"
++
++if IS_CI:
++    BS_RANGE = [16]
++    GQA_RANGE = [4]
++    KV_HEAD_RANGE = [1]
++else:
++    BS_RANGE = [2**n for n in range(0, 14)]
++    GQA_RANGE = [4, 8]
++    KV_HEAD_RANGE = [1, 2, 4, 8]
++
++LINE_VALS = ["aot", "jit", "fi", "torch"]
++LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
++STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
++
++configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
++
++
++@triton.testing.perf_report(
++    triton.testing.Benchmark(
++        x_names=["GQA", "num_kv_heads", "batch_size"],
++        x_vals=configs,
++        line_arg="provider",
++        line_vals=LINE_VALS,
++        line_names=LINE_NAMES,
++        styles=STYLES,
++        ylabel="us",
++        plot_name="qknorm-performance",
++        args={},
++    )
++)
++def benchmark(
++    batch_size: int, GQA: int, num_kv_heads: int, provider: str
++) -> Tuple[float, float, float]:
++    num_qo_heads = GQA * num_kv_heads
++    q = torch.randn((batch_size, num_qo_heads, HEAD_DIM), dtype=DTYPE, device=DEVICE)
++    k = torch.randn((batch_size, num_kv_heads, HEAD_DIM), dtype=DTYPE, device=DEVICE)
++    q_weight = torch.randn(HEAD_DIM, dtype=DTYPE, device=DEVICE)
++    k_weight = torch.randn(HEAD_DIM, dtype=DTYPE, device=DEVICE)
++    FN_MAP = {
++        "aot": sglang_aot_qknorm,
++        "jit": sglang_jit_qknorm,
++        "fi": flashinfer_qknorm,
++        "torch": torch_impl_qknorm,
++    }
++    fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
++    quantiles = [0.5, 0.2, 0.8]
++    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
++    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
++
++
++if __name__ == "__main__":
++    benchmark.run(print_data=True)
+diff --git a/python/sglang/jit_kernel/csrc/norm.cuh b/python/sglang/jit_kernel/csrc/norm.cuh
+new file mode 100644
+index 000000000000..0f9e7ac53f03
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/norm.cuh
+@@ -0,0 +1,202 @@
++#include <sgl_kernel/runtime.cuh>
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.cuh>
++#include <sgl_kernel/utils.h>
++#include <sgl_kernel/warp.cuh>
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++
++#include <cstdint>
++#include <type_traits>
++
++namespace {
++
++[[maybe_unused]]
++__device__ auto to_float2(nv_bfloat162 x) -> float2 {
++  return __bfloat1622float2(x);
++}
++
++[[maybe_unused]]
++__device__ auto to_float2(half2 x) -> float2 {
++  return __half22float2(x);
++}
++
++template <typename T>
++__device__ auto from_float2(float2 x) -> T {
++  if constexpr (std::is_same_v<T, nv_bfloat162>) {
++    return __float22bfloat162_rn(x);
++  } else if constexpr (std::is_same_v<T, half2>) {
++    return __float22half2_rn(x);
++  } else {
++    static_assert(sizeof(T) == 0, "Unsupported type");
++  }
++}
++
++struct QKNormParams {
++  void* __restrict__ q;
++  void* __restrict__ k;  // k is offset by (-num_qo_heads * head_dim) elements
++  int64_t q_stride;
++  int64_t k_stride;
++  uint32_t num_qo_heads;
++  uint32_t num_kv_heads;
++  float eps;
++  const void* __restrict__ q_weight;
++  const void* __restrict__ k_weight;
++  uint32_t num_tokens;
++};
++
++template <int64_t kHeadDim, typename PackedFloat>
++__always_inline __device__ void apply_norm(void* __restrict__ input, const void* __restrict__ weight, float eps) {
++  using namespace device;
++
++  constexpr auto kLoopCount = kHeadDim / (kWarpThreads * 2);
++  static_assert(kHeadDim % (kWarpThreads * 2) == 0);
++
++  const auto lane_id = threadIdx.x % kWarpThreads;
++  float sum_of_squares = 0.0f;
++
++  using vec_t = device_vec<PackedFloat, kLoopCount>;
++  auto input_vec = static_cast<const vec_t*>(input)[lane_id];
++
++#pragma unroll
++  for (auto i = 0u; i < kLoopCount; ++i) {
++    const auto fp16_input = input_vec.data[i];
++    const auto fp32_input = to_float2(fp16_input);
++    sum_of_squares += fp32_input.x * fp32_input.x;
++    sum_of_squares += fp32_input.y * fp32_input.y;
++  }
++
++  sum_of_squares = warp::reduce_sum(sum_of_squares);
++  const auto norm_factor = rsqrtf(sum_of_squares / kHeadDim + eps);
++  const auto weight_vec = static_cast<const vec_t*>(weight)[lane_id];
++
++  vec_t output_vec;
++#pragma unroll
++  for (auto i = 0u; i < kLoopCount; ++i) {
++    const auto fp32_weight = to_float2(weight_vec.data[i]);
++    const auto fp32_input = to_float2(input_vec.data[i]);
++    output_vec.data[i] = from_float2<PackedFloat>({
++        fp32_input.x * norm_factor * fp32_weight.x,
++        fp32_input.y * norm_factor * fp32_weight.y,
++    });
++  }
++
++  static_cast<vec_t*>(input)[lane_id] = output_vec;
++}
++
++constexpr uint32_t kWarpsPerBlock = 4;
++constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
++
++template <int64_t kHeadDim, bool kUsePDL, typename PackedFloat, typename Float>
++__global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
++  using namespace device;
++
++  static_assert(sizeof(Float) == 2 && sizeof(PackedFloat) == 4, "Only support FP16/BF16");
++  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
++
++  const auto num_blks = gridDim.x;
++  const auto num_workers = num_blks * kWarpsPerBlock;
++  const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
++  const auto num_works = num_q_and_k_heads * num_tokens;
++  const auto start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
++
++  PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
++
++  for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
++    const int64_t token_id = idx / num_q_and_k_heads;
++    const int64_t head_id = idx % num_q_and_k_heads;
++    const auto load_q = head_id < num_qo_heads;
++    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
++                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
++    const auto weight = load_q ? q_weight : k_weight;
++    apply_norm<kHeadDim, PackedFloat>(input, weight, eps);
++  }
++
++  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
++}
++
++template <int64_t kHeadDim, bool kUsePDL>
++struct QKNormKernel {
++  template <typename PackedFloat, typename Float>
++  static constexpr auto qknorm_kernel = fused_qknorm<kHeadDim, kUsePDL, PackedFloat, Float>;
++
++  static void
++  run(const tvm::ffi::TensorView q,
++      const tvm::ffi::TensorView k,
++      const tvm::ffi::TensorView q_weight,
++      const tvm::ffi::TensorView k_weight,
++      float eps) {
++    using namespace host;
++
++    auto N = SymbolicSize{"num_tokens"};
++    auto Q = SymbolicSize{"num_qo_heads"};
++    auto K = SymbolicSize{"num_kv_heads"};
++    auto D = SymbolicSize{"head_dim"};
++    auto Sq = SymbolicSize{"q_stride"};
++    auto Sk = SymbolicSize{"k_stride"};
++    auto dtype = SymbolicDType{};
++    auto device = SymbolicDevice{};
++
++    TensorMatcher({N, Q, D})  // q input
++        .with_strides({Sq, D, 1})
++        .with_dtype<nv_bfloat16, half>(dtype)
++        .with_device<kDLCUDA>(device)
++        .verify(q);
++    TensorMatcher({N, K, D})  // k input
++        .with_strides({Sk, D, 1})
++        .with_dtype<nv_bfloat16, half>(dtype)
++        .with_device<kDLCUDA>(device)
++        .verify(k);
++    TensorMatcher({D})  // weight
++        .with_dtype<nv_bfloat16, half>(dtype)
++        .with_device<kDLCUDA>(device)
++        .verify(q_weight)
++        .verify(k_weight);
++
++    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
++    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
++    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
++    const auto head_dim = D.unwrap();
++    RuntimeCheck(head_dim == kHeadDim, "Wrong head_dim: ", head_dim, ". Expected:", kHeadDim);
++
++    // NOTE: we offset the k here to reduce computation cost in the kernel
++    const auto params = QKNormParams{
++        .q = q.data_ptr(),
++        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * kHeadDim),
++        .q_stride = static_cast<int64_t>(Sq.unwrap()),
++        .k_stride = static_cast<int64_t>(Sk.unwrap()),
++        .num_qo_heads = num_qo_heads,
++        .num_kv_heads = num_kv_heads,
++        .eps = eps,
++        .q_weight = q_weight.data_ptr(),
++        .k_weight = k_weight.data_ptr(),
++        .num_tokens = num_tokens,
++    };
++
++    // only initialize once (static variable) to avoid overhead
++    static constexpr auto bf16_kernel = qknorm_kernel<nv_bfloat162, nv_bfloat16>;
++    static constexpr auto fp16_kernel = qknorm_kernel<half2, half>;
++    static const uint32_t kMaxOccupancyTable[2] = {
++        runtime::get_blocks_per_sm(fp16_kernel, kThreadsPerBlock),
++        runtime::get_blocks_per_sm(bf16_kernel, kThreadsPerBlock),
++    };
++    static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
++
++    // choose kernel based on dtype
++    const bool use_bf16 = dtype.is_type<nv_bfloat16>();
++    const auto kernel = use_bf16 ? bf16_kernel : fp16_kernel;
++    const auto max_occupancy = kMaxOccupancyTable[use_bf16 ? 1 : 0];
++    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
++    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
++
++    // we use persistent kernel, which limit the number of blocks to reduce overhead
++    const auto num_blocks = std::min(kNumSM * max_occupancy, needed_blocks);
++    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap())  //
++        .enable_pdl(kUsePDL)(kernel, params);
++  }
++};
++
++}  // namespace
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh b/python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh
+new file mode 100644
+index 000000000000..c9ba59be49a5
+--- /dev/null
++++ b/python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <sgl_kernel/utils.cuh>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace host::runtime {
++
++// Return the maximum number of active blocks per SM for the given kernel
++template <typename T>
++inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
++  int num_blocks_per_sm = 0;
++  RuntimeDeviceCheck(
++      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
++  return static_cast<uint32_t>(num_blocks_per_sm);
++}
++
++// Return the number of SMs for the given device
++inline auto get_sm_count(int device_id) -> uint32_t {
++  cudaDeviceProp device_prop;
++  RuntimeDeviceCheck(cudaGetDeviceProperties(&device_prop, device_id));
++  return static_cast<uint32_t>(device_prop.multiProcessorCount);
++}
++
++}  // namespace host::runtime
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/tensor.h b/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
+index b577d8f483ca..7117ecf641d5 100644
+--- a/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
++++ b/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
+@@ -153,6 +153,11 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
+ 
+ }  // namespace details
+ 
++template <typename T>
++inline bool is_type(DLDataType dtype) {
++  return dtype == details::dtype_trait<T>::value;
++}
++
+ struct SymbolicSize {
+  public:
+   SymbolicSize(std::string_view annotation = {}) : m_value(details::kNullSize), m_annotation(annotation) {}
+@@ -259,6 +264,11 @@ struct SymbolicDType {
+     }
+   }
+ 
++  template <typename T>
++  auto is_type() const -> bool {
++    return ::host::is_type<T>(m_value);
++  }
++
+  private:
+   auto m_check(DLDataType value) const -> bool {
+     return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh b/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
+index 14a90aa9db03..738da61766b5 100644
+--- a/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
++++ b/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
+@@ -79,6 +79,24 @@ struct device_vec {
+   T data[N];
+ };
+ 
++template <bool kUsePDL>
++__forceinline__ __device__ void PDLWaitPrimary() {
++#ifndef USE_ROCM
++  if constexpr (kUsePDL) {
++    asm volatile("griddepcontrol.wait;");
++  }
++#endif
++}
++
++template <bool kUsePDL>
++__forceinline__ __device__ void PDLTriggerSecondary() {
++#ifndef USE_ROCM
++  if constexpr (kUsePDL) {
++    asm volatile("griddepcontrol.launch_dependents;");
++  }
++#endif
++}
++
+ }  // namespace device
+ 
+ namespace host {
+@@ -120,6 +138,18 @@ struct LaunchKernel {
+     return static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+   }
+ 
++  auto enable_pdl(bool enabled = true) -> LaunchKernel& {
++    if (enabled) {
++      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
++      m_config.numAttrs = 1;
++      m_config.attrs = m_attrs;
++    } else {
++      m_config.numAttrs = 0;
++    }
++    return *this;
++  }
++
+   template <typename T, typename... Args>
+   auto operator()(T&& kernel, Args&&... args) const -> void {
+     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+@@ -142,7 +172,7 @@ struct LaunchKernel {
+ 
+   cudaLaunchConfig_t m_config;
+   const DebugInfo m_location;
+-  /// TODO: We can add a queue to store the attributes (e.g. for PDL) if needed in the future.
++  cudaLaunchAttribute m_attrs[1];
+ };
+ 
+ }  // namespace host
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/warp.cuh b/python/sglang/jit_kernel/include/sgl_kernel/warp.cuh
+new file mode 100644
+index 000000000000..e18b6bd95242
+--- /dev/null
++++ b/python/sglang/jit_kernel/include/sgl_kernel/warp.cuh
+@@ -0,0 +1,14 @@
++#pragma once
++
++// Some warp primitives
++namespace device::warp {
++
++template <typename T>
++__always_inline __device__ T reduce_sum(T val, uint32_t active_mask = 0xffffffff) {
++#pragma unroll
++  for (int mask = 16; mask > 0; mask >>= 1)
++    val += __shfl_xor_sync(active_mask, val, mask, 32);
++  return val;
++}
++
++}  // namespace device::warp
+diff --git a/python/sglang/jit_kernel/norm.py b/python/sglang/jit_kernel/norm.py
+new file mode 100644
+index 000000000000..b5ed6df47c3d
+--- /dev/null
++++ b/python/sglang/jit_kernel/norm.py
+@@ -0,0 +1,55 @@
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING
++
++import torch
++
++from sglang.jit_kernel.utils import (
++    cache_once,
++    is_arch_support_pdl,
++    load_jit,
++    make_cpp_args,
++)
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++
++@cache_once
++def _jit_norm_module(head_dims: int) -> Module:
++    args = make_cpp_args(head_dims, is_arch_support_pdl())
++    return load_jit(
++        "norm",
++        *args,
++        cuda_files=["norm.cuh"],
++        cuda_wrappers=[("qknorm", f"QKNormKernel<{args}>::run")],
++    )
++
++
++@cache_once
++def can_use_fused_inplace_qknorm(head_dim: int) -> bool:
++    logger = logging.getLogger(__name__)
++    if head_dim not in [64, 128, 256]:
++        logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
++        return False
++    try:
++        _jit_norm_module(head_dim)
++        return True
++    except Exception as e:
++        logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
++        return False
++
++
++def fused_inplace_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    eps: float = 1e-6,
++    *,
++    head_dim: int = 0,
++) -> None:
++    head_dim = head_dim or q.size(-1)
++    module = _jit_norm_module(head_dim)
++    module.qknorm(q, k, q_weight, k_weight, eps)
+diff --git a/python/sglang/jit_kernel/tests/test_qknorm.py b/python/sglang/jit_kernel/tests/test_qknorm.py
+new file mode 100644
+index 000000000000..8fb8f1ba7baa
+--- /dev/null
++++ b/python/sglang/jit_kernel/tests/test_qknorm.py
+@@ -0,0 +1,85 @@
++import torch
++import triton
++
++
++def sglang_aot_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from sgl_kernel import rmsnorm
++
++    head_dim = q.shape[-1]
++    q = q.view(-1, head_dim)
++    k = k.view(-1, head_dim)
++    rmsnorm(q, q_weight, out=q)
++    rmsnorm(k, k_weight, out=k)
++
++
++def sglang_jit_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from sglang.jit_kernel.norm import fused_inplace_qknorm
++
++    fused_inplace_qknorm(q, k, q_weight, k_weight)
++
++
++def flashinfer_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++) -> None:
++    from flashinfer.norm import rmsnorm
++
++    rmsnorm(q, q_weight, out=q)
++    rmsnorm(k, k_weight, out=k)
++
++
++@torch.compile()
++def torch_impl_qknorm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    eps: float = 1e-6,
++) -> None:
++    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
++    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
++    q_norm = (q_mean + eps).rsqrt()
++    k_norm = (k_mean + eps).rsqrt()
++    q.copy_(q.float() * q_norm * q_weight.float())
++    k.copy_(k.float() * k_norm * k_weight.float())
++
++
++# NOTE(dark): sgl_kernel use flashinfer template, which is bitwise identical to flashinfer impl.
++# However, sgl-jit-kernel, flashinfer, torch_impl, may have small numerical differences.
++# so we allow a small rel/abs tolerance in correctness test.
++def main():
++    N_K = 2
++    N_Q = 16
++    DEVICE = "cuda"
++    DTYPE = torch.bfloat16
++    BS_LIST = [2**n for n in range(0, 15)]
++    BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
++    for HEAD_DIM in [64, 128, 256]:
++        for BS in BS_LIST:
++            q = torch.randn(BS, N_Q, HEAD_DIM, device=DEVICE, dtype=DTYPE)
++            k = torch.randn(BS, N_K, HEAD_DIM, device=DEVICE, dtype=DTYPE)
++            q_weight = torch.randn(HEAD_DIM, device=DEVICE, dtype=DTYPE)
++            k_weight = torch.randn(HEAD_DIM, device=DEVICE, dtype=DTYPE)
++            q_k_aot = (q.clone(), k.clone())
++            q_k_jit = (q.clone(), k.clone())
++            sglang_aot_qknorm(q_k_aot[0], q_k_aot[1], q_weight, k_weight)
++            sglang_jit_qknorm(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
++            triton.testing.assert_close(q_k_aot[0], q_k_jit[0], atol=1e-2, rtol=1e-2)
++            triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
++        print(f"HEAD_DIM={HEAD_DIM} correctness test passed.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/jit_kernel/utils.py b/python/sglang/jit_kernel/utils.py
+index 46390c161498..07bd75906bd7 100644
+--- a/python/sglang/jit_kernel/utils.py
++++ b/python/sglang/jit_kernel/utils.py
+@@ -1,8 +1,25 @@
+ from __future__ import annotations
+ 
++import functools
++import inspect
+ import pathlib
+ from functools import lru_cache
+-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Callable,
++    List,
++    Optional,
++    Tuple,
++    TypeAlias,
++    TypeVar,
++    Union,
++    overload,
++)
++
++import torch
++
++from sglang.srt.utils.common import direct_register_custom_op
+ 
+ if TYPE_CHECKING:
+     from tvm_ffi import Module
+@@ -131,3 +148,134 @@ def load_jit(
+         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+         build_directory=build_directory,
+     )
++
++
++F = TypeVar("F", bound=Callable[..., Any])
++
++
++def cache_once(fn: F) -> F:
++    """
++    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
++    So we manually implement a simple cache_once decorator to replace it.
++    """
++    result_map = {}
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
++        if key not in result_map:
++            result_map[key] = fn(*args, **kwargs)
++        return result_map[key]
++
++    return wrapper  # type: ignore
++
++
++@cache_once
++def is_arch_support_pdl() -> bool:
++    import torch
++
++    device = torch.cuda.current_device()
++    return torch.cuda.get_device_capability(device)[0] >= 9
++
++
++def fake_inplace_impl(*args, **kwargs) -> None:
++    pass
++
++
++@overload
++def register_jit_op(
++    fn: F,
++    *,
++    op_name: Optional[str] = None,
++    out_list: Optional[List[int]] = None,
++    out_args: Optional[List[str]] = None,
++    fake_impl: Optional[Callable] = fake_inplace_impl,
++) -> F: ...
++
++
++@overload
++def register_jit_op(
++    *,
++    op_name: Optional[str] = None,
++    out_list: Optional[List[int]] = None,
++    out_args: Optional[List[str]] = None,
++    fake_impl: Optional[Callable] = fake_inplace_impl,
++) -> Callable[[F], F]: ...
++
++
++# Real implementation
++def register_jit_op(
++    fn=None,
++    *,
++    op_name: Optional[str] = None,
++    out_list: Optional[List[int]] = None,
++    out_args: Optional[List[str]] = None,
++    fake_impl: Optional[Callable] = fake_inplace_impl,
++) -> Any:
++    """
++    A decorator to register a JIT custom operator.
++
++    Example usage:
++    ```python
++    @register_jit_op(op_name="my_op", out_list=[0])
++    def my_inplace_op(x: torch.Tensor) -> None:
++        x.add_(1)
++
++    def fake_impl(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++        return x + y
++
++    @register_jit_op(op_name="my_op2", out_args=["x"], fake_impl=fake_impl)
++    def my_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++        return x.add_(y)
++    ```
++
++    :param fn: The function to be registered as a JIT custom operator.
++               If None, return a decorator.
++    :type fn: Callable
++    :param op_name: The name of the operator. If None, use the function name
++    :type op_name: Optional[str]
++    :param out_list: A list of argument indices that are mutated in-place.
++    :type out_list: Optional[List[int]]
++    :param out_args: A list of argument names that are mutated in-place.
++    :type out_args: Optional[List[str]]
++    :param fake_impl: A fake implementation for the operator, used for
++                      torch.compile compatibility.
++                      By default, a no-op function is used, which suits
++                      for most in-place operations.
++    :type fake_impl: Optional[Callable]
++    :return: The registered JIT custom operator, or a decorator.
++             NOTE: the real register will occur at the first call of the function.
++    :rtype: Callable
++    """
++
++    def decorator(fn):
++        real_impl = None
++        resolved_name = op_name or fn.__name__
++
++        @functools.wraps(fn)
++        def wrapper(*args, **kwargs):
++            nonlocal real_impl
++            if real_impl is None:
++                if not hasattr(torch.ops.sglang, resolved_name):
++                    signature = inspect.signature(fn)
++                    mutates_args = []
++                    param_names = list(signature.parameters.keys())
++                    for id in out_list or []:
++                        mutates_args.append(param_names[id])
++                    for name in out_args or []:
++                        mutates_args.append(name)
++                    mutates_args = list(set(mutates_args))
++                    direct_register_custom_op(
++                        op_name=resolved_name,
++                        op_func=fn,
++                        mutates_args=mutates_args,
++                        fake_impl=fake_impl,
++                    )
++                real_impl = getattr(torch.ops.sglang, resolved_name)
++            return real_impl(*args, **kwargs)
++
++        return wrapper
++
++    if fn is not None:
++        return decorator(fn)
++    return decorator
+diff --git a/python/sglang/srt/models/bailing_moe.py b/python/sglang/srt/models/bailing_moe.py
+index 3fed3528d8f9..c353a0cd9177 100644
+--- a/python/sglang/srt/models/bailing_moe.py
++++ b/python/sglang/srt/models/bailing_moe.py
+@@ -75,6 +75,7 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.utils import (
++    apply_qk_norm,
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+@@ -507,28 +508,6 @@ def __init__(
+ 
+         self.alt_stream = alt_stream
+ 
+-    def _apply_qk_norm(
+-        self, q: torch.Tensor, k: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # overlap qk norm
+-        if self.alt_stream is not None and get_is_capture_mode():
+-            current_stream = torch.cuda.current_stream()
+-            self.alt_stream.wait_stream(current_stream)
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.query_layernorm(q_by_head)
+-            with torch.cuda.stream(self.alt_stream):
+-                k_by_head = k.reshape(-1, self.head_dim)
+-                k_by_head = self.key_layernorm(k_by_head)
+-            current_stream.wait_stream(self.alt_stream)
+-        else:
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.query_layernorm(q_by_head)
+-            k_by_head = k.reshape(-1, self.head_dim)
+-            k_by_head = self.key_layernorm(k_by_head)
+-        q = q_by_head.view(q.shape)
+-        k = k_by_head.view(k.shape)
+-        return q, k
+-
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -540,7 +519,14 @@ def forward(
+         qkv, _ = self.query_key_value(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         if self.use_qk_norm:
+-            q, k = self._apply_qk_norm(q, k)
++            q, k = apply_qk_norm(
++                q=q,
++                k=k,
++                q_norm=self.query_layernorm,
++                k_norm=self.key_layernorm,
++                head_dim=self.head_dim,
++                alt_stream=self.alt_stream,
++            )
+         q, k = self.rotary_emb(
+             positions,
+             q,
+diff --git a/python/sglang/srt/models/glm4_moe.py b/python/sglang/srt/models/glm4_moe.py
+index 0e8c9cf79a2d..be71d0d28167 100644
+--- a/python/sglang/srt/models/glm4_moe.py
++++ b/python/sglang/srt/models/glm4_moe.py
+@@ -75,6 +75,7 @@
+ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.models.utils import apply_qk_norm
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+@@ -250,28 +251,6 @@ def __init__(
+             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+         self.alt_stream = alt_stream
+ 
+-    def _apply_qk_norm(
+-        self, q: torch.Tensor, k: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # overlap qk norm
+-        if self.alt_stream is not None and get_is_capture_mode():
+-            current_stream = torch.cuda.current_stream()
+-            self.alt_stream.wait_stream(current_stream)
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            with torch.cuda.stream(self.alt_stream):
+-                k_by_head = k.reshape(-1, self.head_dim)
+-                k_by_head = self.k_norm(k_by_head)
+-            current_stream.wait_stream(self.alt_stream)
+-        else:
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            k_by_head = k.reshape(-1, self.head_dim)
+-            k_by_head = self.k_norm(k_by_head)
+-        q = q_by_head.view(q.shape)
+-        k = k_by_head.view(k.shape)
+-        return q, k
+-
+     def op_prepare(self, state):
+         state.attn_intermediate_state = self.forward_prepare(
+             positions=state.positions,
+@@ -295,7 +274,14 @@ def forward_prepare(
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         if self.use_qk_norm:
+-            q, k = self._apply_qk_norm(q, k)
++            q, k = apply_qk_norm(
++                q=q,
++                k=k,
++                q_norm=self.q_norm,
++                k_norm=self.k_norm,
++                head_dim=self.head_dim,
++                alt_stream=self.alt_stream,
++            )
+         q, k = self.rotary_emb(positions, q, k)
+         inner_state = q, k, v, forward_batch
+         return None, forward_batch, inner_state
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index 94d7712245bf..8cf8902d02c1 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -71,6 +71,7 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.utils import (
++    apply_qk_norm,
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+@@ -492,28 +493,6 @@ def __init__(
+ 
+         self.alt_stream = alt_stream
+ 
+-    def _apply_qk_norm(
+-        self, q: torch.Tensor, k: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # overlap qk norm
+-        if self.alt_stream is not None and get_is_capture_mode():
+-            current_stream = torch.cuda.current_stream()
+-            self.alt_stream.wait_stream(current_stream)
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.query_layernorm(q_by_head)
+-            with torch.cuda.stream(self.alt_stream):
+-                k_by_head = k.reshape(-1, self.head_dim)
+-                k_by_head = self.key_layernorm(k_by_head)
+-            current_stream.wait_stream(self.alt_stream)
+-        else:
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.query_layernorm(q_by_head)
+-            k_by_head = k.reshape(-1, self.head_dim)
+-            k_by_head = self.key_layernorm(k_by_head)
+-        q = q_by_head.view(q.shape)
+-        k = k_by_head.view(k.shape)
+-        return q, k
+-
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -525,7 +504,14 @@ def forward(
+         qkv, _ = self.query_key_value(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         if self.use_qk_norm:
+-            q, k = self._apply_qk_norm(q, k)
++            q, k = apply_qk_norm(
++                q=q,
++                k=k,
++                q_norm=self.query_layernorm,
++                k_norm=self.key_layernorm,
++                head_dim=self.head_dim,
++                alt_stream=self.alt_stream,
++            )
+         q, k = self.rotary_emb(
+             positions,
+             q,
+diff --git a/python/sglang/srt/models/qwen3.py b/python/sglang/srt/models/qwen3.py
+index 1a05618ab864..f41235e218cd 100644
+--- a/python/sglang/srt/models/qwen3.py
++++ b/python/sglang/srt/models/qwen3.py
+@@ -21,7 +21,6 @@
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import (
+     default_weight_loader,
+@@ -29,6 +28,7 @@
+ )
+ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
+ from sglang.srt.models.qwen2 import Qwen2Model
++from sglang.srt.models.utils import apply_qk_norm
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import add_prefix, is_cuda, is_npu
+ 
+@@ -138,32 +138,17 @@ def __init__(
+         )
+         self.alt_stream = alt_stream
+ 
+-    def _apply_qk_norm(
+-        self, q: torch.Tensor, k: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # overlap qk norm
+-        if self.alt_stream is not None and get_is_capture_mode():
+-            current_stream = torch.cuda.current_stream()
+-            self.alt_stream.wait_stream(current_stream)
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            with torch.cuda.stream(self.alt_stream):
+-                k_by_head = k.reshape(-1, self.head_dim)
+-                k_by_head = self.k_norm(k_by_head)
+-            current_stream.wait_stream(self.alt_stream)
+-        else:
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            k_by_head = k.reshape(-1, self.head_dim)
+-            k_by_head = self.k_norm(k_by_head)
+-        q = q_by_head.view(q.shape)
+-        k = k_by_head.view(k.shape)
+-        return q, k
+-
+     def forward_prepare_native(self, positions, hidden_states):
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+-        q, k = self._apply_qk_norm(q, k)
++        q, k = apply_qk_norm(
++            q=q,
++            k=k,
++            q_norm=self.q_norm,
++            k_norm=self.k_norm,
++            head_dim=self.head_dim,
++            alt_stream=self.alt_stream,
++        )
+         q, k = self.rotary_emb(positions, q, k)
+         return q, k, v
+ 
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index fd02e378232b..d88896bab457 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -57,12 +57,12 @@
+ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+ from sglang.srt.layers.utils import get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
+ from sglang.srt.models.qwen2_moe import Qwen2MoeModel
+ from sglang.srt.models.utils import (
++    apply_qk_norm,
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+@@ -498,31 +498,6 @@ def __init__(
+         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+         self.alt_stream = alt_stream
+ 
+-    def _apply_qk_norm(
+-        self, q: torch.Tensor, k: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # overlap qk norm
+-        if self.alt_stream is not None and get_is_capture_mode():
+-            current_stream = torch.cuda.current_stream()
+-            self.alt_stream.wait_stream(current_stream)
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            with torch.cuda.stream(self.alt_stream):
+-                k_by_head = k.reshape(-1, self.head_dim)
+-                k_by_head = self.k_norm(k_by_head)
+-            current_stream.wait_stream(self.alt_stream)
+-            q = q_by_head.view(q.shape)
+-            k = k_by_head.view(k.shape)
+-            return q, k
+-        else:
+-            q_by_head = q.reshape(-1, self.head_dim)
+-            q_by_head = self.q_norm(q_by_head)
+-            k_by_head = k.reshape(-1, self.head_dim)
+-            k_by_head = self.k_norm(k_by_head)
+-        q = q_by_head.view(q.shape)
+-        k = k_by_head.view(k.shape)
+-        return q, k
+-
+     def op_prepare(self, state):
+         state.attn_intermediate_state = self.forward_prepare(
+             positions=state.positions,
+@@ -604,7 +579,14 @@ def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+         else:
+             # Fallback to non-fused QK Norm & RoPE implementation
+             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+-            q, k = self._apply_qk_norm(q, k)
++            q, k = apply_qk_norm(
++                q=q,
++                k=k,
++                q_norm=self.q_norm,
++                k_norm=self.k_norm,
++                head_dim=self.head_dim,
++                alt_stream=self.alt_stream,
++            )
+             q, k = self.rotary_emb(
+                 positions,
+                 q,
+diff --git a/python/sglang/srt/models/utils.py b/python/sglang/srt/models/utils.py
+index a536a55a8aa6..d27fd44eec31 100644
+--- a/python/sglang/srt/models/utils.py
++++ b/python/sglang/srt/models/utils.py
+@@ -11,24 +11,27 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ # ==============================================================================
++from __future__ import annotations
+ 
+ from collections.abc import Iterable, Mapping
+ from dataclasses import dataclass, field
+ from functools import lru_cache
+-from typing import Any, Optional
++from typing import TYPE_CHECKING, Any, Optional, Tuple
+ 
+ import numpy as np
+ import torch
+ 
++from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
++from sglang.jit_kernel.utils import register_jit_op
++from sglang.srt.environ import envs
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.utils import is_cuda
+ 
+-_is_cuda = is_cuda()
+-
++if TYPE_CHECKING:
++    from sglang.srt.layers.layernorm import RMSNorm
+ 
+-if _is_cuda:
+-    from sgl_kernel import FusedSetKVBufferArg
++_is_cuda = is_cuda()
+ 
+ WeightsMapping = Mapping[str, Optional[str]]
+ """If a key maps to a value of `None`, the corresponding weight is ignored."""
+@@ -113,6 +116,8 @@ def create_fused_set_kv_buffer_arg(
+     layer: RadixAttention,
+     forward_batch: ForwardBatch,
+ ):
++    from sgl_kernel import FusedSetKVBufferArg
++
+     layer_id = layer.layer_id
+     token_to_kv_pool = forward_batch.token_to_kv_pool
+ 
+@@ -191,3 +196,73 @@ def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+         wpos_ids = wpos_ids.flatten()
+ 
+         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
++
++
++def apply_qk_norm(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_norm: RMSNorm,
++    k_norm: RMSNorm,
++    head_dim: int,
++    alt_stream: Optional[torch.cuda.Stream] = None,
++    allow_inplace: bool = True,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Apply QK normalization for query and key tensors.
++    If eligible, we will use JIT fused inplace QK normalization for better performance.
++
++    Args:
++        q: Query tensor of shape [batch_size, ...]
++        k: Key tensor of shape [batch_size, ...]
++        q_norm: RMSNorm layer for query normalization
++        k_norm: RMSNorm layer for key normalization
++        head_dim: Dimension of each attention head
++        alt_stream: Optional alternative CUDA stream for overlapping computation
++        allow_inplace: Whether to allow inplace normalization. (True for better performance)
++
++    Returns:
++        Tuple of normalized query and key tensors
++    """
++    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
++
++    batch_size = q.size(0)
++    q_eps = q_norm.variance_epsilon
++    k_eps = k_norm.variance_epsilon
++    if (
++        _is_cuda  # TODO(dark): have not tested on ROCm or other backends
++        and allow_inplace  # TODO(dark): this can be relaxed if needed
++        and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
++        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++        and can_use_fused_inplace_qknorm(head_dim)
++    ):
++        fused_inplace_qknorm(
++            q=q.view(batch_size, -1, head_dim),
++            k=k.view(batch_size, -1, head_dim),
++            q_weight=q_norm.weight,
++            k_weight=k_norm.weight,
++            head_dim=head_dim,
++            eps=q_eps,
++        )
++        return q, k
++
++    if alt_stream is not None and get_is_capture_mode():
++        current_stream = torch.cuda.current_stream()
++        alt_stream.wait_stream(current_stream)
++        q_by_head = q.reshape(-1, head_dim)
++        q_by_head = q_norm(q_by_head)
++        with torch.cuda.stream(alt_stream):
++            k_by_head = k.reshape(-1, head_dim)
++            k_by_head = k_norm(k_by_head)
++        current_stream.wait_stream(alt_stream)
++    else:
++        q_by_head = q.reshape(-1, head_dim)
++        q_by_head = q_norm(q_by_head)
++        k_by_head = k.reshape(-1, head_dim)
++        k_by_head = k_norm(k_by_head)
++    q = q_by_head.view(q.shape)
++    k = k_by_head.view(k.shape)
++    return q, k
++
++
++# Register the inplace op
++fused_inplace_qknorm = register_jit_op(fused_inplace_qknorm, out_args=["q", "k"])

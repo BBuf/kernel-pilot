@@ -1,0 +1,10 @@
+add_proton_library(ProtonDriver
+  Device.cpp
+  GPU/CudaApi.cpp
+  GPU/CuptiApi.cpp
+  GPU/HipApi.cpp
+  GPU/HsaApi.cpp
+  GPU/NvtxApi.cpp
+  GPU/RoctracerApi.cpp
+  GPU/RocprofApi.cpp
+)

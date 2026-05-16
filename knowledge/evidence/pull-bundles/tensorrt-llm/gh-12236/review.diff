@@ -1,0 +1,2589 @@
+diff --git a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+index ea19d21a02c4..2e3443ec739c 100644
+--- a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
++++ b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+@@ -11,6 +11,7 @@
+     MLAParams, PositionalEmbeddingParams)
+ from tensorrt_llm._torch.attention_backend.trtllm import (
+     TrtllmAttention, TrtllmAttentionMetadata)
++from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+ from tensorrt_llm._torch.distributed.ops import allgather
+ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
+ from tensorrt_llm._torch.modules.linear import Linear
+@@ -1025,8 +1026,18 @@ def __init__(self,
+         self.scale_fmt = "ue8m0"
+         self.aux_stream = aux_stream
+         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
++        self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
++                                  and IS_CUTLASS_DSL_AVAILABLE)
+         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+ 
++        if self.use_cute_dsl_topk and layer_idx == 0:
++            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
++
++            # the dtype of topk input tensor, which is float32 now.
++            # Note, need to update it if the dtype of topk input tensor is changed.
++            cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
++                dtype=torch.float32, top_k=self.index_topk)
++
+     def post_load_weights(self):
+         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
+@@ -1644,10 +1655,23 @@ def sparse_attn_indexer(
+                 # This is because rowEnd = seq_len - next_n + offset + 1
+                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
+                     num_contexts:num_contexts + num_generations]
+-                torch.ops.trtllm.indexer_topk_decode(
+-                    logits_decode, gen_kv_lens_cuda,
+-                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+-                                        num_gen_tokens, :], next_n)
++                # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
++                # memory. Beyond 256 tokens the extra memory becomes significant,
++                # so we cap it at 256 for now and fall back to the CUDA C++
++                # indexer_topk_decode. This limit can be removed if GPU memory
++                # is not a bottleneck.
++                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
++                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
++                        logits_decode, gen_kv_lens_cuda,
++                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
++                                            num_gen_tokens, :], self.index_topk,
++                        next_n)
++                else:
++                    torch.ops.trtllm.indexer_topk_decode(
++                        logits_decode, gen_kv_lens_cuda,
++                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
++                                            num_gen_tokens, :], next_n,
++                        self.index_topk)
+             else:
+                 # padded
+                 positions = torch.arange(
+diff --git a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+index d6f616088951..14f1e8b55f2d 100644
+--- a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+@@ -320,6 +320,10 @@ def get_dense_gemm_approximate_cta_nums(
+         Sm100BlockScaledPersistentDenseGemmKernel
+     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+         FilteredTopKKernelVarlenDecode
++    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
++        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
++    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
++        SinglePassMultiCTARadixTopKKernel
+     from ..cute_dsl_kernels.blackwell.utils import make_ptr
+ 
+     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+@@ -2824,6 +2828,30 @@ def _get_num_sms() -> int:
+         torch.float32: cutlass.Float32,
+     }
+ 
++    def _get_or_alloc_buffer(buffer_cache, key, shape, dtype, device="cuda"):
++        """Get cached buffer or allocate a new one, growing if needed.
++
++        Buffers only grow, never shrink, to maintain stable addresses for
++        CUDA Graph capture/replay. Returns a slice of the cached buffer
++        matching the requested shape.
++        """
++        buf = buffer_cache.get(key)
++        need_realloc = (buf is None or buf.dtype != dtype
++                        or any(b < s for b, s in zip(buf.shape, shape)))
++        if need_realloc:
++            # Grow: take element-wise max of old and new shape
++            if buf is not None:
++                alloc_shape = tuple(max(b, s) for b, s in zip(buf.shape, shape))
++            else:
++                alloc_shape = shape
++            buffer_cache[key] = torch.empty(alloc_shape,
++                                            dtype=dtype,
++                                            device=device)
++            buf = buffer_cache[key]
++        # Slice each dim to the requested size
++        slices = tuple(slice(0, s) for s in shape)
++        return buf[slices]
++
+     class CuteDSLTopKDecodeSingleCTARunner:
+         """Runner for CuTE DSL Top-K decode kernel (single CTA version).
+ 
+@@ -2849,6 +2877,7 @@ class CuteDSLTopKDecodeSingleCTARunner:
+             - Automatically selects occupancy optimization based on batch size
+         """
+         kernel_cache = dict()
++        buffer_cache = dict()
+ 
+         @classmethod
+         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
+@@ -2942,6 +2971,7 @@ def forward(
+             return_val: bool = False,
+             num_copy_bits: int = 256,
+             load_balance: bool = False,
++            output_indices: Optional[torch.Tensor] = None,
+         ):
+             """Execute filtered top-k selection on input logits."""
+             torch_dtype = input_values.dtype
+@@ -2952,7 +2982,6 @@ def forward(
+             num_sms = _get_num_sms()
+             large_occupancy = num_rows > num_sms
+ 
+-            # Compilation key
+             key = (
+                 dtype,
+                 bucketed_num_cols,
+@@ -2963,55 +2992,40 @@ def forward(
+                 load_balance,
+                 large_occupancy,
+             )
+-
+-            if key not in cls.kernel_cache:
+-                cls._compile(
+-                    dtype,
+-                    bucketed_num_cols,
+-                    top_k,
+-                    next_n,
+-                    return_val,
+-                    num_copy_bits,
+-                    load_balance,
+-                    large_occupancy,
+-                )
++            cls._compile(*key)
+             compiled_kernel = cls.kernel_cache[key]
+ 
+             # Prepare output tensors
+-            output_indices_torch = torch.empty(num_rows,
+-                                               top_k,
+-                                               dtype=torch.int32,
+-                                               device="cuda")
++            if output_indices is not None:
++                output_indices_torch = output_indices
++            else:
++                output_indices_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "output_indices", (num_rows, top_k),
++                    torch.int32)
+             if return_val:
+-                output_values_torch = torch.empty(num_rows,
+-                                                  top_k,
+-                                                  dtype=torch_dtype,
+-                                                  device="cuda")
++                output_values_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "output_values", (num_rows, top_k),
++                    torch_dtype)
+             else:
+                 output_values_torch = None
+ 
+             # Prepare buffer
++            # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
++            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
++            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
+             if dtype == cutlass.Float32:
+                 buffer_numbers = 2
+             else:
+                 buffer_numbers = 1
+-            buffer_bytes = num_rows * buffer_numbers * num_cols * 4
+-            if buffer_bytes > 1 << 30:  # > 1 GB
+-                logger.warning(
+-                    f"CuTE DSL top-k: intermediate buffer is {buffer_bytes / (1 << 30):.1f} GB "
+-                    f"(num_rows={num_rows}, num_cols={num_cols}). "
+-                    "Consider reducing batch size or vocab size to avoid OOM.")
+-            buffer_torch = torch.empty(num_rows,
+-                                       buffer_numbers,
+-                                       num_cols,
+-                                       dtype=torch.int32,
+-                                       device="cuda")
+-
++            buffer_torch = _get_or_alloc_buffer(
++                cls.buffer_cache, "buffer",
++                (num_rows, buffer_numbers, bucketed_num_cols), torch.int32)
++            buffer_torch = buffer_torch[:, :, :num_cols]
+             # Prepare global counter for persistent dynamic scheduling
+             if load_balance:
+-                g_global_counter_torch = torch.zeros(1,
+-                                                     dtype=torch.int32,
+-                                                     device="cuda")
++                g_global_counter_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "g_global_counter", (1, ), torch.int32)
++                g_global_counter_torch.zero_()
+             else:
+                 g_global_counter_torch = None
+ 
+@@ -3149,11 +3163,11 @@ class CuteDSLTopKDecodeMultiCTARunner:
+             - Automatically selects occupancy optimization based on batch size
+         """
+         kernel_cache = dict()
++        buffer_cache = dict()
+ 
+         @classmethod
+         def _compile(cls,
+                      dtype,
+-                     bucketed_num_cols,
+                      top_k,
+                      next_n,
+                      return_val,
+@@ -3166,14 +3180,12 @@ def _compile(cls,
+             """Compile and cache multi-CTA top-k kernels for the given config."""
+             key = (
+                 dtype,
+-                bucketed_num_cols,
+                 top_k,
+                 next_n,
+                 return_val,
+                 num_copy_bits,
+                 load_balance,
+                 large_occupancy,
+-                True,
+                 chunk_size_per_cta,
+                 num_ctas_per_row,
+                 dynamic,
+@@ -3305,12 +3317,12 @@ def forward(
+             num_copy_bits: int = 256,
+             chunk_size_per_cta: int = 16384,
+             dynamic: bool = True,
++            output_indices: Optional[torch.Tensor] = None,
+         ):
+             """Execute multi-CTA filtered top-k selection on input logits."""
+             torch_dtype = input_values.dtype
+             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+             num_rows, num_cols = input_values.shape
+-            bucketed_num_cols = next_positive_power_of_2(num_cols)
+ 
+             num_sms = _get_num_sms()
+             large_occupancy = num_rows > num_sms
+@@ -3319,37 +3331,19 @@ def forward(
+             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
+             merge_cols = num_ctas_per_row * top_k
+ 
+-            # Compilation key (use bucketed_num_cols to reduce recompilations;
+-            # include num_ctas_per_row since it depends on actual num_cols)
+             key = (
+                 dtype,
+-                bucketed_num_cols,
+                 top_k,
+                 next_n,
+                 return_val,
+                 num_copy_bits,
+                 load_balance,
+                 large_occupancy,
+-                True,  # enable_multi_cta
+                 chunk_size_per_cta,
+                 num_ctas_per_row,
+                 dynamic,
+             )
+-
+-            if key not in cls.kernel_cache:
+-                cls._compile(
+-                    dtype,
+-                    bucketed_num_cols,
+-                    top_k,
+-                    next_n,
+-                    return_val,
+-                    num_copy_bits,
+-                    load_balance,
+-                    large_occupancy,
+-                    chunk_size_per_cta,
+-                    num_ctas_per_row,
+-                    dynamic,
+-                )
++            cls._compile(*key)
+             compiled_kernel_first, compiled_kernel_second = \
+                 cls.kernel_cache[key]
+ 
+@@ -3358,114 +3352,316 @@ def forward(
+             else:
+                 buffer_numbers = 1
+ 
+-            if dynamic:
+-                # Dynamic mode: 2D grid (num_rows, num_ctas_per_row) with
+-                # per-CTA early exit for rows needing fewer chunks.
+-                # Intermediate buffers: 2D (num_rows, merge_cols)
+-                first_output_indices = torch.empty(num_rows,
+-                                                   merge_cols,
+-                                                   dtype=torch.int32,
+-                                                   device="cuda")
+-                first_output_values = torch.empty(num_rows,
+-                                                  merge_cols,
+-                                                  dtype=torch_dtype,
+-                                                  device="cuda")
+-
+-                # Shared buffer for both kernels (they run sequentially)
+-                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+-                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+-                                           buffer_numbers,
+-                                           buffer_dim2,
+-                                           dtype=torch.int32,
+-                                           device="cuda")
+-
+-                # Final output tensors
+-                output_indices_torch = torch.empty(num_rows,
+-                                                   top_k,
+-                                                   dtype=torch.int32,
+-                                                   device="cuda")
+-                if return_val:
+-                    output_values_torch = torch.empty(num_rows,
+-                                                      top_k,
+-                                                      dtype=torch_dtype,
+-                                                      device="cuda")
+-                else:
+-                    output_values_torch = None
+-
+-                # Execute first kernel: per-chunk top-k with early exit
+-                compiled_kernel_first(
+-                    input_values,
+-                    None,  # indices
+-                    buffer_torch,
+-                    None,  # g_global_counter_torch
+-                    seq_lens,
+-                    first_output_indices,
+-                    first_output_values,
+-                )
++            # Intermediate buffers for first kernel output
++            first_output_indices = _get_or_alloc_buffer(cls.buffer_cache,
++                                                        "first_output_indices",
++                                                        (num_rows, merge_cols),
++                                                        torch.int32)
++            first_output_values = _get_or_alloc_buffer(cls.buffer_cache,
++                                                       "first_output_values",
++                                                       (num_rows, merge_cols),
++                                                       torch_dtype)
++
++            # Shared buffer for both kernels (they run sequentially)
++            buffer_dim2 = max(chunk_size_per_cta, merge_cols)
++            buffer_torch = _get_or_alloc_buffer(
++                cls.buffer_cache, "buffer",
++                (num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2),
++                torch.int32)
++
++            # Final output tensors
++            if output_indices is not None:
++                output_indices_torch = output_indices
++            else:
++                output_indices_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "output_indices", (num_rows, top_k),
++                    torch.int32)
++            if return_val:
++                output_values_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "output_values", (num_rows, top_k),
++                    torch_dtype)
++            else:
++                output_values_torch = None
++
++            # Execute first kernel: per-chunk top-k
++            compiled_kernel_first(
++                input_values,
++                None,  # indices
++                buffer_torch,
++                None,  # g_global_counter_torch
++                seq_lens,
++                first_output_indices,
++                first_output_values,
++            )
++
++            # Execute second kernel: merge partial results
++            compiled_kernel_second(
++                first_output_values,
++                first_output_indices,
++                buffer_torch,
++                None,  # g_global_counter_torch
++                seq_lens,
++                output_indices_torch,
++                output_values_torch,
++            )
++
++            return output_indices_torch, output_values_torch
++
++    class CuteDSLTopKDecodeSinglePassMultiCTARunner:
++        """Runner for single-pass multi-CTA radix top-k (FlashInfer-style fused multi-CTA).
++
++        All CTAs in a group cooperatively find the global pivot via multi-round
++        radix select with global histogram merging, then each CTA collects
++        results from its own chunk.  Single kernel launch, no intermediate
++        buffer, no merge kernel.
++
++        All methods are class-level — no instantiation needed.
++
++        Attributes:
++            kernel_cache: Class-level dict mapping config tuples to compiled
++                         kernels.
++        """
++        kernel_cache = dict()
++        # buffer_cache is used to cache the row_states and output buffers.
++        buffer_cache = dict()
+ 
+-                # Execute second kernel: varlen merge (reuses buffer_torch)
+-                # merge_width computed in-kernel from seqlen.
+-                compiled_kernel_second(
+-                    first_output_values,
+-                    first_output_indices,
+-                    buffer_torch,
+-                    None,  # g_global_counter_torch
+-                    seq_lens,
+-                    output_indices_torch,
+-                    output_values_torch,
++        @classmethod
++        def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
++                     ctas_per_group, num_sms, return_val):
++            """Compile and cache a single-pass multi-CTA radix top-k kernel."""
++            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
++                   ctas_per_group, num_sms, return_val)
++            if key in cls.kernel_cache:
++                return
++            n_rows = cute.sym_int()
++            n_cols = cute.sym_int()
++            n_batch = cute.sym_int()
++            n_groups = cute.sym_int()
++
++            input_fake = cute.runtime.make_fake_compact_tensor(
++                dtype,
++                (n_rows, n_cols),
++                stride_order=(1, 0),
++                assumed_align=32,
++            )
++            row_states_fake = cute.runtime.make_fake_compact_tensor(
++                cutlass.Int32,
++                (n_groups, DISTRIBUTED_TOPK_STATE_SIZE),
++                stride_order=(1, 0),
++                assumed_align=32,
++            )
++            seqlen_fake = cute.runtime.make_fake_compact_tensor(
++                cutlass.Int32,
++                (n_batch, ),
++                stride_order=(0, ),
++            )
++            output_indices_fake = cute.runtime.make_fake_compact_tensor(
++                cutlass.Int32,
++                (n_rows, top_k),
++                stride_order=(1, 0),
++            )
++            if return_val:
++                output_values_fake = cute.runtime.make_fake_compact_tensor(
++                    dtype,
++                    (n_rows, top_k),
++                    stride_order=(1, 0),
+                 )
+             else:
+-                # Static mode: fixed grid (num_rows, num_ctas_per_row)
+-                # Prepare intermediate output tensors for first kernel
+-                first_kernel_output_indices_torch = torch.empty(
+-                    num_rows, merge_cols, dtype=torch.int32, device="cuda")
+-                first_kernel_output_values_torch = torch.empty(
+-                    num_rows, merge_cols, dtype=torch_dtype, device="cuda")
+-
+-                # Prepare final output tensors
+-                output_indices_torch = torch.empty(num_rows,
+-                                                   top_k,
+-                                                   dtype=torch.int32,
+-                                                   device="cuda")
+-                if return_val:
+-                    output_values_torch = torch.empty(num_rows,
+-                                                      top_k,
+-                                                      dtype=torch_dtype,
+-                                                      device="cuda")
++                output_values_fake = None
++            fake_stream = cute.runtime.make_fake_stream(
++                use_tvm_ffi_env_stream=True)
++
++            kernel_obj = SinglePassMultiCTARadixTopKKernel(
++                dtype=dtype,
++                chunk_size=chunk_size,
++                top_k=top_k,
++                next_n=next_n,
++                num_copy_bits=num_copy_bits,
++                ctas_per_group=ctas_per_group,
++                num_sms=num_sms,
++            )
++            compiled_kernel = cute.compile(
++                kernel_obj,
++                input_fake,
++                row_states_fake,
++                seqlen_fake,
++                output_indices_fake,
++                output_values_fake,
++                stream=fake_stream,
++                options="--enable-tvm-ffi",
++            )
++            cls.kernel_cache[key] = compiled_kernel
++
++        @classmethod
++        def _compute_max_chunk(cls, dtype, num_copy_bits: int = 256):
++            """Compute the maximum chunk_size a single CTA can handle."""
++            max_smem = cutlass.utils.get_smem_capacity_in_bytes()
++            # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
++            # local_histogram[256]*4 + prefix_buf[256]*4 + scalars[4]*4 + warp_sums[8]*4
++            overhead = 256 * 4 * 2 + 4 * 4 + 8 * 4
++            if dtype == cutlass.Float32:
++                ordered_elem_size = 4
++            else:
++                ordered_elem_size = 2
++            vec_size = num_copy_bits // dtype.width
++            max_chunk = (max_smem - overhead) // ordered_elem_size
++            max_chunk = (max_chunk // vec_size) * vec_size
++            return max_chunk, vec_size
++
++        @classmethod
++        def _get_chunk_config(cls,
++                              dtype,
++                              num_cols: int,
++                              chunk_size: Optional[int] = None,
++                              num_copy_bits: int = 256,
++                              num_rows: int = 1):
++            """Resolve chunk_size and ctas_per_group.
++
++            If chunk_size is provided, use it (clamped and aligned).
++            Otherwise use an SM-aware heuristic that targets
++            total_ctas ≈ num_sms by balancing parallelism against
++            per-CTA reduce overhead.
++
++            Returns:
++                (chunk_size, ctas_per_group, vec_size)
++            """
++            max_chunk, vec_size = cls._compute_max_chunk(dtype, num_copy_bits)
++
++            if chunk_size is not None:
++                # User-specified: clamp and align
++                chunk_size = min(chunk_size, max_chunk)
++                chunk_size = (chunk_size // vec_size) * vec_size
++                if chunk_size < vec_size:
++                    chunk_size = vec_size
++            else:
++                # Auto: SM-aware heuristic
++                num_sms = _get_num_sms()
++
++                # Target total_ctas ≈ num_sms
++                ideal_ctas_per_group = max(1, num_sms // max(num_rows, 1))
++
++                if ideal_ctas_per_group <= 1:
++                    # Large batch: use FlashInfer-style logic —
++                    # minimize ctas_per_group based on max_chunk capacity
++                    ctas_per_group = math.ceil(num_cols / max_chunk)
++                    if ctas_per_group < 1:
++                        ctas_per_group = 1
++                    chunk_size = math.ceil(num_cols / ctas_per_group)
++                    chunk_size = (
++                        (chunk_size + vec_size - 1) // vec_size) * vec_size
++                    if chunk_size > max_chunk:
++                        chunk_size = max_chunk
+                 else:
+-                    output_values_torch = None
+-
+-                # Prepare buffer
+-                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+-                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+-                                           buffer_numbers,
+-                                           buffer_dim2,
+-                                           dtype=torch.int32,
+-                                           device="cuda")
+-
+-                # Execute first kernel: per-chunk top-k
+-                compiled_kernel_first(
+-                    input_values,
+-                    None,  # indices, used for merge blocks kernel
+-                    buffer_torch,
+-                    None,  # g_global_counter_torch
+-                    seq_lens,
+-                    first_kernel_output_indices_torch,
+-                    first_kernel_output_values_torch,
+-                )
++                    chunk_size = math.ceil(num_cols / ideal_ctas_per_group)
+ 
+-                # Execute second kernel: merge partial results
+-                compiled_kernel_second(
+-                    first_kernel_output_values_torch,
+-                    first_kernel_output_indices_torch,
+-                    buffer_torch,
+-                    None,  # g_global_counter_torch
+-                    seq_lens,
+-                    output_indices_torch,
+-                    output_values_torch,
+-                )
++                    # Minimum chunk to avoid per-CTA overhead dominating
++                    chunk_size = max(chunk_size, 8192)
+ 
+-            return output_indices_torch, output_values_torch
++                    # Avoid ctas_per_group=2 with small chunks: reduce
++                    # overhead (~5us) exceeds 2-way parallelism benefit
++                    ctas_per_group = math.ceil(num_cols / chunk_size)
++                    if ctas_per_group == 2 and chunk_size < 32768:
++                        chunk_size = num_cols
++
++                    # Snap to power-of-2 for JIT cache friendliness
++                    snap_up = 1 << math.ceil(math.log2(max(chunk_size, 1)))
++                    if snap_up > max_chunk:
++                        snap_up = 1 << int(math.log2(max_chunk))
++                    chunk_size = snap_up
++
++            ctas_per_group = math.ceil(num_cols / chunk_size)
++            return chunk_size, ctas_per_group, vec_size
++
++        @classmethod
++        def _get_possible_chunk_sizes(cls, dtype, num_copy_bits: int = 256):
++            """Return all possible chunk_size values the auto heuristic can produce.
++
++            These are powers of 2 from 8192 up to the largest power of 2
++            that fits within max_chunk (for the SM-aware multi-CTA path).
++            """
++            max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
++            sizes = []
++            cs = 8192
++            while cs <= max_chunk:
++                sizes.append(cs)
++                cs *= 2
++            return sizes
++
++        @classmethod
++        def forward(
++            cls,
++            input_values: torch.Tensor,
++            seq_lens: torch.Tensor,
++            top_k: int,
++            next_n: int,
++            return_val: bool = False,
++            num_copy_bits: int = 256,
++            chunk_size: Optional[int] = None,
++            output_indices: Optional[torch.Tensor] = None,
++        ):
++            """Execute single-pass multi-CTA radix top-k selection.
++
++            Args:
++                chunk_size: Optional chunk size per CTA. If None, uses the
++                    maximum chunk that fits in shared memory. Smaller values
++                    increase ctas_per_group (more parallelism) at the cost of
++                    more inter-CTA synchronization.
++            """
++            torch_dtype = input_values.dtype
++            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
++            num_rows, num_cols = input_values.shape
++            num_sms = _get_num_sms()
++
++            chunk_size, ctas_per_group, _ = cls._get_chunk_config(
++                dtype, num_cols, chunk_size, num_copy_bits, num_rows=num_rows)
++
++            num_groups = min(num_sms // ctas_per_group, num_rows)
++            if num_groups < 1:
++                num_groups = 1
++
++            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
++                   ctas_per_group, num_sms, return_val)
++            cls._compile(*key)
++            compiled_kernel = cls.kernel_cache[key]
++
++            # Allocate row_states once with num_sms rows — large enough for
++            # any ctas_per_group config because group_id < num_groups
++            # <= num_sms // ctas_per_group <= num_sms.  The kernel resets
++            # the slots it used at end-of-kernel, so the buffer stays clean
++            # across calls without re-zeroing (FlashInfer pattern).
++            # extra buffer: 148 * 770 * 4 bytes = 452960 bytes = 440 KB
++            if "row_states" not in cls.buffer_cache:
++                cls.buffer_cache["row_states"] = torch.zeros(
++                    num_sms,
++                    DISTRIBUTED_TOPK_STATE_SIZE,
++                    dtype=torch.int32,
++                    device="cuda")
++            row_states = cls.buffer_cache["row_states"]
++
++            # Allocate outputs
++            if output_indices is not None:
++                output_indices_torch = output_indices
++            else:
++                output_indices_torch = _get_or_alloc_buffer(
++                    cls.buffer_cache, "output_indices", (num_rows, top_k),
++                    torch.int32)
++            if return_val:
++                output_values = _get_or_alloc_buffer(cls.buffer_cache,
++                                                     "output_values",
++                                                     (num_rows, top_k),
++                                                     torch_dtype)
++            else:
++                output_values = None
++
++            compiled_kernel(
++                input_values,
++                row_states,
++                seq_lens,
++                output_indices_torch,
++                output_values,
++            )
++
++            return output_indices_torch, output_values
+ 
+     @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
+                              mutates_args=(),
+@@ -3567,175 +3763,292 @@ def _(
+         return indices
+ 
+     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
+-                             mutates_args=(),
++                             mutates_args=("output_indices", ),
+                              device_types="cuda")
+     def cute_dsl_indexer_topk_decode(
+         input_values: torch.Tensor,
+         seq_lens: torch.Tensor,
++        output_indices: torch.Tensor,
+         top_k: int,
+         next_n: int = 1,
+         num_copy_bits: int = 256,
+         dynamic: bool = True,
+-    ) -> torch.Tensor:
+-        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
++        single_pass_multi_cta: bool = False,
++    ) -> None:
++        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
++        single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
++        and multi-CTA (1-pass multi-CTA). When single_pass_multi_cta=False, it selects between
++        single-CTA and multi-CTA (2-pass multi-CTA).
++
++        Writes results directly into the pre-allocated ``output_indices`` buffer.
++
++        Dispatch logic (``single_pass_multi_cta=True`` path):
++
++        The key insight is that the single-pass multi-CTA kernel wins when all CTAs fit
++        in a single SM wave (no inter-CTA barrier serialization across waves).
++        For fp32, the 4 radix rounds double the sync overhead vs fp16/bf16's
++        2 rounds, so the crossover favors single-CTA much earlier.
++
++        - **ctas_per_group >= 2** (single-pass multi-CTA):
++          Use single-pass multi-CTA when ``num_rows * ctas_per_group <= num_sms``
++          (single wave). For fp32, additionally require ``vocab >= 65536``
++          since smaller vocab doesn't benefit enough from parallelism.
++        - **ctas_per_group == 1** (effectively single-CTA single-pass multi-CTA):
++          fp16/bf16: use single-pass multi-CTA when ``num_rows <= num_sms`` (no
++          inter-CTA sync, single-pass multi-CTA kernel is faster due to better
++          memory access patterns).
++          fp32: always use single-CTA (single-pass multi-CTA overhead not worth it).
+ 
+-        Automatically chooses the faster kernel based on:
+-          1. dtype threshold: fp16/bf16 >= 131072, fp32 >= 65536
+-          2. SM utilization < 25% (num_rows < num_sms // 4)
+-        Multi-CTA is only used when both conditions are met, ensuring it
+-        only activates when single-CTA occupancy is genuinely low.
+-        Uses chunk_size_per_cta=16384 for multi-CTA.
++        Benchmark: overhead vs oracle ~2.4%, speedup vs always-single ~1.14x
++        (Blackwell SM100 148 SMs, top_k=2048, fp32/bf16/fp16).
+ 
+-        Based on benchmark results (Blackwell SM100, top_k=2048).
+-        See bench_cute_dsl_single_vs_multi_cta_topk.py.
++        Legacy dispatch (``single_pass_multi_cta=False``) uses the original vocab
++        threshold + SM utilization heuristic for the 2-pass multi-CTA kernel.
+ 
+         Args:
+             input_values: Input logits tensor [batch_size * next_n, vocab_size]
+             seq_lens: Sequence lengths for each batch [batch_size]
++            output_indices: Pre-allocated output buffer [batch_size * next_n, top_k]
+             top_k: Number of top elements to select (max 2048)
+             next_n: Number of candidates per sequence (for speculative decoding)
+             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+-
+-        Returns:
+-            indices: Top-k indices [batch_size * next_n, top_k]
++            dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
++            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+         """
+         num_rows = input_values.shape[0]
+         num_tokens = input_values.shape[1]
+-        chunk_size_per_cta = 16384
+ 
+-        # Multi-CTA vocab thresholds by dtype.
+-        # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
+-        # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
+-        if input_values.dtype == torch.float32:
+-            use_multi_cta = num_tokens >= 65536
+-        else:
+-            use_multi_cta = num_tokens >= 131072
+-
+-        # Only use multi-CTA when SM utilization from single-CTA is low
+-        # (< 25%). Beyond this, single-CTA already saturates the SMs and
+-        # multi-CTA 2-pass overhead hurts.
+-        if use_multi_cta:
+-            num_sms = _get_num_sms()
+-            use_multi_cta = num_rows < num_sms // 4
+-
+-        if use_multi_cta:
+-            indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
+-                input_values=input_values,
+-                seq_lens=seq_lens,
+-                top_k=top_k,
+-                next_n=next_n,
+-                return_val=False,
+-                num_copy_bits=num_copy_bits,
+-                chunk_size_per_cta=chunk_size_per_cta,
+-                dynamic=dynamic,
+-            )
++        if single_pass_multi_cta:
++            # --- heuristic for single-CTA vs single-pass multi-CTA ---
++            # Determines whether the single-pass multi-CTA kernel
++            # is faster than single-CTA based on SM wave occupancy analysis.
++            #
++            # Core rules:
++            # 1. ctas_per_group >= 2: single-pass multi-CTA wins iff all CTAs fit in one
++            #    SM wave (num_rows * ctas_per_group <= num_sms). Multi-wave
++            #    causes inter-CTA barrier serialization → perf collapse.
++            #    For fp32, also require vocab >= 65536 (small vocab: sync
++            #    overhead from 4 radix rounds > parallelism benefit).
++            # 2. ctas_per_group == 1: no inter-CTA sync needed.
++            #    fp16/bf16: single-pass multi-CTA wins when num_rows <= num_sms.
++            #    fp32: single-CTA always wins (single-pass multi-CTA overhead too high).
++            is_fp32 = (input_values.dtype == torch.float32)
++
++            # Short-circuit: fp32 with small vocab never benefits from
++            # single-pass multi-CTA (sync overhead from 4 radix rounds > parallelism
++            # gain). Skip _get_chunk_config entirely.
++            if is_fp32 and num_tokens < 65536:
++                use_single_pass_multi_cta = False
++            else:
++                num_sms = _get_num_sms()
++                cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[input_values.dtype]
++                _, ctas_per_group, _ = (
++                    CuteDSLTopKDecodeSinglePassMultiCTARunner._get_chunk_config(
++                        cutlass_dtype,
++                        num_tokens,
++                        num_copy_bits=num_copy_bits,
++                        num_rows=num_rows))
++
++                if ctas_per_group >= 2:
++                    use_single_pass_multi_cta = (num_rows * ctas_per_group
++                                                 <= num_sms)
++                    if is_fp32:
++                        use_single_pass_multi_cta = (use_single_pass_multi_cta
++                                                     and num_tokens >= 65536)
++                else:  # ctas_per_group == 1
++                    use_single_pass_multi_cta = (not is_fp32
++                                                 and num_rows <= num_sms)
++
++            if use_single_pass_multi_cta:
++                CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
++                    input_values=input_values,
++                    seq_lens=seq_lens,
++                    top_k=top_k,
++                    next_n=next_n,
++                    return_val=False,
++                    num_copy_bits=num_copy_bits,
++                    output_indices=output_indices,
++                )
++            else:
++                CuteDSLTopKDecodeSingleCTARunner.forward(
++                    input_values=input_values,
++                    seq_lens=seq_lens,
++                    top_k=top_k,
++                    next_n=next_n,
++                    return_val=False,
++                    num_copy_bits=num_copy_bits,
++                    output_indices=output_indices,
++                )
+         else:
+-            indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
+-                input_values=input_values,
+-                seq_lens=seq_lens,
+-                top_k=top_k,
+-                next_n=next_n,
+-                return_val=False,
+-                num_copy_bits=num_copy_bits,
+-            )
+-        return indices
++            # --- 2-pass multi-CTA dispatch ---
++            # Kept for A/B comparison and as fallback when single_pass_multi_cta=False.
++            # Uses vocab threshold + SM utilization < 25% heuristic.
++            chunk_size_per_cta = 16384
++
++            # Multi-CTA vocab thresholds by dtype.
++            # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
++            # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
++            if input_values.dtype == torch.float32:
++                use_multi_cta = num_tokens >= 65536
++            else:
++                use_multi_cta = num_tokens >= 131072
++
++            # Only use multi-CTA when SM utilization from single-CTA is low
++            # (< 25%). Beyond this, single-CTA already saturates the SMs and
++            # multi-CTA 2-pass overhead hurts.
++            if use_multi_cta:
++                num_sms = _get_num_sms()
++                use_multi_cta = num_rows < num_sms // 4
++
++            if use_multi_cta:
++                CuteDSLTopKDecodeMultiCTARunner.forward(
++                    input_values=input_values,
++                    seq_lens=seq_lens,
++                    top_k=top_k,
++                    next_n=next_n,
++                    return_val=False,
++                    num_copy_bits=num_copy_bits,
++                    chunk_size_per_cta=chunk_size_per_cta,
++                    dynamic=dynamic,
++                    output_indices=output_indices,
++                )
++            else:
++                CuteDSLTopKDecodeSingleCTARunner.forward(
++                    input_values=input_values,
++                    seq_lens=seq_lens,
++                    top_k=top_k,
++                    next_n=next_n,
++                    return_val=False,
++                    num_copy_bits=num_copy_bits,
++                    output_indices=output_indices,
++                )
+ 
+     @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
+     def _(
+         input_values: torch.Tensor,
+         seq_lens: torch.Tensor,
++        output_indices: torch.Tensor,
+         top_k: int,
+         next_n: int = 1,
+         num_copy_bits: int = 256,
+         dynamic: bool = True,
+-    ):
+-        num_rows = input_values.shape[0]
+-        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+-        return indices
++        single_pass_multi_cta: bool = False,
++    ) -> None:
++        return None
+ 
+-    # TODO: call this warmup in DSL initialization or autotune warmup to compile all the dsl top-k kernels.
+-    def warmup_cute_dsl_topk_kernels(
+-        dtype=cutlass.BFloat16,
+-        top_k: int = 2048,
++    def warmup_cute_dsl_indexer_topk(
++        dtype: torch.dtype,
++        top_k: int,
+         next_n: int = 1,
+-        return_val: bool = False,
+         num_copy_bits: int = 256,
+-        bucketed_num_cols_list: list | None = None,
+-        chunk_size_per_cta: int = 16384,
+-    ):
+-        """Pre-compile CuTE DSL top-k kernels for common configurations.
++        min_seq_len_log2: int = 10,
++        max_seq_len_log2: int = 18,
++        single_pass_multi_cta: bool = False,
++    ) -> None:
++        """Pre-compile all CuTE DSL top-k kernel variants for every
++        power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
++
++        Because the kernel compilation key uses
++        ``bucketed_num_cols = next_positive_power_of_2(num_cols)``, only
++        a small number of distinct kernels are needed regardless of the
++        actual ``max_seq_len``.  This allows warmup to be called at model
++        init time without knowing the runtime ``max_seq_len``.
+ 
+-        Enumerates all combinations of (bucketed_num_cols, large_occupancy)
+-        and compiles both single-CTA and multi-CTA kernels. This avoids
+-        compilation latency on the first decode request.
++        Must be called before CUDA Graph capture so that JIT compilation
++        does not occur during capture/replay.
+ 
+         Args:
+-            dtype: Cutlass data type (default BFloat16).
+-            top_k: Number of top-k elements (default 2048).
+-            next_n: Speculative decoding candidates (default 1).
+-            return_val: Whether kernels should return values (default False).
+-            num_copy_bits: Vectorization width (default 256).
+-            bucketed_num_cols_list: List of bucketed num_cols to warmup.
+-                If None, uses powers of 2 from 4096 to 262144.
+-            chunk_size_per_cta: Chunk size for multi-CTA (default 16384).
++            dtype: Data type of the logits (e.g. torch.bfloat16).
++            top_k: Number of top elements to select.
++            next_n: Number of candidates per sequence (speculative decoding).
++            num_copy_bits: Vectorized memory copy width (128 or 256).
++            min_seq_len_log2: Log2 of minimum bucketed_num_cols (default 10 → 1024).
++            max_seq_len_log2: Log2 of maximum bucketed_num_cols (default 18 → 262144).
+         """
+-        # Default bucketed num_cols values to warmup (powers of 2 from 4096 to 262144).
+-        _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS = [
+-            1 << i for i in range(12, 19)
+-        ]
+-        if bucketed_num_cols_list is None:
+-            bucketed_num_cols_list = _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS
+-
+-        load_balance = False
+-        count = 0
+-        for bucketed_num_cols in bucketed_num_cols_list:
+-            for large_occupancy in [False, True]:
+-                # Single-CTA kernel
++        cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
++        return_val = False
++        chunk_size_per_cta = 16384
++
++        # Multi-CTA vocab thresholds by dtype
++        if dtype == torch.float32:
++            multi_cta_threshold = 65536
++        else:
++            multi_cta_threshold = 131072
++
++        # SingleCTA: enumerate all power-of-2 bucketed_num_cols
++        for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
++            bucketed_num_cols = 1 << log2_n
++            for large_occupancy in (False, True):
+                 CuteDSLTopKDecodeSingleCTARunner._compile(
+-                    dtype,
++                    cutlass_dtype,
+                     bucketed_num_cols,
+                     top_k,
+                     next_n,
+                     return_val,
+                     num_copy_bits,
+-                    load_balance,
+-                    large_occupancy,
++                    load_balance=False,
++                    large_occupancy=large_occupancy,
+                 )
+-                count += 1
+ 
+-                # Multi-CTA kernel (only when num_cols > chunk_size_per_cta)
+-                num_ctas_per_row = math.ceil(bucketed_num_cols /
+-                                             chunk_size_per_cta)
+-                if num_ctas_per_row > 1:
+-                    CuteDSLTopKDecodeMultiCTARunner._compile(
+-                        dtype,
+-                        bucketed_num_cols,
+-                        top_k,
+-                        next_n,
+-                        return_val,
+-                        num_copy_bits,
+-                        load_balance,
+-                        large_occupancy,
+-                        chunk_size_per_cta,
+-                        num_ctas_per_row,
+-                    )
+-                    count += 1
+-
+-                    # Dynamic multi-CTA kernel
++        if single_pass_multi_cta:
++            # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group)
++            # pairs.  chunk_size is snapped to power-of-2 (+ max_chunk clamp),
++            # so the set of possible values is small and deterministic.
++            num_sms = _get_num_sms()
++            possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
++                cutlass_dtype, num_copy_bits)
++            max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
++                cutlass_dtype, num_copy_bits)
++            single_pass_multi_cta_configs = set()
++            for cs in possible_chunks:
++                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
++                    num_cols = 1 << log2_n
++                    ctas = math.ceil(num_cols / cs)
++                    if ctas >= 1:
++                        single_pass_multi_cta_configs.add((cs, ctas))
++            # Also cover FlashInfer-style fallback path (large batch):
++            # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
++            for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
++                num_cols = 1 << log2_n
++                ctas = math.ceil(num_cols / max_chunk)
++                if ctas >= 1:
++                    cs = math.ceil(num_cols / ctas)
++                    cs = ((cs + vec_size - 1) // vec_size) * vec_size
++                    if cs > max_chunk:
++                        cs = max_chunk
++                    single_pass_multi_cta_configs.add((cs, ctas))
++            for cs, ctas in sorted(single_pass_multi_cta_configs):
++                CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
++                    cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
++                    num_sms, return_val)
++            multi_cta_info = (
++                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)"
++            )
++        else:
++            # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
++            # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
++            # fp32: num_cols in [65536, 262144] → num_ctas_per_row in [4, 16]
++            # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
++            min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
++            max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
++            for num_ctas_per_row in range(min_ctas, max_ctas + 1):
++                for large_occupancy in (False, True):
+                     CuteDSLTopKDecodeMultiCTARunner._compile(
+-                        dtype,
+-                        bucketed_num_cols,
++                        cutlass_dtype,
+                         top_k,
+                         next_n,
+                         return_val,
+                         num_copy_bits,
+-                        load_balance,
+-                        large_occupancy,
+-                        chunk_size_per_cta,
+-                        num_ctas_per_row,
++                        load_balance=False,
++                        large_occupancy=large_occupancy,
++                        chunk_size_per_cta=chunk_size_per_cta,
++                        num_ctas_per_row=num_ctas_per_row,
+                         dynamic=True,
+                     )
+-                    count += 1
++            multi_cta_info = (
++                f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}]")
+ 
+-        logger.info(f"Warmup: pre-compiled {count} CuTE DSL top-k kernels "
+-                    f"(dtype={dtype}, top_k={top_k}, next_n={next_n})")
++        logger.info(
++            f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
++            f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
++            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/__init__.py b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/__init__.py
+index 6e5f8581b6bd..0c2c3191a5c5 100644
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/__init__.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/__init__.py
+@@ -16,8 +16,10 @@
+ 
+ from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
+ from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
++from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
+ 
+ __all__ = [
++    "SinglePassMultiCTARadixTopKKernel",
+     "FilteredTopKKernelVarlen",
+     "FilteredTopKKernelVarlenDecode",
+ ]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py
+new file mode 100644
+index 000000000000..cf8dd50fccea
+--- /dev/null
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py
+@@ -0,0 +1,1298 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Single-pass multi-CTA radix top-k kernel using FlashInfer-style fused multi-CTA approach.
++
++All CTAs in a group cooperatively find the global pivot via multi-round radix
++select with global histogram merging, then each CTA collects results from its
++own chunk.  Single kernel launch, no intermediate buffer, no merge kernel.
++"""
++
++import cutlass
++import cutlass.cute as cute
++from cutlass._mlir.dialects import llvm
++from cutlass.cute.typing import Int32 as CuteInt32
++from cutlass.cute.typing import Pointer as CutePointer
++from cutlass.cutlass_dsl import dsl_user_op
++from cutlass.utils.distributed import atomicAdd
++from cutlass.utils.smem_allocator import SmemAllocator
++
++from .block_scan import block_prefix_sum_kernel
++from .filtered_top_k_varlen_util import float_as_uint32, half_as_ushort
++
++# ---------------------------------------------------------------------------
++# Global-state layout constants
++# ---------------------------------------------------------------------------
++# row_states: (num_groups, STATE_SIZE) int32 tensor
++#   [0..255]     histogram buffer 0
++#   [256..511]   histogram buffer 1
++#   [512..767]   histogram buffer 2
++#   [768]        arrival_counter
++#   [769]        output_counter
++_HIST_SIZE = 256
++_HIST_BUF_0 = 0
++_HIST_BUF_1 = _HIST_SIZE
++_HIST_BUF_2 = 2 * _HIST_SIZE
++_ARRIVAL_COUNTER = 3 * _HIST_SIZE  # 768
++_OUTPUT_COUNTER = 3 * _HIST_SIZE + 1  # 769
++STATE_SIZE = 3 * _HIST_SIZE + 2  # 770
++
++
++# ---------------------------------------------------------------------------
++# GPU-scope synchronisation primitives (inline PTX)
++# ---------------------------------------------------------------------------
++@cute.jit
++def fence_acq_rel_gpu(*, loc=None, ip=None):
++    """GPU-scope acquire-release fence."""
++    llvm.inline_asm(
++        res=None,
++        operands_=[],
++        asm_string="fence.acq_rel.gpu;",
++        constraints="",
++        has_side_effects=True,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def _red_relaxed_gpu(ptr: CutePointer, val: CuteInt32, loc=None, ip=None) -> None:
++    """fence.acq_rel.gpu + red.relaxed.gpu.global.add.s32 (no read-back)."""
++    llvm.inline_asm(
++        None,
++        [ptr.toint().ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
++        "fence.acq_rel.gpu;\nred.relaxed.gpu.global.add.s32 [$0], $1;",
++        "l,r",
++        has_side_effects=True,
++        asm_dialect=0,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def _st_release_gpu(ptr: CutePointer, val: CuteInt32, loc=None, ip=None) -> None:
++    """fence.acq_rel.gpu + st.release.gpu.global.b32 (release store, no RMW)."""
++    llvm.inline_asm(
++        None,
++        [ptr.toint().ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
++        "fence.acq_rel.gpu;\nst.release.gpu.global.b32 [$0], $1;",
++        "l,r",
++        has_side_effects=True,
++        asm_dialect=0,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@cute.jit
++def red_release_gpu(ptr, val):
++    """fence + red.relaxed.gpu (no read-back, lighter than atomicAdd)."""
++    _red_relaxed_gpu(ptr, val)
++
++
++@cute.jit
++def st_release_gpu(ptr, val):
++    """fence + st.release.gpu (release store for counter resets)."""
++    _st_release_gpu(ptr, val)
++
++
++@dsl_user_op
++def _ld_acquire_gpu(ptr: CutePointer, loc=None, ip=None) -> CuteInt32:
++    """GPU-scope acquire load: ld.global.acquire.gpu.b32 (plain load, not atomic).
++
++    Much cheaper than atomicAdd(ptr, 0) in the spin loop — multiple CTAs
++    can read simultaneously without serialization.
++    """
++    from cutlass.cutlass_dsl import T
++
++    return llvm.inline_asm(
++        T.i32(),
++        [ptr.toint().ir_value(loc=loc, ip=ip)],
++        "ld.global.acquire.gpu.b32 $0, [$1];",
++        "=r,l",
++        has_side_effects=True,
++        asm_dialect=0,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@cute.jit
++def ld_acquire_gpu(ptr):
++    """GPU-scope acquire load (plain load, not atomic)."""
++    return _ld_acquire_gpu(ptr)
++
++
++@cute.jit
++def barrier_inter_cta(arrival_counter_ptr, target, tidx):
++    """Inter-CTA barrier: thread 0 spins on arrival counter, then syncthreads."""
++    if tidx == 0:
++        while ld_acquire_gpu(arrival_counter_ptr) < target:
++            pass
++    cute.arch.barrier()
++
++
++# ---------------------------------------------------------------------------
++# SinglePassMultiCTARadixTopKKernel
++# ---------------------------------------------------------------------------
++class SinglePassMultiCTARadixTopKKernel:
++    """FlashInfer-style single-pass multi-CTA radix top-k kernel.
++
++    All CTAs in a *group* cooperatively process one row at a time.  The groups
++    are persistent and iterate over rows in round-robin fashion.
++
++    Algorithm:
++      1. Each CTA loads its chunk into shared memory as *ordered* integers.
++      2. Multi-round (2 or 4) radix select:
++         a. Each CTA builds a local 256-bin histogram on its smem data.
++         b. atomicAdd to a global histogram (triple-buffered in ``row_states``).
++         c. Inter-CTA barrier.
++         d. All CTAs read the merged histogram, compute prefix sum, find the
++            threshold bucket, update prefix and remaining_k.
++      3. Collect output:
++         a. Pass 1: elements strictly greater than pivot → atomicAdd to get
++            position in output.
++         b. Inter-CTA barrier.
++         c. Pass 2: elements equal to pivot → per-element atomicAdd, write
++            only while pos < k.
++    """
++
++    def __init__(
++        self,
++        dtype: cutlass.Numeric,
++        chunk_size: int,
++        top_k: int,
++        next_n: int = 1,
++        num_copy_bits: int = 256,
++        ctas_per_group: int = 1,
++        num_sms: int = 148,
++    ):
++        self.dtype = dtype
++        self.chunk_size = chunk_size
++        self.top_k = top_k
++        self.next_n = next_n
++        self.ctas_per_group = ctas_per_group
++        self.num_sms = num_sms
++        self.num_copy_bits = num_copy_bits
++
++        # Radix config
++        self.radix = 256
++        self.radix_bits = 8
++        if cutlass.const_expr(dtype == cutlass.Float32):
++            self.ordered_type = cutlass.Uint32
++            self.ordered_bits = 32
++            self.num_rounds = 4
++        else:
++            self.ordered_type = cutlass.Uint16
++            self.ordered_bits = 16
++            self.num_rounds = 2
++
++        # Thread config — fixed at 1024 (FlashInfer convention)
++        self.num_threads = 1024
++        self.num_warps = self.num_threads // 32
++
++        # Vec size for loading
++        self.vec_size = num_copy_bits // dtype.width
++
++    # ------------------------------------------------------------------
++    # Bit-pattern helpers
++    # ------------------------------------------------------------------
++    @cute.jit
++    def to_ordered(self, x):
++        """Convert float to an ordered unsigned integer (descending mapping).
++
++        Descending sign-flip so that larger float → smaller ordered integer:
++          negative (sign=1) → keep bits unchanged  (bits)
++          positive (sign=0) → flip all bits and clear sign bit  (~bits & 0x7FFFFFFF)
++        This allows using a natural prefix sum to locate the top-k boundary.
++        """
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            bits = float_as_uint32(x)
++            key = cutlass.Uint32(0)
++            if bits & cutlass.Uint32(0x80000000):
++                key = cutlass.Uint32(bits)
++            else:
++                key = (bits ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
++            return cutlass.Uint32(key)
++        else:
++            bits = half_as_ushort(x)
++            key = cutlass.Uint16(0)
++            if bits & cutlass.Uint16(0x8000):
++                key = cutlass.Uint16(bits)
++            else:
++                key = (bits ^ cutlass.Uint16(0xFFFF)) & cutlass.Uint16(0x7FFF)
++            return cutlass.Uint16(key)
++
++    @cute.jit
++    def from_ordered(self, ordered):
++        """Inverse of ``to_ordered``: ordered integer → float.
++
++        Inverse of the descending mapping:
++          sign bit set (was negative) → bits unchanged  (ordered)
++          sign bit clear (was positive) → flip all and clear sign  (~ordered & 0x7FFFFFFF)
++        """
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            # Initialize before dynamic branch to satisfy DSL scoping.
++            bits = cutlass.Uint32(0)
++            if ordered & cutlass.Uint32(0x80000000):
++                bits = ordered
++            else:
++                bits = (ordered ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
++            return llvm.bitcast(cutlass.Float32.mlir_type, bits.ir_value())
++        else:
++            bits = cutlass.Uint16(0)
++            if ordered & cutlass.Uint16(0x8000):
++                bits = ordered
++            else:
++                bits = (ordered ^ cutlass.Uint16(0xFFFF)) & cutlass.Uint16(0x7FFF)
++            if cutlass.const_expr(self.dtype == cutlass.Float16):
++                return llvm.bitcast(cutlass.Float16.mlir_type, bits.ir_value())
++            else:
++                return llvm.bitcast(cute.BFloat16.mlir_type, bits.ir_value())
++
++    # ------------------------------------------------------------------
++    # Step 1: Load chunk → smem (convert to ordered)
++    # ------------------------------------------------------------------
++    @cute.jit
++    def load_chunk_to_smem(self, input_row, shared_ordered, chunk_start, actual_chunk_size, tidx):
++        """Load valid chunk elements into smem as ordered integers.
++
++        Follows the prologue/aligned/tail pattern from filtered_top_k_varlen_util:
++          - Scalar prologue: handle misaligned prefix at chunk_start
++          - Vectorized main: num_copy_bits-wide loads for the aligned region
++          - Scalar tail: remaining elements after the last aligned vector
++        Thread layout: thread t handles every (num_threads)-th vector in the
++        aligned region (coalesced warp access).
++        """
++        vec_size = cutlass.const_expr(self.vec_size)
++        num_threads = cutlass.const_expr(self.num_threads)
++        # align_bytes and elem_bytes are compile-time Python ints
++        align_bytes = self.num_copy_bits // 8
++        elem_bytes = self.dtype.width // 8
++
++        # --- Compute prologue / aligned / tail region sizes ---
++        # Pointer to chunk[0]; .toint() gives byte address as Int64.
++        row_ptr = input_row.iterator + chunk_start
++        row_addr_u64 = row_ptr.toint()
++
++        misalign = row_addr_u64 % align_bytes
++        fix_bytes = cutlass.Int64(0)
++        if misalign != 0:
++            fix_bytes = align_bytes - misalign
++
++        prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
++        remaining = actual_chunk_size - prologue_elems
++        aligned_size = (remaining // vec_size) * vec_size
++        left_size = remaining - aligned_size
++        # Byte address of first element in the aligned region
++        aligned_addr = row_addr_u64 + fix_bytes
++
++        # --- Part 2: Vectorized aligned region ---
++        copy_atom = cute.make_copy_atom(
++            cute.nvgpu.CopyUniversalOp(),
++            self.dtype,
++            num_bits_per_copy=cutlass.const_expr(self.num_copy_bits),
++        )
++        frag = cute.make_fragment((vec_size,), self.dtype)
++        stride = cutlass.const_expr(num_threads * vec_size)
++
++        # Thread t covers [t*vs, t*vs+vs), [t*vs+stride, ...) in the aligned region.
++        # All start offsets i = t*vs + k*stride are multiples of vec_size, so
++        # aligned_addr + i*elem_bytes is always align_bytes-aligned.
++        # Assert this to the MLIR verifier via assumed_align on each make_ptr.
++        i = tidx * vec_size
++        while i < aligned_size:
++            src_ptr = cute.make_ptr(
++                self.dtype,
++                aligned_addr + cutlass.Int64(i) * elem_bytes,
++                assumed_align=align_bytes,
++            )
++            src = cute.make_tensor(src_ptr, cute.make_layout((vec_size,)))
++
++            cute.copy(copy_atom, src, frag)
++            # Apply to_ordered into a correctly-typed uint32 fragment so
++            # autovec_copy sees matching types (uint32 → uint32) and emits
++            # STS.128 instead of 8 scalar STS instructions.
++            ordered_frag = cute.make_fragment((vec_size,), self.ordered_type)
++            for j in cutlass.range(vec_size, unroll_full=True):
++                ordered_frag[j] = self.to_ordered(frag[j])
++
++            # Smem layout reordering: aligned region at smem[0..aligned_size-1],
++            # prologue at smem[aligned_size..+prologue-1], tail after that.
++            # smem_base is 128B-aligned and i is always a multiple of vec_size*elem_bytes
++            # → smem[i] is always align_bytes-aligned → STS.128 is valid.
++            shared_addr_u64 = (shared_ordered.iterator + i).toint()
++            shared_ptr = cute.make_ptr(
++                self.ordered_type,
++                shared_addr_u64,
++                cute.AddressSpace.smem,
++                assumed_align=align_bytes,
++            )
++            shared_tensor = cute.make_tensor(shared_ptr, cute.make_layout((vec_size,)))
++            cute.autovec_copy(ordered_frag, shared_tensor)
++
++            i = i + stride
++
++        # --- Part 1: Scalar prologue (before alignment boundary) ---
++        for j in range(tidx, prologue_elems, num_threads):
++            shared_ordered[aligned_size + j] = self.to_ordered(input_row[chunk_start + j])
++
++        # --- Part 3: Scalar tail (after last aligned vector) ---
++        for j in range(tidx, left_size, num_threads):
++            k = prologue_elems + aligned_size + j
++            shared_ordered[k] = self.to_ordered(input_row[chunk_start + k])
++
++        cute.arch.barrier()
++        return prologue_elems, aligned_size, left_size
++
++    # ------------------------------------------------------------------
++    # Step 2a: Build local histogram and merge to global
++    # ------------------------------------------------------------------
++    @cute.jit
++    def build_and_merge_histogram(
++        self,
++        shared_ordered,
++        actual_chunk_size,
++        prefix,
++        prefix_mask,
++        shift,
++        local_histogram,
++        global_histogram_ptr,
++        tidx,
++    ):
++        """Build per-CTA histogram on smem data and atomicAdd to global."""
++        # Clear local histogram
++        for i in range(tidx, self.radix, self.num_threads):
++            local_histogram[i] = cutlass.Int32(0)
++        cute.arch.barrier()
++
++        # Build local histogram
++        val_one = cutlass.Int32(1)
++        for i in range(tidx, actual_chunk_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if (ordered & prefix_mask) == prefix:
++                if cutlass.const_expr(self.dtype == cutlass.Float32):
++                    bucket = cutlass.Int32(
++                        (ordered >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
++                    )
++                else:
++                    bucket = cutlass.Int32(
++                        (ordered >> cutlass.Uint16(shift)) & cutlass.Uint16(0xFF)
++                    )
++                atomicAdd(local_histogram.iterator + bucket, val_one)
++        cute.arch.barrier()
++
++        # Merge to global histogram
++        for i in range(tidx, self.radix, self.num_threads):
++            count = local_histogram[i]
++            if count > 0:
++                atomicAdd(global_histogram_ptr + cutlass.Int32(i), count)
++
++    # ------------------------------------------------------------------
++    # Step 2b: Prefix sum + find threshold bucket
++    # ------------------------------------------------------------------
++    @cute.jit
++    def prefix_sum_and_find_threshold(
++        self, local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
++    ):
++        """Compute prefix sum over 256-bin histogram and find threshold bucket.
++
++        With the descending ordered mapping (larger float → smaller bucket),
++        prefix_sum[b] = count of elements in buckets 0..b = count of the
++        largest elements.  The threshold bucket is the first one where:
++          prefix_sum[b] >= remaining_k  AND  prefix_sum[b-1] < remaining_k
++
++        Results written to s_scalars:
++          [0] = found_bucket
++          [1] = found_remaining_k (remaining_k - prefix_sum[bucket-1])
++        """
++        # Step 1: Inclusive prefix sum directly on the histogram
++        if tidx < self.radix:
++            val = local_histogram[tidx]
++            num_warps_scan = cutlass.const_expr(min(self.radix, 256) // 32)
++            val, _ = block_prefix_sum_kernel(
++                val, s_warp_sums, tidx, self.radix, num_warps_scan, barrier_id=1
++            )
++            prefix_buf[tidx] = val
++        cute.arch.barrier()
++
++        # Initialize fallback values: found_bucket=0,
++        # found_remaining_k=remaining_k.  Without this, degenerate cases
++        # where no thread satisfies the threshold condition would leave
++        # s_scalars with stale values from a previous round.
++        if tidx == 0:
++            s_scalars[0] = cutlass.Int32(0)  # found_bucket
++            s_scalars[1] = remaining_k  # found_remaining_k
++        cute.arch.barrier()
++
++        # Step 2: Find threshold bucket
++        if tidx < self.radix:
++            b = tidx  # bucket index
++            current = prefix_buf[b]  # count of elements in buckets 0..b
++            # For first bucket (b==0), previous=0.
++            # Define previous unconditionally to avoid DSL scoping issues.
++            previous = cutlass.Int32(0)
++            if b > 0:
++                previous = prefix_buf[b - 1]  # count of elements in buckets 0..b-1
++
++            if current >= remaining_k and previous < remaining_k:
++                s_scalars[0] = cutlass.Int32(b)  # found_bucket
++                s_scalars[1] = remaining_k - previous  # found_remaining_k
++        cute.arch.barrier()
++
++    # ------------------------------------------------------------------
++    # Step 2c-single: Single-CTA radix round (no global state, no barriers)
++    # ------------------------------------------------------------------
++    @cute.jit
++    def _radix_round_single_cta(
++        self,
++        round_idx: cutlass.Constexpr,
++        shift: cutlass.Constexpr,
++        shared_ordered,
++        actual_chunk_size,
++        prefix,
++        remaining_k,
++        local_histogram,
++        prefix_buf,
++        s_scalars,
++        s_warp_sums,
++        num_threads,
++        tidx,
++    ):
++        """Execute one radix select round for single-CTA mode.
++
++        No global memory histogram merging and no inter-CTA barriers needed:
++        the CTA owns all data, so ``local_histogram`` (smem) is already the
++        complete histogram after the local build pass.
++        """
++        # Compute prefix_mask for this round (top round_idx*8 bits)
++        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            if cutlass.const_expr(prefix_mask_bits == 0):
++                prefix_mask = cutlass.Uint32(0)
++            else:
++                prefix_mask = cutlass.Uint32(
++                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
++                )
++        else:
++            if cutlass.const_expr(prefix_mask_bits == 0):
++                prefix_mask = cutlass.Uint16(0)
++            else:
++                prefix_mask = cutlass.Uint16(
++                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
++                )
++
++        # Clear local histogram
++        for i in range(tidx, self.radix, num_threads):
++            local_histogram[i] = cutlass.Int32(0)
++        cute.arch.barrier()
++
++        # Build histogram directly in smem (no global merge)
++        val_one = cutlass.Int32(1)
++        for i in range(tidx, actual_chunk_size, num_threads):
++            ordered = shared_ordered[i]
++            if (ordered & prefix_mask) == prefix:
++                if cutlass.const_expr(self.dtype == cutlass.Float32):
++                    bucket = cutlass.Int32(
++                        (ordered >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
++                    )
++                else:
++                    bucket = cutlass.Int32(
++                        (ordered >> cutlass.Uint16(shift)) & cutlass.Uint16(0xFF)
++                    )
++                atomicAdd(local_histogram.iterator + bucket, val_one)
++        cute.arch.barrier()
++
++        # local_histogram is already the complete histogram — compute
++        # prefix sum and find the threshold bucket directly.
++        self.prefix_sum_and_find_threshold(
++            local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
++        )
++
++        found_bucket = s_scalars[0]
++        found_remaining_k = s_scalars[1]
++
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            prefix = prefix | cutlass.Uint32(cutlass.Uint32(found_bucket) << cutlass.Uint32(shift))
++        else:
++            prefix = prefix | cutlass.Uint16(cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
++        remaining_k = found_remaining_k
++
++        return prefix, remaining_k
++
++    # ------------------------------------------------------------------
++    # Step 2c: Multi-CTA radix round (called explicitly per round)
++    # ------------------------------------------------------------------
++    @cute.jit
++    def _radix_round(
++        self,
++        round_idx: cutlass.Constexpr,
++        num_rounds: cutlass.Constexpr,
++        iter,
++        shift: cutlass.Constexpr,
++        shared_ordered,
++        actual_chunk_size,
++        prefix,
++        remaining_k,
++        local_histogram,
++        prefix_buf,
++        s_scalars,
++        s_warp_sums,
++        state_base_ptr,
++        state_row,
++        cta_in_group,
++        barrier_phase,
++        ctas_per_group,
++        num_threads,
++        tidx,
++    ):
++        """Execute one radix select round with inter-CTA synchronisation."""
++        # FlashInfer-style triple-buffer rotation
++        hist_buf_idx = (
++            iter * cutlass.Int32(num_rounds) + cutlass.Int32(round_idx)
++        ) % cutlass.Int32(3)
++        next_hist_buf_idx = (hist_buf_idx + cutlass.Int32(1)) % cutlass.Int32(3)
++        hist_offset = hist_buf_idx * cutlass.Int32(self.radix)
++        next_hist_offset = next_hist_buf_idx * cutlass.Int32(self.radix)
++        global_hist_ptr = state_base_ptr + hist_offset
++
++        # Compute prefix_mask for this round (top round_idx*8 bits)
++        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            if cutlass.const_expr(prefix_mask_bits == 0):
++                prefix_mask = cutlass.Uint32(0)
++            else:
++                prefix_mask = cutlass.Uint32(
++                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
++                )
++        else:
++            if cutlass.const_expr(prefix_mask_bits == 0):
++                prefix_mask = cutlass.Uint16(0)
++            else:
++                prefix_mask = cutlass.Uint16(
++                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
++                )
++
++        # Build local histogram and merge to global
++        self.build_and_merge_histogram(
++            shared_ordered,
++            actual_chunk_size,
++            prefix,
++            prefix_mask,
++            shift,
++            local_histogram,
++            global_hist_ptr,
++            tidx,
++        )
++
++        # CTA 0 clears the *next* round's histogram buffer
++        if cta_in_group == 0:
++            for i in range(tidx, self.radix, num_threads):
++                state_row[next_hist_offset + cutlass.Int32(i)] = cutlass.Int32(0)
++
++        # Inter-CTA barrier (only thread 0 signals arrival)
++        if tidx == 0:
++            red_release_gpu(state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(1))
++        barrier_phase = barrier_phase + 1
++        barrier_inter_cta(
++            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
++            barrier_phase * ctas_per_group,
++            tidx,
++        )
++
++        # Read merged histogram into local_histogram (smem)
++        for i in range(tidx, self.radix, num_threads):
++            local_histogram[i] = state_row[hist_offset + cutlass.Int32(i)]
++        cute.arch.barrier()
++
++        # Prefix sum and find threshold bucket
++        self.prefix_sum_and_find_threshold(
++            local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
++        )
++
++        # Update prefix and remaining_k
++        found_bucket = s_scalars[0]
++        found_remaining_k = s_scalars[1]
++
++        if cutlass.const_expr(self.dtype == cutlass.Float32):
++            prefix = prefix | cutlass.Uint32(cutlass.Uint32(found_bucket) << cutlass.Uint32(shift))
++        else:
++            prefix = prefix | cutlass.Uint16(cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
++        remaining_k = found_remaining_k
++
++        return prefix, remaining_k, barrier_phase
++
++    # ------------------------------------------------------------------
++    # Step 2d: Count elements > pivot per CTA (for batch atomicAdd)
++    # ------------------------------------------------------------------
++    @cute.jit
++    def compute_local_gt_count(
++        self, shared_ordered, actual_chunk_size, ordered_pivot, local_histogram, tidx
++    ):
++        """Count elements whose float value is strictly greater than pivot.
++
++        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
++        Uses local_histogram[0] as shared counter.
++
++        Uses warp reduction (FlashInfer pattern): each thread counts its
++        elements, then a butterfly warp-sum reduces 32 threads to one
++        atomicAdd per warp, cutting smem contention by 32x.
++        """
++        if tidx == 0:
++            local_histogram[0] = cutlass.Int32(0)
++        cute.arch.barrier()
++
++        my_count = cutlass.Int32(0)
++        for i in range(tidx, actual_chunk_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if ordered < ordered_pivot:
++                my_count = my_count + 1
++
++        # Warp-level reduction: butterfly sum across 32 threads.
++        warp_sum = cute.arch.warp_reduction_sum(my_count)
++        # Only lane 0 of each warp atomics the warp's total to smem.
++        if cute.arch.lane_idx() == 0:
++            if warp_sum > 0:
++                atomicAdd(local_histogram.iterator, warp_sum)
++        cute.arch.barrier()
++
++        return local_histogram[0]
++
++    # ------------------------------------------------------------------
++    # Step 3: Collect output indices and values
++    # ------------------------------------------------------------------
++    @cute.jit
++    def collect_output(
++        self,
++        shared_ordered,
++        actual_chunk_size,
++        chunk_start,
++        prologue_elems,
++        aligned_size,
++        left_size,
++        ordered_pivot,
++        top_k,
++        local_gt_count,
++        output_counter_ptr,
++        arrival_counter_ptr,
++        barrier_phase,
++        ctas_per_group,
++        local_histogram,
++        output_indices_row,
++        output_values_row,
++        tidx,
++    ):
++        """Collect elements into output: first > pivot, then == pivot.
++
++        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
++
++        Uses FlashInfer-style batch atomicAdd for > pivot elements:
++        one global atomicAdd per CTA (instead of per element) to get
++        a contiguous allocation, then local atomicAdd within the CTA.
++
++        An inter-CTA barrier separates the two passes to ensure all > pivot
++        elements from all CTAs are counted before == pivot elements start
++        filling the remaining slots.
++        """
++        val_one = cutlass.Int32(1)
++
++        # Reuse local_histogram for counters (FlashInfer convention):
++        #   [0] = local_offset_gt  (local position within CTA allocation)
++        #   [1] = global_base_gt   (global base from batch atomicAdd)
++        if tidx == 0:
++            local_histogram[0] = cutlass.Int32(0)  # local_offset_gt
++            local_histogram[1] = cutlass.Int32(0)  # global_base_gt
++            if local_gt_count > 0:
++                local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
++        cute.arch.barrier()
++
++        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
++        # 3-region structure mirrors the reordered smem layout from
++        # load_chunk_to_smem:
++        #   aligned:  smem[i]                       → gmem[chunk_start + prologue_elems + i]
++        #   prologue: smem[aligned_size + i]         → gmem[chunk_start + i]
++        #   tail:     smem[aligned_size+prologue+i]  → gmem[chunk_start + prologue_elems + aligned_size + i]
++        for i in range(tidx, aligned_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if ordered < ordered_pivot:
++                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                pos = local_histogram[1] + local_pos
++                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++        for i in range(tidx, prologue_elems, self.num_threads):
++            ordered = shared_ordered[i + aligned_size]
++            if ordered < ordered_pivot:
++                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                pos = local_histogram[1] + local_pos
++                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++        for i in range(tidx, left_size, self.num_threads):
++            ordered = shared_ordered[i + aligned_size + prologue_elems]
++            if ordered < ordered_pivot:
++                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                pos = local_histogram[1] + local_pos
++                output_indices_row[pos] = cutlass.Int32(
++                    chunk_start + prologue_elems + aligned_size + i
++                )
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++
++        # Inter-CTA barrier between pass 1 and pass 2 (only thread 0 signals)
++        if tidx == 0:
++            red_release_gpu(arrival_counter_ptr, cutlass.Int32(1))
++        barrier_phase = barrier_phase + 1
++        barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
++
++        # Pass 2: equal to pivot — same 3-region structure
++        for i in range(tidx, aligned_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(output_counter_ptr, val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++        for i in range(tidx, prologue_elems, self.num_threads):
++            ordered = shared_ordered[i + aligned_size]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(output_counter_ptr, val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++        for i in range(tidx, left_size, self.num_threads):
++            ordered = shared_ordered[i + aligned_size + prologue_elems]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(output_counter_ptr, val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(
++                        chunk_start + prologue_elems + aligned_size + i
++                    )
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++
++        return barrier_phase
++
++    # ------------------------------------------------------------------
++    # Step 3-single: Single-CTA output collection (no inter-CTA barrier)
++    # ------------------------------------------------------------------
++    @cute.jit
++    def collect_output_single_cta(
++        self,
++        shared_ordered,
++        actual_chunk_size,
++        chunk_start,
++        prologue_elems,
++        aligned_size,
++        left_size,
++        ordered_pivot,
++        top_k,
++        local_histogram,
++        output_indices_row,
++        output_values_row,
++        tidx,
++    ):
++        """Single-CTA output collection using a smem counter.
++
++        No inter-CTA barrier is needed.  ``local_histogram[2]`` is reused as
++        a smem output counter (safe because the histogram phase is complete).
++        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
++        """
++        val_one = cutlass.Int32(1)
++
++        # Reuse local_histogram[2] as smem output counter
++        if tidx == 0:
++            local_histogram[2] = cutlass.Int32(0)
++        cute.arch.barrier()
++
++        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
++        # 3-region structure
++        for i in range(tidx, aligned_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if ordered < ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++        for i in range(tidx, prologue_elems, self.num_threads):
++            ordered = shared_ordered[i + aligned_size]
++            if ordered < ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++        for i in range(tidx, left_size, self.num_threads):
++            ordered = shared_ordered[i + aligned_size + prologue_elems]
++            if ordered < ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                output_indices_row[pos] = cutlass.Int32(
++                    chunk_start + prologue_elems + aligned_size + i
++                )
++                if cutlass.const_expr(output_values_row is not None):
++                    output_values_row[pos] = self.from_ordered(ordered)
++        cute.arch.barrier()
++
++        # Pass 2: equal to pivot (fill remaining slots up to k)
++        for i in range(tidx, aligned_size, self.num_threads):
++            ordered = shared_ordered[i]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++        for i in range(tidx, prologue_elems, self.num_threads):
++            ordered = shared_ordered[i + aligned_size]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++        for i in range(tidx, left_size, self.num_threads):
++            ordered = shared_ordered[i + aligned_size + prologue_elems]
++            if ordered == ordered_pivot:
++                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                if pos < top_k:
++                    output_indices_row[pos] = cutlass.Int32(
++                        chunk_start + prologue_elems + aligned_size + i
++                    )
++                    if cutlass.const_expr(output_values_row is not None):
++                        output_values_row[pos] = self.from_ordered(ordered_pivot)
++
++    # ------------------------------------------------------------------
++    # Main kernel
++    # ------------------------------------------------------------------
++    @cute.kernel
++    def single_pass_multi_cta_topk_kernel(
++        self,
++        input_data: cute.Tensor,
++        row_states: cute.Tensor,
++        seqlen: cute.Tensor,
++        output_indices: cute.Tensor,
++        output_values: cute.Tensor,
++    ):
++        """Main single-pass multi-CTA radix top-k kernel.
++
++        Grid: (total_ctas, 1, 1) where total_ctas = num_groups * ctas_per_group
++        Each group processes one row at a time in persistent round-robin fashion.
++        """
++        tidx, _, _ = cute.arch.thread_idx()
++        bidx, _, _ = cute.arch.block_idx()
++        grid_size, _, _ = cute.arch.grid_dim()
++
++        ctas_per_group = cutlass.const_expr(self.ctas_per_group)
++        chunk_size = cutlass.const_expr(self.chunk_size)
++        top_k = cutlass.const_expr(self.top_k)
++        next_n = cutlass.const_expr(self.next_n)
++        num_threads = cutlass.const_expr(self.num_threads)
++
++        group_id = bidx // ctas_per_group
++        cta_in_group = bidx % ctas_per_group
++        num_groups = grid_size // ctas_per_group
++        num_rows = input_data.shape[0]
++
++        # ---- Shared memory allocation ----
++        smem = SmemAllocator()
++
++        # local histogram [256] int32
++        local_histogram = smem.allocate_tensor(
++            element_type=cutlass.Int32,
++            layout=cute.make_ordered_layout((self.radix,), order=(0,)),
++            byte_alignment=128,
++        )
++        # prefix sum buffer [256] int32
++        prefix_buf = smem.allocate_tensor(
++            element_type=cutlass.Int32,
++            layout=cute.make_ordered_layout((self.radix,), order=(0,)),
++            byte_alignment=128,
++        )
++        # scalars: [0]=found_bucket, [1]=found_remaining_k,
++        #          [2]=prefix_lo (lower 32 bits), [3]=remaining_k
++        s_scalars = smem.allocate_tensor(
++            element_type=cutlass.Int32,
++            layout=cute.make_ordered_layout((4,), order=(0,)),
++            byte_alignment=16,
++        )
++        # warp sums for prefix sum (need num_warps entries, but radix scan uses
++        # min(radix, 256)//32 = 8 warps)
++        num_warps_scan = cutlass.const_expr(min(self.radix, 256) // 32)
++        s_warp_sums = smem.allocate_tensor(
++            element_type=cutlass.Int32,
++            layout=cute.make_ordered_layout((num_warps_scan,), order=(0,)),
++            byte_alignment=128,
++        )
++        # shared ordered data [chunk_size] ordered_type
++        shared_ordered = smem.allocate_tensor(
++            element_type=self.ordered_type,
++            layout=cute.make_ordered_layout((self.chunk_size,), order=(0,)),
++            byte_alignment=128,
++        )
++
++        # ---- Persistent loop: round-robin over rows ----
++        row_idx = group_id
++        barrier_phase = cutlass.Int32(0)
++
++        # Multi-CTA only: global state pointer (compiled away for single-CTA)
++        if cutlass.const_expr(ctas_per_group > 1):
++            state_size = cutlass.const_expr(STATE_SIZE)
++            state_base_ptr = row_states.iterator + cutlass.Int32(group_id * state_size)
++            state_row = row_states[group_id, None]
++
++            # Per-call iteration counter (row_states zeroed by caller).
++            iter_var = cutlass.Int32(0)
++
++        while row_idx < num_rows:
++            # Compute effective length from seqlen
++            seq_len = seqlen[row_idx // next_n]
++            length = seq_len - next_n + (row_idx % next_n) + 1
++
++            # My chunk boundaries
++            chunk_start = cta_in_group * chunk_size
++            actual_chunk_size = cutlass.Int32(0)
++            if chunk_start < length:
++                remaining_len = length - chunk_start
++                if remaining_len > chunk_size:
++                    actual_chunk_size = cutlass.Int32(chunk_size)
++                else:
++                    actual_chunk_size = cutlass.Int32(remaining_len)
++
++            # Early exit: k >= length → return all indices directly
++            input_row = input_data[row_idx, None]
++            output_indices_row = output_indices[row_idx, None]
++            if cutlass.const_expr(output_values is not None):
++                output_values_row = output_values[row_idx, None]
++            else:
++                output_values_row = None
++
++            if top_k >= length:
++                for i in range(tidx, actual_chunk_size, num_threads):
++                    if chunk_start + i < top_k:
++                        output_indices_row[chunk_start + i] = cutlass.Int32(chunk_start + i)
++                        if cutlass.const_expr(output_values is not None):
++                            output_values_row[chunk_start + i] = input_row[chunk_start + i]
++                # Fill remaining slots with -1 (only CTA 0 / single-CTA)
++                if cta_in_group == 0:
++                    for i in range(tidx + length, top_k, num_threads):
++                        output_indices_row[i] = cutlass.Int32(-1)
++                # Multi-CTA: clear next iter's first histogram buffer.
++                # No inter-CTA barrier needed here (FlashInfer pattern):
++                # early-exit writes no global histogram, so there is nothing
++                # to synchronize.  barrier_phase is intentionally NOT
++                # incremented so the next normal row's barrier targets remain
++                # consistent.
++                if cutlass.const_expr(ctas_per_group > 1):
++                    # CTA 0 clears the first buffer used by the next iteration
++                    # (FlashInfer pattern: histogram[(iter+1)*num_rounds % 3]).
++                    if cta_in_group == 0:
++                        num_rounds_const = cutlass.const_expr(self.num_rounds)
++                        next_first_offset = (
++                            ((iter_var + cutlass.Int32(1)) * cutlass.Int32(num_rounds_const))
++                            % cutlass.Int32(3)
++                            * cutlass.Int32(self.radix)
++                        )
++                        for i in range(tidx, self.radix, num_threads):
++                            state_row[next_first_offset + cutlass.Int32(i)] = cutlass.Int32(0)
++            else:
++                # Step 1: Load chunk to smem as ordered
++                prologue_elems, aligned_size, left_size = self.load_chunk_to_smem(
++                    input_row, shared_ordered, chunk_start, actual_chunk_size, tidx
++                )
++
++                # Step 2: Multi-round radix select
++                if cutlass.const_expr(self.dtype == cutlass.Float32):
++                    prefix = cutlass.Uint32(0)
++                else:
++                    prefix = cutlass.Uint16(0)
++                remaining_k = cutlass.Int32(top_k)
++
++                if cutlass.const_expr(ctas_per_group == 1):
++                    # ---- Single-CTA path: no global state, no barriers ----
++                    # Round 0
++                    prefix, remaining_k = self._radix_round_single_cta(
++                        0,
++                        self.ordered_bits - 1 * self.radix_bits,
++                        shared_ordered,
++                        actual_chunk_size,
++                        prefix,
++                        remaining_k,
++                        local_histogram,
++                        prefix_buf,
++                        s_scalars,
++                        s_warp_sums,
++                        num_threads,
++                        tidx,
++                    )
++                    # Round 1
++                    prefix, remaining_k = self._radix_round_single_cta(
++                        1,
++                        self.ordered_bits - 2 * self.radix_bits,
++                        shared_ordered,
++                        actual_chunk_size,
++                        prefix,
++                        remaining_k,
++                        local_histogram,
++                        prefix_buf,
++                        s_scalars,
++                        s_warp_sums,
++                        num_threads,
++                        tidx,
++                    )
++                    if cutlass.const_expr(self.num_rounds > 2):
++                        # Round 2 (fp32 only)
++                        prefix, remaining_k = self._radix_round_single_cta(
++                            2,
++                            self.ordered_bits - 3 * self.radix_bits,
++                            shared_ordered,
++                            actual_chunk_size,
++                            prefix,
++                            remaining_k,
++                            local_histogram,
++                            prefix_buf,
++                            s_scalars,
++                            s_warp_sums,
++                            num_threads,
++                            tidx,
++                        )
++                        # Round 3 (fp32 only)
++                        prefix, remaining_k = self._radix_round_single_cta(
++                            3,
++                            self.ordered_bits - 4 * self.radix_bits,
++                            shared_ordered,
++                            actual_chunk_size,
++                            prefix,
++                            remaining_k,
++                            local_histogram,
++                            prefix_buf,
++                            s_scalars,
++                            s_warp_sums,
++                            num_threads,
++                            tidx,
++                        )
++
++                    # Step 3: Collect output (smem counter, no inter-CTA sync)
++                    self.collect_output_single_cta(
++                        shared_ordered,
++                        actual_chunk_size,
++                        chunk_start,
++                        prologue_elems,
++                        aligned_size,
++                        left_size,
++                        prefix,
++                        top_k,
++                        local_histogram,
++                        output_indices_row,
++                        output_values_row,
++                        tidx,
++                    )
++
++                else:
++                    # ---- Multi-CTA path ----
++                    # Initial inter-CTA barrier for this row.
++                    if tidx == 0:
++                        red_release_gpu(
++                            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(1)
++                        )
++                    barrier_phase = barrier_phase + 1
++                    barrier_inter_cta(
++                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
++                        barrier_phase * ctas_per_group,
++                        tidx,
++                    )
++
++                    # CTA 0 resets output counter AFTER barrier (release store)
++                    if cta_in_group == 0:
++                        if tidx == 0:
++                            st_release_gpu(
++                                state_base_ptr + cutlass.Int32(_OUTPUT_COUNTER),
++                                cutlass.Int32(0),
++                            )
++
++                    num_rounds_const = cutlass.const_expr(self.num_rounds)
++                    # Round 0
++                    prefix, remaining_k, barrier_phase = self._radix_round(
++                        0,
++                        num_rounds_const,
++                        iter_var,
++                        self.ordered_bits - 1 * self.radix_bits,
++                        shared_ordered,
++                        actual_chunk_size,
++                        prefix,
++                        remaining_k,
++                        local_histogram,
++                        prefix_buf,
++                        s_scalars,
++                        s_warp_sums,
++                        state_base_ptr,
++                        state_row,
++                        cta_in_group,
++                        barrier_phase,
++                        ctas_per_group,
++                        num_threads,
++                        tidx,
++                    )
++                    # Round 1
++                    prefix, remaining_k, barrier_phase = self._radix_round(
++                        1,
++                        num_rounds_const,
++                        iter_var,
++                        self.ordered_bits - 2 * self.radix_bits,
++                        shared_ordered,
++                        actual_chunk_size,
++                        prefix,
++                        remaining_k,
++                        local_histogram,
++                        prefix_buf,
++                        s_scalars,
++                        s_warp_sums,
++                        state_base_ptr,
++                        state_row,
++                        cta_in_group,
++                        barrier_phase,
++                        ctas_per_group,
++                        num_threads,
++                        tidx,
++                    )
++
++                    if cutlass.const_expr(self.num_rounds > 2):
++                        # Round 2 (fp32 only)
++                        prefix, remaining_k, barrier_phase = self._radix_round(
++                            2,
++                            num_rounds_const,
++                            iter_var,
++                            self.ordered_bits - 3 * self.radix_bits,
++                            shared_ordered,
++                            actual_chunk_size,
++                            prefix,
++                            remaining_k,
++                            local_histogram,
++                            prefix_buf,
++                            s_scalars,
++                            s_warp_sums,
++                            state_base_ptr,
++                            state_row,
++                            cta_in_group,
++                            barrier_phase,
++                            ctas_per_group,
++                            num_threads,
++                            tidx,
++                        )
++                        # Round 3 (fp32 only)
++                        prefix, remaining_k, barrier_phase = self._radix_round(
++                            3,
++                            num_rounds_const,
++                            iter_var,
++                            self.ordered_bits - 4 * self.radix_bits,
++                            shared_ordered,
++                            actual_chunk_size,
++                            prefix,
++                            remaining_k,
++                            local_histogram,
++                            prefix_buf,
++                            s_scalars,
++                            s_warp_sums,
++                            state_base_ptr,
++                            state_row,
++                            cta_in_group,
++                            barrier_phase,
++                            ctas_per_group,
++                            num_threads,
++                            tidx,
++                        )
++
++                    # Count > pivot elements per CTA (for batch atomicAdd)
++                    local_gt_count = self.compute_local_gt_count(
++                        shared_ordered, actual_chunk_size, prefix, local_histogram, tidx
++                    )
++
++                    # Step 3: Collect output
++                    output_counter_ptr = state_base_ptr + cutlass.Int32(_OUTPUT_COUNTER)
++                    arrival_counter_ptr = state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER)
++
++                    barrier_phase = self.collect_output(
++                        shared_ordered,
++                        actual_chunk_size,
++                        chunk_start,
++                        prologue_elems,
++                        aligned_size,
++                        left_size,
++                        prefix,
++                        top_k,
++                        local_gt_count,
++                        output_counter_ptr,
++                        arrival_counter_ptr,
++                        barrier_phase,
++                        ctas_per_group,
++                        local_histogram,
++                        output_indices_row,
++                        output_values_row,
++                        tidx,
++                    )
++
++                    # Final inter-CTA barrier: ensure all CTAs finish before
++                    # moving to the next row.
++                    if tidx == 0:
++                        red_release_gpu(arrival_counter_ptr, cutlass.Int32(1))
++                    barrier_phase = barrier_phase + 1
++                    barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
++
++            # Advance to next row (round-robin).
++            row_idx = row_idx + num_groups
++            if cutlass.const_expr(ctas_per_group > 1):
++                iter_var = iter_var + cutlass.Int32(1)
++
++        # End-of-kernel cleanup (FlashInfer-style): CTA 0 resets state so the
++        # next kernel call can use torch.empty instead of torch.zeros.
++        if cutlass.const_expr(ctas_per_group > 1):
++            if cta_in_group == 0:
++                hist_total = cutlass.const_expr(3 * self.radix)
++                for i in range(tidx, hist_total, num_threads):
++                    state_row[i] = cutlass.Int32(0)
++                if tidx == 0:
++                    st_release_gpu(
++                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(0)
++                    )
++
++    # ------------------------------------------------------------------
++    # Host-side launcher
++    # ------------------------------------------------------------------
++    @cute.jit
++    def __call__(
++        self,
++        input_data: cute.Tensor,
++        row_states: cute.Tensor,
++        seqlen: cute.Tensor,
++        output_indices: cute.Tensor,
++        output_values: cute.Tensor,
++        stream,
++    ):
++        num_rows = input_data.shape[0]
++        ctas_per_group = cutlass.const_expr(self.ctas_per_group)
++        num_groups = min(self.num_sms // ctas_per_group, num_rows)
++        total_ctas = num_groups * ctas_per_group
++
++        self.single_pass_multi_cta_topk_kernel(
++            input_data,
++            row_states,
++            seqlen,
++            output_indices,
++            output_values,
++        ).launch(
++            grid=(total_ctas, 1, 1),
++            block=(self.num_threads, 1, 1),
++            stream=stream,
++        )
+diff --git a/tensorrt_llm/_torch/model_config.py b/tensorrt_llm/_torch/model_config.py
+index 5bd4d62ab4d6..1d567c2051c3 100644
+--- a/tensorrt_llm/_torch/model_config.py
++++ b/tensorrt_llm/_torch/model_config.py
+@@ -521,6 +521,7 @@ def from_pretrained(cls,
+                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
++                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                         q_split_threshold = sparse_attention_config.q_split_threshold
+                     else:
+                         index_n_heads = pretrained_config.index_n_heads
+@@ -528,6 +529,7 @@ def from_pretrained(cls,
+                         index_topk = pretrained_config.index_topk
+                         indexer_max_chunk_size = None
+                         skip_indexer_for_short_seqs = True
++                        use_cute_dsl_topk = False
+                         q_split_threshold = 8192
+                     kwargs[
+                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+@@ -537,6 +539,7 @@ def from_pretrained(cls,
+                             indexer_max_chunk_size=indexer_max_chunk_size,
+                             skip_indexer_for_short_seqs=
+                             skip_indexer_for_short_seqs,
++                            use_cute_dsl_topk=use_cute_dsl_topk,
+                             q_split_threshold=q_split_threshold,
+                             indexer_rope_interleave=indexer_rope_interleave)
+             else:
+diff --git a/tensorrt_llm/llmapi/llm_args.py b/tensorrt_llm/llmapi/llm_args.py
+index 9a8dd6ab5817..e8affa7741da 100644
+--- a/tensorrt_llm/llmapi/llm_args.py
++++ b/tensorrt_llm/llmapi/llm_args.py
+@@ -322,6 +322,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
+         default=True,
+         description=
+         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
++    use_cute_dsl_topk: bool = Field(
++        default=False,
++        description=
++        "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
++    )
+     q_split_threshold: int = Field(
+         default=8192,
+         description=
+diff --git a/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py b/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
+index ae449d2f93d5..46bb102fcf7a 100644
+--- a/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
++++ b/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
+@@ -69,6 +69,7 @@ def __init__(self, index_head_dim, index_n_heads, index_topk):
+             self.index_n_heads = index_n_heads
+             self.index_topk = index_topk
+             self.prompt_budget = 1024
++            self.use_cute_dsl_topk = False
+ 
+     sparse_attn_config = SparseAttentionConfig(
+         index_head_dim=head_dim,
+diff --git a/tests/unittest/_torch/thop/parallel/test_indexer_topk.py b/tests/unittest/_torch/thop/parallel/test_indexer_topk.py
+index a41cbff8f8ad..84fe094efa6c 100644
+--- a/tests/unittest/_torch/thop/parallel/test_indexer_topk.py
++++ b/tests/unittest/_torch/thop/parallel/test_indexer_topk.py
+@@ -4,6 +4,7 @@
+ 
+ # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
+ import tensorrt_llm  # noqa: F401
++from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+ 
+ # Import CuTE DSL utils
+ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+@@ -287,6 +288,11 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
+     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+ 
+     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
++    # Clamp seq_lens so that every effective row length >= index_topk.
++    # With next_n > 1, effective length = seq_len - next_n + offset + 1,
++    # and the minimum (offset=0) is seq_len - next_n + 1.
++    # Ensure seq_len >= next_n so effective length is at least 1.
++    seq_lens = seq_lens.clamp(min=next_n)
+     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+ 
+     logits = create_random_logits(row_starts, row_ends, dtype, 42)
+@@ -306,13 +312,15 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
+ 
+ @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+ @skip_pre_blackwell
+-@pytest.mark.parametrize("batch_size", [1, 4, 64])
++@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
+ @pytest.mark.parametrize("next_n", [1, 3])
+ @pytest.mark.parametrize("index_topk", [2048])
+ @pytest.mark.parametrize("num_tokens", [4096, 8192])
+ @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+ @pytest.mark.parametrize("load_balance", [False, True])
+-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype, load_balance):
++def test_cute_dsl_topk_decode_single_cta(
++    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
++):
+     _run_cute_dsl_topk_test(
+         batch_size,
+         next_n,
+@@ -367,17 +375,53 @@ def test_cute_dsl_topk_decode_multi_cta(
+ @pytest.mark.parametrize("index_topk", [2048])
+ @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
+ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
++    num_gen_tokens = batch_size * next_n
++
++    def run_fn(logits, seq_lens):
++        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
++        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
++            input_values=logits,
++            seq_lens=seq_lens,
++            output_indices=output_indices,
++            top_k=index_topk,
++            next_n=next_n,
++            num_copy_bits=256,
++        )
++        return output_indices
++
+     _run_cute_dsl_topk_test(
+         batch_size,
+         next_n,
+         index_topk,
+         num_tokens,
+         torch.float32,
+-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_indexer_topk_decode(
++        run_fn,
++    )
++
++
++@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
++@skip_pre_blackwell
++@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
++@pytest.mark.parametrize("next_n", [1, 2, 3])
++@pytest.mark.parametrize("index_topk", [2048])
++@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
++def test_cute_dsl_topk_decode_single_pass_multi_cta(
++    batch_size, next_n, index_topk, num_tokens, dtype
++):
++    _run_cute_dsl_topk_test(
++        batch_size,
++        next_n,
++        index_topk,
++        num_tokens,
++        dtype,
++        lambda logits,
++        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
+             input_values=logits,
+             seq_lens=seq_lens,
+             top_k=index_topk,
+             next_n=next_n,
++            return_val=False,
+             num_copy_bits=256,
+-        ),
++        )[0],
+     )

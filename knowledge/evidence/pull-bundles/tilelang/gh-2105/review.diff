@@ -1,0 +1,480 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 576eb5b6ca..57b29f50db 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -86,7 +86,7 @@ jobs:
+             name: self-hosted-amd
+             # Format: [Nightly-]ROCm-<major>.<minor>[.<patch>]. E.g., "ROCm-6.4" or "Nightly-ROCm-7.0".
+             # Use "Nightly-" prefix to use torch nightly builds.
+-            toolkit: Nightly-ROCm-7.1
++            toolkit: Nightly-ROCm-7.2
+           - tags: [macos-latest]
+             name: macos-latest
+             toolkit: Metal # or Nightly-Metal
+diff --git a/src/tl_templates/hip/copy.h b/src/tl_templates/hip/copy.h
+index c691017148..6142e3fdfb 100644
+--- a/src/tl_templates/hip/copy.h
++++ b/src/tl_templates/hip/copy.h
+@@ -91,16 +91,14 @@ CK_TILE_DEVICE void async_buffer_load_dwordx4_v(void *smem, int32x4_t rsrc,
+ template <int N>
+ TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
+   if constexpr (N == 16) {
+-#if defined(__gfx950__)
+-    // gfx950: use 128-bit direct-to-LDS async copy (buffer_load_dwordx4 lds)
+-    async_buffer_load_dwordx4_v(
+-        lds_base_ptr,
+-        make_wave_buffer_resource(((const int32_t *)global_base_ptr) -
+-                                  threadIdx.x),
+-        threadIdx.x * N /*16 bytes*/);
+-#else
++    // NOTE: the gfx950 buffer_load_dwordx4 ... lds path requires the per-thread
++    // LDS destination address to be exactly base + threadIdx.x * 16 bytes
++    // (i.e. no swizzling).  The pipeline-planning pass generates swizzled LDS
++    // layouts that violate this constraint, so we always use the synchronous
++    // uint4 store here.  The T.async_copy path (called with a known-linear LDS
++    // layout) may still use the fast async path via async_buffer_load_dwordx4_v
++    // directly.
+     *(uint4 *)lds_base_ptr = *(const uint4 *)global_base_ptr;
+-#endif
+   } else if constexpr (N == 8) {
+     *(uint2 *)lds_base_ptr = *(const uint2 *)global_base_ptr;
+   } else if constexpr (N == 4) {
+@@ -116,21 +114,14 @@ template <int N>
+ TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
+                                        void const *global_base_ptr, bool cond) {
+   if constexpr (N == 16) {
+-#if defined(__gfx950__)
+-    // gfx950: use 128-bit direct-to-LDS async copy (buffer_load_dwordx4 lds)
+-    if (cond) {
+-      async_buffer_load_dwordx4_v(
+-          lds_base_ptr,
+-          make_wave_buffer_resource(((const int32_t *)global_base_ptr) -
+-                                    threadIdx.x),
+-          threadIdx.x * N /*16 bytes*/);
+-    } else {
+-      *(uint4 *)lds_base_ptr = make_uint4(0, 0, 0, 0);
+-    }
+-#else
++    // NOTE: same reasoning as cp_async_gs above — the pipeline-planning pass
++    // generates swizzled LDS layouts that are incompatible with the gfx950
++    // buffer_load_dwordx4 ... lds path (which requires a linear, un-swizzled
++    // destination).  Use the synchronous uint4 path here as well so that
++    // cp_async_wait (which issues s_waitcnt vmcnt) correctly synchronises the
++    // data before the consumer MFMA reads it.
+     *(uint4 *)lds_base_ptr =
+         cond ? *(const uint4 *)global_base_ptr : make_uint4(0, 0, 0, 0);
+-#endif
+   } else if constexpr (N == 8) {
+     *(uint2 *)lds_base_ptr =
+         cond ? *(const uint2 *)global_base_ptr : make_uint2(0, 0);
+diff --git a/src/transform/pipeline_planning.cc b/src/transform/pipeline_planning.cc
+index 6911a73ce9..5cc2344508 100644
+--- a/src/transform/pipeline_planning.cc
++++ b/src/transform/pipeline_planning.cc
+@@ -1074,22 +1074,28 @@ class PipelinePlanner : public StmtExprMutator {
+     if (!num_stages_anno)
+       return StmtExprMutator::VisitStmt_(loop);
+     int num_stages = num_stages_anno->as<IntImmNode>()->value;
+-    // On HIP/ROCM, skip software pipelining for multi-stage loops.
+-    // Double-buffering (num_stages > 1) doubles the LDS allocation for every
+-    // shared buffer declared inside the loop body, which easily exhausts the
+-    // per-workgroup LDS limit and causes hipModuleLaunchKernel to return
+-    // HIPERRORINVALIDVALUE.  LDS limits by generation:
+-    //   gfx942 (CDNA3 / MI300X): 64 KB per workgroup
+-    //   gfx950 (CDNA4 / MI350):  160 KB per workgroup (see PR #2058)
+-    // Even with the larger gfx950 budget, double-buffering a pair of large
+-    // shared tiles (e.g. bM×bK + bK×bN in bf16) can exceed 160 KB, and the
+-    // HIP async-copy infrastructure used by the CUDA pipeline planner has no
+-    // equivalent on ROCM today.  Setting num_stages = 1 inside the planner
+-    // generates incorrect copy loops, so the safest fallback is a plain
+-    // sequential loop where T.copy executes synchronously without any
+-    // async-copy or double-buffering infrastructure.
+-    if (TargetIsRocm(target_) && num_stages > 1) {
+-      return StmtExprMutator::VisitStmt_(loop);
++    // Skip software pipelining on ROCm targets where async-copy pipelining
++    // has not been validated.  Currently only gfx950 (CDNA4 / MI350) supports
++    // the full HIP async-copy pipeline path.  gfx942 (CDNA3 / MI300X) has
++    // async-copy hardware but the software pipeline for that target has not
++    // been validated yet, so it falls back to a plain sequential loop as well.
++    // RDNA targets have no async-copy support at all and also fall back.
++    if (TargetIsRocm(target_) && !TargetIsGfx950(target_) && num_stages >= 1) {
++      // Strip the "num_stages" annotation before recursing so that downstream
++      // passes (InjectSoftwarePipeline, MultiVersionBufferRewriter, etc.) do
++      // not treat this loop as pipelined.  Leaving the annotation in place
++      // would cause those passes to multi-version shared buffers and inject
++      // cp.async / barrier code that is incompatible with the plain sequential
++      // execution path chosen here.
++      auto stripped = tvm::ffi::GetRef<For>(loop);
++      Map<String, Any> annotations;
++      for (const auto &[key, value] : loop->annotations) {
++        if (key != "num_stages") {
++          annotations.Set(key, value);
++        }
++      }
++      stripped.CopyOnWrite()->annotations = annotations;
++      return StmtExprMutator::VisitStmt_(stripped.get());
+     }
+     Stmt pipeline_body_root{nullptr};
+     if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
+diff --git a/testing/python/amd/test_tilelang_gemm_mfma_preshuffle.py b/testing/python/amd/test_tilelang_gemm_mfma_preshuffle.py
+index 2df6b1962d..abedd1f19b 100644
+--- a/testing/python/amd/test_tilelang_gemm_mfma_preshuffle.py
++++ b/testing/python/amd/test_tilelang_gemm_mfma_preshuffle.py
+@@ -399,7 +399,7 @@ def test_assert_tl_matmul(
+         (256, 256, 512, T.int8, T.int32, T.int32, True, 1, True, (32, 32, 32)),
+     ],
+ )
+-@tilelang.testing.requires_rocm
++@tilelang.testing.requires_gfx950
+ def test_assert_tl_matmul_extended_mfma(
+     M,
+     N,
+diff --git a/testing/python/amd/test_tilelang_gfx950_copy_async.py b/testing/python/amd/test_tilelang_gfx950_copy_async.py
+index 78712ef11c..18935db938 100644
+--- a/testing/python/amd/test_tilelang_gfx950_copy_async.py
++++ b/testing/python/amd/test_tilelang_gfx950_copy_async.py
+@@ -13,21 +13,7 @@
+ import tilelang as tl
+ import tilelang.language as T
+ import tilelang.testing
+-
+-
+-# ---------------------------------------------------------------------------
+-# Helpers
+-# ---------------------------------------------------------------------------
+-
+-
+-def _is_gfx950() -> bool:
+-    try:
+-        from tilelang import tvm
+-
+-        mcpu = str(tvm.target.Target("rocm").attrs.get("mcpu", ""))
+-        return "gfx950" in mcpu
+-    except Exception:
+-        return False
++from tilelang.testing import _check_is_gfx950 as _is_gfx950
+ 
+ 
+ def _matmul_kernel(
+@@ -86,10 +72,62 @@ def main(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-@tilelang.testing.requires_rocm
++def _matmul_kernel_async(
++    M,
++    N,
++    K,
++    block_M,
++    block_N,
++    block_K,
++    trans_A,
++    trans_B,
++    in_dtype,
++    out_dtype,
++    accum_dtype,
++    coalesced_width=4,
++    threads=128,
++):
++    """Return a prim_func using T.async_copy (explicit async, no pipeline) for codegen tests."""
++    A_shape = (K, M) if trans_A else (M, K)
++    B_shape = (N, K) if trans_B else (K, N)
++    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
++    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
++
++    @T.prim_func
++    def main(
++        A: T.Tensor(A_shape, in_dtype),
++        B: T.Tensor(B_shape, in_dtype),
++        C: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
++            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
++            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            T.clear(C_local)
++            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
++                if trans_A:
++                    T.async_copy(A[k * block_K, by * block_M], A_shared, coalesced_width=coalesced_width)
++                else:
++                    T.async_copy(A[by * block_M, k * block_K], A_shared, coalesced_width=coalesced_width)
++                if trans_B:
++                    T.async_copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=coalesced_width)
++                else:
++                    T.async_copy(B[k * block_K, bx * block_N], B_shared, coalesced_width=coalesced_width)
++                T.gemm(A_shared, B_shared, C_local, trans_A, trans_B)
++            T.copy(C_local, C[by * block_M, bx * block_N])
++
++    return main
++
++
++@tilelang.testing.requires_gfx950
+ def test_gfx950_cp_async_gs_16_in_codegen():
+-    """coalesced_width=8 (16 bytes) must emit cp_async_gs<16> in generated HIP source."""
+-    prog = _matmul_kernel(
++    """coalesced_width=8 (16 bytes) must emit cp_async_gs<16> in generated HIP source.
++
++    Uses T.async_copy (explicit async semantics) so that the 16-byte path is
++    emitted verbatim without relying on the software pipeline planner.
++    Pipelining correctness is covered separately by test_gfx950_copy_async_gemm_pipelined.
++    """
++    prog = _matmul_kernel_async(
+         256,
+         256,
+         256,
+@@ -101,7 +139,6 @@ def test_gfx950_cp_async_gs_16_in_codegen():
+         T.float16,
+         T.float32,
+         T.float32,
+-        num_stages=2,
+         coalesced_width=8,  # 8 fp16 = 16 bytes → cp_async_gs<16>
+     )
+     kernel = tl.compile(prog, out_idx=[2])
+@@ -147,7 +184,7 @@ def test_gfx950_smem_cap_160kb():
+         (True, False, 1),
+     ],
+ )
+-@tilelang.testing.requires_rocm
++@tilelang.testing.requires_gfx950
+ def test_gfx950_copy_async_gemm_pipelined(trans_A, trans_B, k_pack):
+     """Pipelined GEMM (num_stages=2) with gfx950 copy.async must be numerically correct."""
+     prog = _matmul_kernel(
+diff --git a/testing/python/amd/test_tilelang_hip_codegen.py b/testing/python/amd/test_tilelang_hip_codegen.py
+index 203f5f1653..d042a3d08e 100644
+--- a/testing/python/amd/test_tilelang_hip_codegen.py
++++ b/testing/python/amd/test_tilelang_hip_codegen.py
+@@ -685,30 +685,26 @@ def test_pipelined_no_lds_overflow(num_stages):
+     M, K, blk = 32, 256, 64
+ 
+     @tilelang.jit
+-    def pipelined_rowsum(n_stages: int):
+-        @T.prim_func
+-        def kernel(
+-            x: T.Tensor((M, K), T.float32),
+-            out: T.Tensor((M,), T.float32),
+-        ) -> None:
+-            with T.Kernel(M, threads=64) as pid:
+-                acc = T.alloc_fragment((1,), T.float32)
+-                T.clear(acc)
+-                for k in T.Pipelined(K // blk, num_stages=n_stages):
+-                    xs = T.alloc_shared((blk,), T.float32)
+-                    xl = T.alloc_fragment((blk,), T.float32)
+-                    T.copy(x[pid, k * blk], xs, disable_tma=True)
+-                    T.copy(xs, xl, disable_tma=True)
+-                    s = T.alloc_fragment((1,), T.float32)
+-                    T.reduce_sum(xl, s, dim=0)
+-                    acc[0] = acc[0] + s[0]
+-                out[pid] = acc[0]
+-
+-        return kernel
++    def kernel(
++        x: T.Tensor((M, K), T.float32),
++        out: T.Tensor((M,), T.float32),
++    ) -> None:
++        with T.Kernel(M, threads=64) as pid:
++            acc = T.alloc_fragment((1,), T.float32)
++            xs = T.alloc_shared((blk,), T.float32)
++            xl = T.alloc_fragment((blk,), T.float32)
++            s = T.alloc_fragment((1,), T.float32)
++            T.clear(acc)
++            for k in T.Pipelined(K // blk, num_stages=num_stages):
++                T.copy(x[pid, k * blk], xs, disable_tma=True)
++                T.copy(xs, xl, disable_tma=True)
++                T.reduce_sum(xl, s, dim=0)
++                acc[0] = acc[0] + s[0]
++            out[pid] = acc[0]
+ 
+     x = torch.ones(M, K, dtype=torch.float32, device="cuda")
+     out = torch.zeros(M, dtype=torch.float32, device="cuda")
+-    pipelined_rowsum(num_stages)(x, out)
++    kernel(x, out)
+     torch.cuda.synchronize()
+     torch.testing.assert_close(out, torch.full((M,), float(K), device="cuda"), atol=1e-4, rtol=0)
+ 
+@@ -725,30 +721,26 @@ def test_pipelined_multi_stage_fp16_gemm(num_stages):
+     bM, bN, bK = 64, 64, 32
+ 
+     @tilelang.jit
+-    def fp16_gemm(n_stages: int):
+-        @T.prim_func
+-        def kernel(
+-            A: T.Tensor((M, K), T.float16),
+-            B: T.Tensor((K, N), T.float16),
+-            C: T.Tensor((M, N), T.float32),
+-        ) -> None:
+-            with T.Kernel(T.ceildiv(N, bN), T.ceildiv(M, bM), threads=128) as (bx, by):
+-                A_s = T.alloc_shared((bM, bK), T.float16)
+-                B_s = T.alloc_shared((bK, bN), T.float16)
+-                C_l = T.alloc_fragment((bM, bN), T.float32)
+-                T.clear(C_l)
+-                for k in T.Pipelined(K // bK, num_stages=n_stages):
+-                    T.copy(A[by * bM, k * bK], A_s)
+-                    T.copy(B[k * bK, bx * bN], B_s)
+-                    T.gemm(A_s, B_s, C_l)
+-                T.copy(C_l, C[by * bM, bx * bN])
+-
+-        return kernel
++    def kernel(
++        A: T.Tensor((M, K), T.float16),
++        B: T.Tensor((K, N), T.float16),
++        C: T.Tensor((M, N), T.float32),
++    ) -> None:
++        with T.Kernel(T.ceildiv(N, bN), T.ceildiv(M, bM), threads=128) as (bx, by):
++            A_s = T.alloc_shared((bM, bK), T.float16)
++            B_s = T.alloc_shared((bK, bN), T.float16)
++            C_l = T.alloc_fragment((bM, bN), T.float32)
++            T.clear(C_l)
++            for k in T.Pipelined(K // bK, num_stages=num_stages):
++                T.copy(A[by * bM, k * bK], A_s)
++                T.copy(B[k * bK, bx * bN], B_s)
++                T.gemm(A_s, B_s, C_l)
++            T.copy(C_l, C[by * bM, bx * bN])
+ 
+     A = torch.randn(M, K, dtype=torch.float16, device="cuda")
+     B = torch.randn(K, N, dtype=torch.float16, device="cuda")
+     C = torch.zeros(M, N, dtype=torch.float32, device="cuda")
+-    fp16_gemm(num_stages)(A, B, C)
++    kernel(A, B, C)
+     torch.cuda.synchronize()
+     torch.testing.assert_close(C, A.float() @ B.float(), atol=1.0, rtol=5e-2)
+ 
+diff --git a/testing/python/components/test_storage_rewrite_detect_inplace.py b/testing/python/components/test_storage_rewrite_detect_inplace.py
+index 3dcd7f57c5..4fe7fdd86b 100644
+--- a/testing/python/components/test_storage_rewrite_detect_inplace.py
++++ b/testing/python/components/test_storage_rewrite_detect_inplace.py
+@@ -1,9 +1,6 @@
+ import tilelang
+ import tilelang.testing
+ from tilelang import language as T
+-from tilelang.utils.target import check_hip_availability
+-
+-_IS_HIP_AVAILABLE = check_hip_availability()
+ 
+ 
+ @tilelang.jit
+@@ -57,9 +54,11 @@ def test_storage_rewrite_detect_inplace_toggle():
+     script_off = _get_device_kernel_script(detect_inplace=False)
+     script_on = _get_device_kernel_script(detect_inplace=True)
+ 
+-    pattern = "read[0] = (read[0] * 2);" if _IS_HIP_AVAILABLE else "read = (read * 2);"
+-    assert script_off.count(pattern) == 0
+-    assert script_on.count(pattern) > 0
++    pattern_on = "read = (read * 2);"
++    pattern_off = "write = (read * 2);"
++    assert script_off.count(pattern_on) == 0, f"inplace pattern found when disabled:\n{script_off}"
++    assert script_on.count(pattern_on) > 0, f"inplace pattern not found when enabled:\n{script_on}"
++    assert script_off.count(pattern_off) > 0, f"separate-write pattern not found when disabled:\n{script_off}"
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tilelang/intrinsics/mfma_layout.py b/tilelang/intrinsics/mfma_layout.py
+index 62eb0dd9e0..3c4bda41d2 100644
+--- a/tilelang/intrinsics/mfma_layout.py
++++ b/tilelang/intrinsics/mfma_layout.py
+@@ -140,6 +140,20 @@ def thread_id_shared_access_64x16_to_32x32_layout_C_n_m(thread_id, local_id):
+     return i, j
+ 
+ 
++def thread_id_shared_access_64x16_to_32x32_layout_C_m_n(thread_id, local_id):
++    """Return (m, n) = (row, col) for the 32x32 MFMA output register layout.
++
++    For v_mfma_i32_32x32x32_i8 (gfx950), each wave-64 lane holds 16 output
++    i32 values.  The column (N-dimension) is indexed by ``thread_id % 32``
++    and the row (M-dimension) is given by the interleaved formula below.
++    This function returns ``(m_idx, n_idx)`` matching the ``(row, col)``
++    convention expected by ``stmatrix``.
++    """
++    m = (thread_id // 32) * 4 + local_id % 4 + (local_id // 4) * 8
++    n = thread_id % 32
++    return m, n
++
++
+ def shared_32x32_to_local_64x16_layout_A(i, j):
+     thread_id = i + 32 * (j // 16)
+     local_id = j % 16
+diff --git a/tilelang/intrinsics/mfma_macro_generator.py b/tilelang/intrinsics/mfma_macro_generator.py
+index 737934d254..71c76051d8 100644
+--- a/tilelang/intrinsics/mfma_macro_generator.py
++++ b/tilelang/intrinsics/mfma_macro_generator.py
+@@ -519,9 +519,9 @@ def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
+         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
+ 
+         if M_DIM == 32:
+-            from .mfma_layout import thread_id_shared_access_64x16_to_32x32_layout_C_n_m
++            from .mfma_layout import thread_id_shared_access_64x16_to_32x32_layout_C_m_n
+ 
+-            _store_map = thread_id_shared_access_64x16_to_32x32_layout_C_n_m
++            _store_map = thread_id_shared_access_64x16_to_32x32_layout_C_m_n
+         else:
+             _store_map = mfma_store_index_map
+ 
+diff --git a/tilelang/intrinsics/utils.py b/tilelang/intrinsics/utils.py
+index 30556499f9..f65fff1a9b 100644
+--- a/tilelang/intrinsics/utils.py
++++ b/tilelang/intrinsics/utils.py
+@@ -10,7 +10,7 @@
+     mma_store_32x8_to_shared_16x16_layout,
+     mma_store_32x2_to_shared_8x8_layout_fp64,
+ )
+-from .mfma_layout import thread_id_shared_access_64x4_to_16x16_layout_C_n_m, thread_id_shared_access_64x16_to_32x32_layout_C_n_m
++from .mfma_layout import thread_id_shared_access_64x4_to_16x16_layout_C_n_m, thread_id_shared_access_64x16_to_32x32_layout_C_m_n
+ 
+ from .mma_layout import get_swizzle_layout  # noqa: F401
+ from .mma_layout import make_mma_swizzle_layout  # noqa: F401
+@@ -94,7 +94,7 @@ def mfma_store_index_map(thread_id, local_id):
+ 
+ 
+ def mfma_store_index_map_32x32(thread_id, local_id):
+-    return thread_id_shared_access_64x16_to_32x32_layout_C_n_m(thread_id, local_id)
++    return thread_id_shared_access_64x16_to_32x32_layout_C_m_n(thread_id, local_id)
+ 
+ 
+ def get_mma_micro_size(dtype: Literal["float16", "int8"]):
+diff --git a/tilelang/testing/__init__.py b/tilelang/testing/__init__.py
+index 1c466eeb3e..6008bfcf12 100644
+--- a/tilelang/testing/__init__.py
++++ b/tilelang/testing/__init__.py
+@@ -5,6 +5,7 @@
+ import torch
+ import numpy as np
+ from tilelang.contrib import nvcc
++from tilelang.utils.target import determine_target, target_is_gfx950
+ from tvm.testing.utils import requires_cuda, requires_package, requires_llvm, requires_metal, requires_rocm, _compose
+ 
+ from tilelang.utils.tensor import torch_assert_close as torch_assert_close
+@@ -16,6 +17,7 @@
+     "requires_metal",
+     "requires_rocm",
+     "requires_llvm",
++    "requires_gfx950",
+     "main",
+     "requires_cuda_compute_version",
+     "process_func",
+@@ -23,6 +25,27 @@
+ ] + [f"requires_cuda_compute_version_{op}" for op in ("ge", "gt", "le", "lt", "eq")]
+ 
+ 
++def _check_is_gfx950() -> bool:
++    try:
++        target = determine_target("auto", return_object=True)
++        return target_is_gfx950(target)
++    except (ValueError, RuntimeError):
++        return False
++
++
++def requires_gfx950(func):
++    """Skip the test unless the ROCm device is gfx950 (CDNA4 / MI350)."""
++    is_gfx950 = _check_is_gfx950()
++    marks = [
++        pytest.mark.skipif(
++            not is_gfx950,
++            reason="Requires gfx950 (CDNA4/MI350)",
++        ),
++        *requires_rocm.marks(),
++    ]
++    return _compose([func], marks)
++
++
+ # pytest.main() wrapper to allow running single test file
+ def main():
+     test_file = inspect.getsourcefile(sys._getframe(1))

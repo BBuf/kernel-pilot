@@ -9,6 +9,5 @@
 git clone --recursive --branch dev --depth 1 https://github.com/PolyArch/humanize.git humanize
 ```
 
-KernelPilot patches add `humanize-kernel-agent-loop` and installer hydration for
-the KernelPilot knowledge root.
-
+KernelPilot patches add `humanize-kernel-agent-loop`, `ncu-report`, and
+installer hydration for the KernelPilot knowledge root.

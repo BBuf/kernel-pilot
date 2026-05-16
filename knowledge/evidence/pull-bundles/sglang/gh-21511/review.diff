@@ -1,0 +1,737 @@
+diff --git a/docker/rocm.Dockerfile b/docker/rocm.Dockerfile
+index 33b4e96580a1..d53f657f08fe 100644
+--- a/docker/rocm.Dockerfile
++++ b/docker/rocm.Dockerfile
+@@ -88,7 +88,7 @@ ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+ 
+ ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
+-ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
++ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
+ 
+ ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
+ ARG FHT_BRANCH="rocm"
+diff --git a/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py b/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
+index 35fe6997d79f..bfc62d7f0b19 100644
+--- a/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
++++ b/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
+@@ -1,3 +1,4 @@
++from functools import lru_cache
+ from typing import Optional, Tuple
+ 
+ import tilelang
+@@ -44,6 +45,23 @@ def fast_round_scale(amax, fp8_max_inv):
+     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
+ 
+ 
++@lru_cache(maxsize=8)
++def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
++    """
++    Pick the largest valid inner_iter (power-of-two divisor of ni) that keeps
++    enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
++    under-utilization while minimizing the number of partial groups.
++    """
++
++    max_it = int(seq * ni / (cu * block_per_cu))
++    it = ni
++    while it >= 2:
++        if it <= max_it and ni % it == 0:
++            return it
++        it //= 2
++    return 1
++
++
+ @tilelang.jit(pass_configs=pass_configs)
+ def act_quant_kernel(
+     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
+@@ -1037,6 +1055,255 @@ def main(
+     return main
+ 
+ 
++@tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
++def sparse_mla_fwd_decode_partial_fp8(
++    num_heads: int,
++    d_v: int,
++    d_tail: int,
++    topk: int,
++    *,
++    sm_scale=None,
++    block_I=64,
++    inner_iter=1,
++    threads=256,
++):
++    assert d_v == 512, f"only support d_v=512"
++    assert (
++        topk % block_I == 0
++    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
++
++    # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
++    # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
++    # This is numerically safe because softmax output is bounded by 1.
++    fp8_dtype = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
++    fp8_max_val = 240.0 if _is_fp8_fnuz else 448.0
++    s_inv_scale_const = fp8_max_val
++    s_scale_const = 1.0 / fp8_max_val
++
++    BI = block_I
++    group_size = 128
++    dim_quant_fp8 = d_v + d_tail
++    rope_offset_fp8 = d_v
++    n_groups = topk // (BI * inner_iter)
++
++    if sm_scale is None:
++        sm_scale = (1.0 / (d_v + d_tail)) ** 0.5 * 1.44269504
++    else:
++        sm_scale = sm_scale * 1.44269504
++
++    h_per_block = 16
++    # Match bf16 partial behavior: keep fixed 16-head tiles and use
++    # sliced T.copy on H0:H1 for tail handling.
++    assert (
++        num_heads <= h_per_block or num_heads % h_per_block == 0
++    ), "num_heads must be <=16 or divisible by 16"
++    head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
++
++    batch = 1
++    kv_group = 1
++    seq_len = T.symbolic("seq_len")
++    num_pages = T.symbolic("num_pages")
++
++    q_fp8_shape = [batch, seq_len, num_heads, d_v + d_tail]
++    kv_fp8_shape = [batch, num_pages, kv_group, dim_quant_fp8]
++    idx_shape = [batch, seq_len, kv_group, topk]
++    partial_o_shape = [batch, seq_len, n_groups, num_heads, d_v]
++    partial_lse_shape = [batch, seq_len, n_groups, num_heads]
++
++    accum_dtype = T.float32
++    dtype_bf16 = T.bfloat16
++
++    @T.prim_func
++    def main(
++        q_fp8: T.Tensor(q_fp8_shape, fp8_dtype),
++        kv_fp8: T.Tensor(kv_fp8_shape, fp8_dtype),
++        indices: T.Tensor(idx_shape, T.int32),
++        partial_o: T.Tensor(partial_o_shape, dtype_bf16),
++        partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
++    ):
++        with T.Kernel(seq_len * head_blocks_per_seq, n_groups, threads=threads) as (
++            bx,
++            by,
++        ):
++            b_i, g_i = 0, 0
++            s_i = bx // head_blocks_per_seq
++            group_i = by
++            H0 = (bx % head_blocks_per_seq) * h_per_block
++            H1 = H0 + h_per_block
++
++            # We intentionally split the K=512 GEMM into 4x128 tiles.
++            # Although this adds extra intermediate memory traffic,
++            # it shortens the MFMA accumulation dependency chain and improves performance.
++            q_tile0 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
++            q_tile1 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
++            q_tile2 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
++            q_tile3 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
++            kv_tile0 = T.alloc_shared([BI, group_size], fp8_dtype)
++            kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
++            kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
++            kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
++            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
++            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
++            s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
++            page_idx_shared = T.alloc_shared([BI], T.int32)
++
++            mask = T.alloc_fragment([BI], T.bool)
++            acc_s = T.alloc_fragment([h_per_block, BI], accum_dtype)
++            acc_tile = T.alloc_fragment([h_per_block, BI], accum_dtype)
++            sv_tile = T.alloc_fragment([h_per_block, group_size], accum_dtype)
++            sumexp = T.alloc_fragment([h_per_block], accum_dtype)
++            sumexp_i = T.alloc_fragment([h_per_block], accum_dtype)
++            alpha = T.alloc_fragment([h_per_block], accum_dtype)
++            m_i = T.alloc_fragment([h_per_block], accum_dtype)
++            m_i_prev = T.alloc_fragment([h_per_block], accum_dtype)
++            inv_denom = T.alloc_fragment([h_per_block], accum_dtype)
++
++            acc_o_tile0 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
++            acc_o_tile1 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
++            acc_o_tile2 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
++            acc_o_tile3 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
++
++            T.fill(acc_o_tile0, 0)
++            T.fill(acc_o_tile1, 0)
++            T.fill(acc_o_tile2, 0)
++            T.fill(acc_o_tile3, 0)
++            T.fill(sumexp, 0)
++            T.fill(m_i, -(2**30))
++
++            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
++            T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
++            T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
++            T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
++            T.copy(q_fp8[b_i, s_i, H0:H1, 3 * group_size : 4 * group_size], q_tile3)
++
++            for k_i in T.serial(inner_iter):
++                topk_block_i = group_i * inner_iter + k_i
++
++                for bi_i in T.Parallel(BI):
++                    idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
++                    valid = idx >= 0
++                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
++                    mask[bi_i] = valid
++
++                for bi_i, j in T.Parallel(BI, group_size):
++                    page = page_idx_shared[bi_i]
++                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, 0 * group_size + j]
++                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, 1 * group_size + j]
++                    kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
++                    kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
++
++                for bi_i, j in T.Parallel(BI, d_tail):
++                    page = page_idx_shared[bi_i]
++                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
++
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    acc_s[h_i, bi_i] = T.if_then_else(
++                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
++                    )
++
++                T.gemm(q_tile0, kv_tile0, acc_s, transpose_B=True, clear_accum=False)
++                T.gemm(q_tile1, kv_tile1, acc_tile, transpose_B=True, clear_accum=True)
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
++                T.gemm(q_tile2, kv_tile2, acc_tile, transpose_B=True, clear_accum=True)
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
++                T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
++                T.gemm(
++                    q_tail_buf,
++                    k_tail_shared,
++                    acc_s,
++                    transpose_B=True,
++                    policy=T.GemmWarpPolicy.FullCol,
++                )
++
++                T.copy(m_i, m_i_prev)
++                T.reduce_max(acc_s, m_i, dim=1, clear=False)
++                for h_i in T.Parallel(h_per_block):
++                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    acc_s[h_i, bi_i] = T.exp2(
++                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
++                    )
++                T.reduce_sum(acc_s, sumexp_i, dim=1)
++                for h_i in T.Parallel(h_per_block):
++                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
++                for h_i, j in T.Parallel(h_per_block, group_size):
++                    acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] * alpha[h_i]
++                    acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] * alpha[h_i]
++                    acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] * alpha[h_i]
++                    acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] * alpha[h_i]
++
++                for h_i, bi_i in T.Parallel(h_per_block, BI):
++                    s_fp8_shared[h_i, bi_i] = T.clamp(
++                        acc_s[h_i, bi_i] * s_inv_scale_const,
++                        -fp8_max_val,
++                        fp8_max_val,
++                    )
++                T.gemm(s_fp8_shared, kv_tile0, sv_tile, clear_accum=True)
++                for h_i, j in T.Parallel(h_per_block, group_size):
++                    acc_o_tile0[h_i, j] = (
++                        acc_o_tile0[h_i, j] + sv_tile[h_i, j] * s_scale_const
++                    )
++
++                T.gemm(s_fp8_shared, kv_tile1, sv_tile, clear_accum=True)
++                for h_i, j in T.Parallel(h_per_block, group_size):
++                    acc_o_tile1[h_i, j] = (
++                        acc_o_tile1[h_i, j] + sv_tile[h_i, j] * s_scale_const
++                    )
++
++                T.gemm(s_fp8_shared, kv_tile2, sv_tile, clear_accum=True)
++                for h_i, j in T.Parallel(h_per_block, group_size):
++                    acc_o_tile2[h_i, j] = (
++                        acc_o_tile2[h_i, j] + sv_tile[h_i, j] * s_scale_const
++                    )
++
++                T.gemm(s_fp8_shared, kv_tile3, sv_tile, clear_accum=True)
++                for h_i, j in T.Parallel(h_per_block, group_size):
++                    acc_o_tile3[h_i, j] = (
++                        acc_o_tile3[h_i, j] + sv_tile[h_i, j] * s_scale_const
++                    )
++
++            for h_i in T.Parallel(h_per_block):
++                denom = T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
++                inv_denom[h_i] = 1.0 / denom
++            for h_i, j in T.Parallel(h_per_block, group_size):
++                acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] * inv_denom[h_i]
++                acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] * inv_denom[h_i]
++                acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] * inv_denom[h_i]
++                acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] * inv_denom[h_i]
++
++            for h_i in T.Parallel(h_per_block):
++                sumexp[h_i] = T.if_then_else(
++                    sumexp[h_i] == 0.0,
++                    -(2**30),
++                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
++                )
++
++            T.copy(
++                acc_o_tile0,
++                partial_o[b_i, s_i, group_i, H0:H1, 0 * group_size : 1 * group_size],
++            )
++            T.copy(
++                acc_o_tile1,
++                partial_o[b_i, s_i, group_i, H0:H1, 1 * group_size : 2 * group_size],
++            )
++            T.copy(
++                acc_o_tile2,
++                partial_o[b_i, s_i, group_i, H0:H1, 2 * group_size : 3 * group_size],
++            )
++            T.copy(
++                acc_o_tile3,
++                partial_o[b_i, s_i, group_i, H0:H1, 3 * group_size : 4 * group_size],
++            )
++
++            T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
++
++    return main
++
++
+ def tilelang_sparse_fwd(
+     q: torch.Tensor,
+     kv: torch.Tensor,
+@@ -1052,46 +1319,47 @@ def tilelang_sparse_fwd(
+     assert topk == 2048
+ 
+     if _is_hip:
+-        # sparse_mla_fwd_decode_partial splits topk KV blocks into N_GROUPS
+-        # independent tiles per query, then sparse_mla_fwd_decode_combine
+-        # reduces them via online softmax.
+-
+-        if _is_gfx95_supported:
+-            # gfx950
+-            block_I, threads = 64, 256
+-            block_per_cu = 2
++        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
++        if is_fp8_kv:
++            if q.dtype != kv.dtype:
++                q = q.to(kv.dtype)
++            if _is_gfx95_supported:
++                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
++            else:
++                block_I, threads, block_per_cu, cu = 64, 256, 1, 304
++            ni = topk // block_I
++            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
++            kernel_partial = sparse_mla_fwd_decode_partial_fp8(
++                num_heads,
++                d_v,
++                tail_dim,
++                topk,
++                sm_scale=sm_scale,
++                block_I=block_I,
++                inner_iter=inner_iter,
++                threads=threads,
++            )
+         else:
+-            # gfx942
+-            block_I, threads = 32, 128
+-            block_per_cu = 1
+-
+-        NI = topk // block_I
+-        CU = 304
+-
+-        def _inner_iter(seq: int) -> int:
+-            """Largest inner_iter ≤ NI that keeps grid/CU ≥ block_per_cu."""
+-            max_it = int(seq * NI / (CU * block_per_cu))
+-            it = NI
+-            while it >= 2:
+-                if it <= max_it and NI % it == 0:
+-                    return it
+-                it //= 2
+-            return 1
+-
+-        inner_iter = _inner_iter(q.shape[0])
+-        n_groups = NI // inner_iter
+-
+-        kernel_partial = sparse_mla_fwd_decode_partial(
+-            num_heads,
+-            d_v,
+-            tail_dim,
+-            topk,
+-            sm_scale=sm_scale,
+-            block_I=block_I,
+-            inner_iter=inner_iter,
+-            num_stages=1,
+-            threads=threads,
++            if _is_gfx95_supported:
++                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
++            else:
++                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
++            ni = topk // block_I
++            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
++            kernel_partial = sparse_mla_fwd_decode_partial(
++                num_heads,
++                d_v,
++                tail_dim,
++                topk,
++                sm_scale=sm_scale,
++                block_I=block_I,
++                inner_iter=inner_iter,
++                threads=threads,
++            )
++        partial_o_batched, partial_lse_batched = kernel_partial(
++            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+         )
++        n_groups = ni // inner_iter
+         kernel_combine = sparse_mla_fwd_decode_combine(
+             num_heads,
+             d_v,
+@@ -1100,10 +1368,7 @@ def _inner_iter(seq: int) -> int:
+             block_I=block_I,
+             threads=threads,
+         )
+-        partial_o, partial_lse = kernel_partial(
+-            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+-        )
+-        out = kernel_combine(partial_o, partial_lse)
++        out = kernel_combine(partial_o_batched, partial_lse_batched)
+     else:
+         kernel = sparse_attention_fwd_kernel_v2(
+             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index df5d54223c22..e4c158cda9f6 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -45,11 +45,13 @@
+     quantize_k_cache,
+     quantize_k_cache_separate,
+ )
++from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.mem_cache.utils import (
+     get_mla_kv_buffer_triton,
+     maybe_init_custom_mem_pool,
+     set_mla_kv_buffer_triton,
++    set_mla_kv_buffer_triton_fp8_quant,
+     set_mla_kv_scale_buffer_triton,
+ )
+ from sglang.srt.utils import (
+@@ -75,6 +77,7 @@
+ _is_cpu = is_cpu()
+ _cpu_has_amx_support = cpu_has_amx_support()
+ _is_hip = is_hip()
++_is_fp8_fnuz = is_fp8_fnuz()
+ 
+ 
+ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+@@ -1573,22 +1576,36 @@ def set_mla_kv_buffer(
+         layer_id = layer.layer_id
+ 
+         if self.nsa_kv_cache_store_fp8:
+-            # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
+-            # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
+-            # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
+-            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+-                cache_k_nope, cache_k_rope
+-            )
++            if _is_hip:
++                # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
++                # Fuse BF16/FP16 -> FP8 cast with paged KV write.
++                fp8_dtype = (
++                    torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
++                )
++                set_mla_kv_buffer_triton_fp8_quant(
++                    self.kv_buffer[layer_id - self.start_layer],
++                    loc,
++                    cache_k_nope,
++                    cache_k_rope,
++                    fp8_dtype,
++                )
++            else:
++                # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
++                # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
++                # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
++                cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
++                    cache_k_nope, cache_k_rope
++                )
+ 
+-            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
+-            # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
+-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+-            set_mla_kv_buffer_triton(
+-                self.kv_buffer[layer_id - self.start_layer],
+-                loc,
+-                cache_k_nope_fp8,
+-                cache_k_rope_fp8,
+-            )
++                # Reuse existing two-tensor write kernel (works with FP8 byte layout)
++                # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
++                # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
++                set_mla_kv_buffer_triton(
++                    self.kv_buffer[layer_id - self.start_layer],
++                    loc,
++                    cache_k_nope_fp8,
++                    cache_k_rope_fp8,
++                )
+         else:
+             if cache_k_nope.dtype != self.dtype:
+                 cache_k_nope = cache_k_nope.to(self.dtype)
+diff --git a/python/sglang/srt/mem_cache/utils.py b/python/sglang/srt/mem_cache/utils.py
+index 3aec3dd89b51..ba08819c3c63 100644
+--- a/python/sglang/srt/mem_cache/utils.py
++++ b/python/sglang/srt/mem_cache/utils.py
+@@ -109,6 +109,93 @@ def set_mla_kv_buffer_triton(
+     )
+ 
+ 
++@triton.jit
++def set_mla_kv_buffer_fp8_quant_kernel(
++    kv_buffer_fp8_ptr,
++    cache_k_nope_ptr,
++    cache_k_rope_ptr,
++    loc_ptr,
++    buffer_stride: tl.constexpr,
++    nope_stride: tl.constexpr,
++    rope_stride: tl.constexpr,
++    nope_dim: tl.constexpr,
++    rope_dim: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    """Fuse BF16/FP16->FP8 cast with paged KV write."""
++    pid_loc = tl.program_id(0)
++    pid_blk = tl.program_id(1)
++
++    base = pid_blk * BLOCK
++    offs = base + tl.arange(0, BLOCK)
++    total_dim = nope_dim + rope_dim
++    mask = offs < total_dim
++
++    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
++    dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
++
++    if base + BLOCK <= nope_dim:
++        src = tl.load(
++            cache_k_nope_ptr + pid_loc * nope_stride + offs,
++            mask=mask,
++            other=0.0,
++        )
++    elif base >= nope_dim:
++        offs_rope = offs - nope_dim
++        src = tl.load(
++            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
++            mask=mask,
++            other=0.0,
++        )
++    else:
++        is_nope = offs < nope_dim
++        src_nope = tl.load(
++            cache_k_nope_ptr + pid_loc * nope_stride + offs,
++            mask=mask & is_nope,
++            other=0.0,
++        )
++        src_rope = tl.load(
++            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
++            mask=mask & ~is_nope,
++            other=0.0,
++        )
++        src = tl.where(is_nope, src_nope, src_rope)
++
++    # Destination pointer is FP8-typed view; tl.store performs downcast.
++    tl.store(dst_ptr, src, mask=mask)
++
++
++def set_mla_kv_buffer_triton_fp8_quant(
++    kv_buffer: torch.Tensor,
++    loc: torch.Tensor,
++    cache_k_nope: torch.Tensor,
++    cache_k_rope: torch.Tensor,
++    fp8_dtype: torch.dtype,
++):
++    """Fuse BF16/FP16 MLA K quantization with paged KV write."""
++    kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
++
++    nope_dim = cache_k_nope.shape[-1]
++    rope_dim = cache_k_rope.shape[-1]
++    total_dim = nope_dim + rope_dim
++    BLOCK = 128
++    n_loc = loc.numel()
++    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
++
++    set_mla_kv_buffer_fp8_quant_kernel[grid](
++        kv_buffer_fp8,
++        cache_k_nope,
++        cache_k_rope,
++        loc,
++        kv_buffer_fp8.stride(0),
++        cache_k_nope.stride(0),
++        cache_k_rope.stride(0),
++        nope_dim,
++        rope_dim,
++        BLOCK=BLOCK,
++    )
++
++
+ @triton.jit
+ def set_mla_kv_scale_buffer_kernel(
+     kv_buffer_ptr,
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 291d9515df17..a6baa4817ace 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -33,6 +33,7 @@
+ from sglang.srt.utils.common import (
+     get_available_gpu_memory,
+     is_float4_e2m1fn_x2,
++    is_hip,
+     is_npu,
+ )
+ 
+@@ -67,6 +68,7 @@ def __post_init__(self):
+ logger = logging.getLogger(__name__)
+ 
+ _is_npu = is_npu()
++_is_hip = is_hip()
+ 
+ 
+ class ModelRunnerKVCacheMixin:
+@@ -256,9 +258,17 @@ def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
+         ):
+             return kv_cache_dim
+ 
++        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
++        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
++        if _is_hip and (
++            self.server_args.nsa_prefill_backend == "tilelang"
++            or self.server_args.nsa_decode_backend == "tilelang"
++        ):
++            return kv_cache_dim
++
+         quant_block_size = NSATokenToKVPool.quant_block_size
+         rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
+-        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
++        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
+         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+         if kv_cache_dtype == torch.float8_e4m3fn:
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+index fe1b3c966a71..cb83a13e9af0 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+@@ -292,9 +292,11 @@ def forward_absorb_prepare(
+ 
+         q_nope_out = q_nope_out.transpose(0, 1)
+ 
++        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+         if (
+             self.rotary_emb is not None
+             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
++            and (not skip_rope_for_nsa_tilelang_fused)
+             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+         ):
+             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+@@ -332,24 +334,69 @@ def forward_absorb_core(
+         save_kv_cache = True
+ 
+         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+-            extra_args = {}
+-            if self._fuse_rope_for_trtllm_mla(forward_batch):
+-                extra_args = {
+-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+-                    "is_neox": self.rotary_emb.is_neox_style,
+-                    "llama_4_scaling": llama_4_scaling,
+-                }
+-
+-            attn_output = self.attn_mqa(
+-                q_nope_out,
+-                k_nope,
+-                k_nope,
+-                forward_batch,
+-                q_rope=q_pe,
+-                k_rope=k_pe,
+-                **extra_args,
+-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+-            )
++            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
++                cos = self.rotary_emb.cos_cache
++                sin = self.rotary_emb.sin_cache
++                kv_cache_dtype = (
++                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
++                )
++                q_cat, _, k_pe_fused, _ = fused_qk_rope_cat_and_cache_mla(
++                    q_nope_out,
++                    q_pe,
++                    k_nope,
++                    k_pe,
++                    forward_batch.token_to_kv_pool.get_key_buffer(
++                        self.attn_mqa.layer_id
++                    ),
++                    forward_batch.out_cache_loc,
++                    positions,
++                    cos,
++                    sin,
++                    self.attn_mqa.k_scale,
++                    self.rotary_emb.is_neox_style,
++                    q_out_dtype=kv_cache_dtype,
++                )
++                q_nope_fused = q_cat[..., : self.kv_lora_rank]
++                q_pe_fused = q_cat[..., self.kv_lora_rank :]
++                save_kv_cache = False
++                if llama_4_scaling is not None:
++                    q_nope_fused *= llama_4_scaling
++                attn_output = self.attn_mqa(
++                    q_nope_fused,
++                    None,
++                    None,
++                    forward_batch,
++                    q_rope=q_pe_fused,
++                    k_rope=k_pe_fused,
++                    save_kv_cache=save_kv_cache,
++                    **(
++                        dict(topk_indices=topk_indices)
++                        if topk_indices is not None
++                        else {}
++                    ),
++                )
++            else:
++                extra_args = {}
++                if self._fuse_rope_for_trtllm_mla(forward_batch):
++                    extra_args = {
++                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
++                        "is_neox": self.rotary_emb.is_neox_style,
++                        "llama_4_scaling": llama_4_scaling,
++                    }
++                attn_output = self.attn_mqa(
++                    q_nope_out,
++                    k_nope,
++                    k_nope,
++                    forward_batch,
++                    q_rope=q_pe,
++                    k_rope=k_pe,
++                    **extra_args,
++                    **(
++                        dict(topk_indices=topk_indices)
++                        if topk_indices is not None
++                        else {}
++                    ),
++                )
+         else:
+             if _use_aiter_gfx95:
+                 cos = self.rotary_emb.cos_cache
+@@ -532,3 +579,17 @@ def _fuse_rope_for_trtllm_mla(
+             )
+             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+         )
++
++    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
++        """
++        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
++        """
++        server_args = get_global_server_args()
++        return (
++            _use_aiter_gfx95
++            and self.current_attention_backend == "nsa"
++            and (
++                server_args.nsa_decode_backend == "tilelang"
++                or server_args.nsa_prefill_backend == "tilelang"
++            )
++        )

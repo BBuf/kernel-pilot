@@ -207,7 +207,7 @@ fi
 
 if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
     echo "Warning: State file corrupted (max_iterations not numeric), using default" >&2
-    MAX_ITERATIONS=42
+    MAX_ITERATIONS=84
 fi
 
 if [[ ! "$MAINLINE_STALL_COUNT" =~ ^[0-9]+$ ]]; then

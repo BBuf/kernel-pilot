@@ -1,0 +1,151 @@
+diff --git a/tests/kernels/quantization/test_cutlass_scaled_mm.py b/tests/kernels/quantization/test_cutlass_scaled_mm.py
+index a8adec49a955..32eb65cfc5b6 100644
+--- a/tests/kernels/quantization/test_cutlass_scaled_mm.py
++++ b/tests/kernels/quantization/test_cutlass_scaled_mm.py
+@@ -40,6 +40,18 @@
+     (512, 24576, 128),
+ ]
+ 
++# Shapes with N or K not divisible by 16.  These exercise the padding path
++# inside CutlassFP8ScaledMMLinearKernel.apply_scaled_mm (e.g. Qwen2.5-VL
++# vision MLP dims).
++UNALIGNED_MNK_FACTORS = [
++    (32, 3420, 1280),
++    (32, 1280, 6840),
++    (1, 3420, 1280),
++    (64, 6840, 1280),
++    (16, 100, 200),
++    (33, 255, 513),
++]
++
+ CUDA_DEVICES = [
+     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
+ ]
+@@ -152,6 +164,62 @@ def test_cutlass_fp8_gemm(
+     cutlass_fp8_gemm_helper(m, n, k, a_scale_group_shape, b_scale_group_shape, use_bias)
+ 
+ 
++@pytest.mark.parametrize("m,n,k", UNALIGNED_MNK_FACTORS)
++@pytest.mark.parametrize(
++    "a_scale_group_shape", [PER_TOKEN_GROUP_SHAPE, TENSORWISE_GROUP_SHAPE]
++)
++@pytest.mark.parametrize(
++    "b_scale_group_shape", [PER_OUT_CH_GROUP_SHAPE, TENSORWISE_GROUP_SHAPE]
++)
++@pytest.mark.parametrize("use_bias", [True, False])
++@pytest.mark.skipif(
++    not current_platform.has_device_capability(89),
++    reason="FP8 is not supported on this GPU type.",
++)
++def test_cutlass_fp8_gemm_padded(
++    m: int, n: int, k: int, a_scale_group_shape, b_scale_group_shape, use_bias: bool
++):
++    """Test CUTLASS FP8 GEMM with padding for non-16-aligned N/K dims.
++
++    Exercises CutlassFP8ScaledMMLinearKernel.apply_scaled_mm which pads
++    inputs to satisfy CUTLASS alignment requirements — the path taken by
++    models like Qwen2.5-VL whose vision MLP has non-16-aligned dims.
++    """
++    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
++        CutlassFP8ScaledMMLinearKernel,
++    )
++
++    a = to_fp8(torch.randn((m, k), device="cuda"))
++    b = to_fp8(torch.randn((n, k), device="cuda").t())
++
++    a_scales_shape = scale_shape(a.shape, a_scale_group_shape)
++    b_scales_shape = scale_shape(b.shape, b_scale_group_shape)
++
++    scale_a = torch.randn(a_scales_shape, device="cuda", dtype=torch.float32)
++    scale_b = torch.randn(b_scales_shape, device="cuda", dtype=torch.float32)
++
++    scale_a = scale_a.t().contiguous().t()
++    scale_b = scale_b.t().contiguous().t()
++
++    out_dtype = torch.bfloat16
++    bias = torch.rand((n,), device="cuda", dtype=out_dtype) * 10 if use_bias else None
++
++    baseline = baseline_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
++
++    kernel = object.__new__(CutlassFP8ScaledMMLinearKernel)
++    out = kernel.apply_scaled_mm(
++        A=a,
++        B=b,
++        out_dtype=out_dtype,
++        As=scale_a,
++        Bs=scale_b,
++        bias=bias,
++        output_shape=[m, n],
++    )
++
++    torch.testing.assert_close(out, baseline, rtol=5e-1, atol=1.5e-1)
++
++
+ @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
+ @pytest.mark.parametrize(
+     "a_scale_group_shape,b_scale_group_shape", [((1, 128), (128, 128))]
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+index 618084029159..2a7b7dc1373c 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+@@ -162,6 +162,20 @@ def is_supported(
+     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+         return True, None
+ 
++    @staticmethod
++    def _pad_to_alignment(
++        x: torch.Tensor, dim: int, alignment: int, value: float = 0.0
++    ) -> torch.Tensor:
++        """Pad tensor ``x`` along ``dim`` to the next multiple of
++        ``alignment``."""
++        remainder = x.shape[dim] % alignment
++        if remainder == 0:
++            return x
++        pad_size = alignment - remainder
++        pad_spec = [0] * (2 * x.dim())
++        pad_spec[-(2 * dim + 1)] = pad_size
++        return torch.nn.functional.pad(x, pad_spec, value=value)
++
+     def apply_scaled_mm(
+         self,
+         *,
+@@ -173,10 +187,38 @@ def apply_scaled_mm(
+         bias: torch.Tensor | None,
+         output_shape: list,
+     ) -> torch.Tensor:
+-        # Fused GEMM_DQ
++        # Per-tensor/Per-channel padding to use Cutlass instead of Triton.
++        K, N = B.shape
++        pad_k = (16 - K % 16) % 16
++        pad_n = (16 - N % 16) % 16
++
++        if pad_k > 0 or pad_n > 0:
++            # B is column-major [K, N].  Transpose to row-major [N, K],
++            # pad both dims in one call, then transpose back so the
++            # result keeps column-major layout with stride (1, K_padded).
++            B = torch.nn.functional.pad(B.t().contiguous(), (0, pad_k, 0, pad_n)).t()
++
++            if pad_k > 0:
++                A = self._pad_to_alignment(A, dim=1, alignment=16)
++            if pad_n > 0:
++                if bias is not None:
++                    bias = self._pad_to_alignment(bias, dim=0, alignment=16)
++                # Bs is per-tensor (numel==1) or per-channel (numel==N)
++                # in this kernel class — never 2D block-wise.
++                if Bs.numel() > 1:
++                    Bs = self._pad_to_alignment(
++                        Bs.view(-1), dim=0, alignment=16, value=1.0
++                    )
++                    if Bs.dim() == 1 and B.shape[1] > 1:
++                        Bs = Bs.view(-1, 1)
++
+         output = ops.cutlass_scaled_mm(
+             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
+         )
++
++        if pad_n > 0:
++            output = output[..., :N].contiguous()
++
+         return output.view(*output_shape)
+ 
+ 

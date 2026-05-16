@@ -109,6 +109,7 @@ TEST_SUITES=(
     "test-frontend-migration.sh"
     "test-rlcr-sources.sh"
     "test-style-compliance.sh"
+    "test-ncu-report-skill.sh"
     # Robustness tests
     "robustness/test-state-file-robustness.sh"
     "robustness/test-session-robustness.sh"

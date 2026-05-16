@@ -1,0 +1,1011 @@
+diff --git a/benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py b/benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py
+new file mode 100644
+index 000000000000..f45a230eebbb
+--- /dev/null
++++ b/benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py
+@@ -0,0 +1,536 @@
++"""
++Benchmark fused allreduce+rmsnorm on AMD with correctness checks.
++
++This script targets the same fused op used by SGLang:
++`tensor_model_parallel_fused_allreduce_rmsnorm`.
++
++It reports:
++- eager mode latency (prefill-like)
++- graph mode latency (decode-like)
++- fused availability (whether fused path returns non-None)
++- correctness (fused output matches split allreduce + rmsnorm reference)
++
++Usage example:
++  torchrun --nproc_per_node=8 \
++    benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py \
++    --dtype bfloat16 \
++    --prefill-shapes 2048x8192,8192x8192 \
++    --decode-shapes 1x8192,4x8192,16x8192 \
++    --warmup 10 --iters 30 --repeats 5
++"""
++
++import argparse
++import csv
++import os
++import statistics
++from typing import Dict, List, Optional, Sequence, Tuple
++
++import torch
++import torch.distributed as dist
++import torch.nn.functional as F
++
++from sglang.srt.distributed.communication_op import (
++    tensor_model_parallel_all_reduce,
++    tensor_model_parallel_fused_allreduce_rmsnorm,
++)
++from sglang.srt.distributed.parallel_state import (
++    destroy_distributed_environment,
++    destroy_model_parallel,
++    graph_capture,
++    init_distributed_environment,
++    initialize_model_parallel,
++    set_custom_all_reduce,
++)
++
++Shape = Tuple[int, int]
++
++
++def parse_shapes(raw: str) -> List[Shape]:
++    shapes: List[Shape] = []
++    for item in [x.strip() for x in raw.split(",") if x.strip()]:
++        if "x" not in item:
++            raise ValueError(f"Invalid shape '{item}', expected MxN format.")
++        m_str, n_str = item.split("x", 1)
++        m = int(m_str)
++        n = int(n_str)
++        if m <= 0 or n <= 0:
++            raise ValueError(f"Invalid shape '{item}', both dims must be positive.")
++        shapes.append((m, n))
++    if not shapes:
++        raise ValueError("Empty shape list is not allowed.")
++    return shapes
++
++
++def dtype_from_name(name: str) -> torch.dtype:
++    mapping = {
++        "float16": torch.float16,
++        "fp16": torch.float16,
++        "bfloat16": torch.bfloat16,
++        "bf16": torch.bfloat16,
++    }
++    if name not in mapping:
++        raise ValueError(f"Unsupported dtype: {name}")
++    return mapping[name]
++
++
++def check_close(
++    a: torch.Tensor, b: torch.Tensor, dtype: torch.dtype
++) -> Tuple[bool, str]:
++    if dtype == torch.bfloat16:
++        rtol, atol = 2e-2, 1.25e-1
++    else:
++        rtol, atol = 1e-2, 2e-2
++    try:
++        torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
++        return True, "PASS"
++    except AssertionError:
++        max_diff = torch.max(torch.abs(a - b)).item()
++        mean_diff = torch.mean(torch.abs(a - b)).item()
++        return False, f"FAIL(max={max_diff:.6f},mean={mean_diff:.6f})"
++
++
++def _measure_us(
++    fn,
++    warmup: int,
++    iters: int,
++    repeats: int,
++    device: torch.device,
++) -> Tuple[float, Dict[str, float]]:
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++
++    start_event = torch.cuda.Event(enable_timing=True)
++    end_event = torch.cuda.Event(enable_timing=True)
++    samples_us: List[float] = []
++
++    for _ in range(max(1, repeats)):
++        _barrier(device)
++        torch.cuda.synchronize()
++        start_event.record()
++        for _ in range(iters):
++            fn()
++        end_event.record()
++        end_event.synchronize()
++        samples_us.append(start_event.elapsed_time(end_event) * 1000.0 / iters)
++
++    sorted_samples = sorted(samples_us)
++    p50 = float(statistics.median(sorted_samples))
++    p95 = float(sorted_samples[int((len(sorted_samples) - 1) * 0.95)])
++    return p50, {
++        "p50_us": p50,
++        "p95_us": p95,
++        "min_us": float(sorted_samples[0]),
++        "max_us": float(sorted_samples[-1]),
++    }
++
++
++def _barrier(device: torch.device):
++    try:
++        dist.barrier(device_ids=[device.index])
++    except TypeError:
++        dist.barrier()
++
++
++def _mean_across_ranks(value: float, device: torch.device) -> float:
++    t = torch.tensor([value], dtype=torch.float64, device=device)
++    dist.all_reduce(t, op=dist.ReduceOp.SUM)
++    t /= dist.get_world_size()
++    return float(t.item())
++
++
++def _all_true_across_ranks(value: bool, device: torch.device) -> bool:
++    t = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
++    dist.all_reduce(t, op=dist.ReduceOp.MIN)
++    return bool(int(t.item()))
++
++
++def _make_inputs(
++    shape: Shape,
++    dtype: torch.dtype,
++    seed: int,
++    residual_mode: str,
++    rank: int,
++    device: torch.device,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    m, n = shape
++    torch.manual_seed(seed + rank * 17)
++    x = torch.randn((m, n), dtype=torch.float32, device=device).to(dtype)
++    if residual_mode == "self":
++        residual = x.clone()
++    elif residual_mode == "random":
++        residual = torch.randn((m, n), dtype=torch.float32, device=device).to(dtype)
++    elif residual_mode == "zero":
++        residual = torch.zeros((m, n), dtype=dtype, device=device)
++    else:
++        raise ValueError(f"Unknown residual_mode: {residual_mode}")
++    weight = torch.randn((n,), dtype=torch.float32, device=device).to(dtype)
++    return x, residual, weight
++
++
++def _split_reference(
++    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    ar_out = tensor_model_parallel_all_reduce(x.clone())
++    residual_out = ar_out + residual
++    out = F.rms_norm(
++        input=residual_out,
++        normalized_shape=(residual_out.shape[-1],),
++        weight=weight,
++        eps=eps,
++    )
++    return out, residual_out
++
++
++def bench_eager(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++    warmup: int,
++    iters: int,
++    repeats: int,
++) -> Dict[str, object]:
++    split_fn = lambda: _split_reference(x, residual, weight, eps)
++    split_us, split_stats = _measure_us(split_fn, warmup, iters, repeats, x.device)
++
++    fused_probe = tensor_model_parallel_fused_allreduce_rmsnorm(
++        x.clone(), residual.clone(), weight, eps
++    )
++    fused_available = fused_probe is not None
++
++    fused_us: Optional[float] = None
++    fused_stats: Optional[Dict[str, float]] = None
++    if fused_available:
++        fused_fn = lambda: tensor_model_parallel_fused_allreduce_rmsnorm(
++            x, residual, weight, eps
++        )
++        fused_us, fused_stats = _measure_us(fused_fn, warmup, iters, repeats, x.device)
++
++    ref_out, ref_residual = _split_reference(x, residual, weight, eps)
++    if fused_available:
++        fused_out, fused_residual = tensor_model_parallel_fused_allreduce_rmsnorm(
++            x.clone(), residual.clone(), weight, eps
++        )
++        out_ok, out_detail = check_close(fused_out, ref_out, x.dtype)
++        res_ok, res_detail = check_close(fused_residual, ref_residual, x.dtype)
++        correctness_ok = out_ok and res_ok
++        correctness_detail = f"out={out_detail}, residual={res_detail}"
++    else:
++        correctness_ok = True
++        correctness_detail = "SKIP(fused_unavailable)"
++
++    return {
++        "split_us": split_us,
++        "split_stats": split_stats,
++        "fused_available": fused_available,
++        "fused_us": fused_us,
++        "fused_stats": fused_stats,
++        "correctness_ok": correctness_ok,
++        "correctness_detail": correctness_detail,
++    }
++
++
++def bench_graph(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++    warmup: int,
++    iters: int,
++    repeats: int,
++) -> Dict[str, object]:
++    split_x = x.clone()
++    split_res = residual.clone()
++    split_graph_out: Optional[torch.Tensor] = None
++
++    with graph_capture() as gc:
++        split_graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(split_graph, stream=gc.stream):
++            split_graph_out, _ = _split_reference(split_x, split_res, weight, eps)
++
++    def split_replay():
++        split_graph.replay()
++
++    split_us, split_stats = _measure_us(split_replay, warmup, iters, repeats, x.device)
++
++    fused_probe = tensor_model_parallel_fused_allreduce_rmsnorm(
++        x.clone(), residual.clone(), weight, eps
++    )
++    fused_available = fused_probe is not None
++
++    fused_us: Optional[float] = None
++    fused_stats: Optional[Dict[str, float]] = None
++    fused_graph_out: Optional[torch.Tensor] = None
++    fused_graph_residual: Optional[torch.Tensor] = None
++
++    if fused_available:
++        fused_x = x.clone()
++        fused_res = residual.clone()
++        with graph_capture() as gc:
++            fused_graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(fused_graph, stream=gc.stream):
++                fused_graph_out, fused_graph_residual = (
++                    tensor_model_parallel_fused_allreduce_rmsnorm(
++                        fused_x, fused_res, weight, eps
++                    )
++                )
++
++        def fused_replay():
++            fused_graph.replay()
++
++        fused_us, fused_stats = _measure_us(
++            fused_replay, warmup, iters, repeats, x.device
++        )
++
++    ref_out, ref_residual = _split_reference(x, residual, weight, eps)
++    if (
++        fused_available
++        and fused_graph_out is not None
++        and fused_graph_residual is not None
++    ):
++        fused_graph.replay()
++        torch.cuda.synchronize()
++        out_ok, out_detail = check_close(fused_graph_out, ref_out, x.dtype)
++        res_ok, res_detail = check_close(fused_graph_residual, ref_residual, x.dtype)
++        correctness_ok = out_ok and res_ok
++        correctness_detail = f"out={out_detail}, residual={res_detail}"
++    else:
++        correctness_ok = True
++        correctness_detail = "SKIP(fused_unavailable)"
++
++    return {
++        "split_us": split_us,
++        "split_stats": split_stats,
++        "fused_available": fused_available,
++        "fused_us": fused_us,
++        "fused_stats": fused_stats,
++        "correctness_ok": correctness_ok,
++        "correctness_detail": correctness_detail,
++    }
++
++
++def _shape_bytes(shape: Shape, dtype: torch.dtype) -> int:
++    m, n = shape
++    return m * n * torch.tensor([], dtype=dtype).element_size()
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description="Benchmark fused allreduce+rmsnorm (prefill eager + decode graph)."
++    )
++    parser.add_argument(
++        "--dtype",
++        type=str,
++        default="bf16",
++        choices=["fp16", "bf16", "float16", "bfloat16"],
++    )
++    parser.add_argument("--eps", type=float, default=1e-6)
++    parser.add_argument("--seed", type=int, default=1234)
++    parser.add_argument(
++        "--residual-mode",
++        type=str,
++        default="self",
++        choices=["self", "random", "zero"],
++        help="Use residual=x (self) to match aiter test behavior by default.",
++    )
++    parser.add_argument(
++        "--prefill-shapes",
++        type=str,
++        default="2048x8192,8192x8192,16384x8192",
++        help="Comma-separated MxN shapes for eager mode.",
++    )
++    parser.add_argument(
++        "--decode-shapes",
++        type=str,
++        default="1x8192,2x8192,4x8192,8x8192,16x8192",
++        help="Comma-separated MxN shapes for graph mode.",
++    )
++    parser.add_argument("--warmup", type=int, default=10)
++    parser.add_argument("--iters", type=int, default=30)
++    parser.add_argument("--repeats", type=int, default=5)
++    parser.add_argument(
++        "--mode",
++        type=str,
++        default="both",
++        choices=["eager", "graph", "both"],
++    )
++    parser.add_argument(
++        "--csv-out",
++        type=str,
++        default=None,
++        help="Optional output CSV path (written on rank 0 only).",
++    )
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    dtype = dtype_from_name(args.dtype)
++    rank = int(os.environ.get("RANK", "0"))
++    world_size = int(os.environ.get("WORLD_SIZE", "1"))
++    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
++    torch.cuda.set_device(local_rank % torch.cuda.device_count())
++    device = torch.device(f"cuda:{local_rank % torch.cuda.device_count()}")
++
++    set_custom_all_reduce(True)
++    init_distributed_environment(
++        world_size=world_size,
++        rank=rank,
++        local_rank=local_rank,
++        distributed_init_method="env://",
++        backend="nccl",
++    )
++    initialize_model_parallel(tensor_model_parallel_size=world_size)
++
++    prefill_shapes = parse_shapes(args.prefill_shapes)
++    decode_shapes = parse_shapes(args.decode_shapes)
++
++    if rank == 0:
++        print(
++            "Config: "
++            f"world_size={world_size}, dtype={dtype}, residual_mode={args.residual_mode}, "
++            f"warmup={args.warmup}, iters={args.iters}, repeats={args.repeats}"
++        )
++
++    run_modes: Sequence[str]
++    if args.mode == "both":
++        run_modes = ("eager", "graph")
++    else:
++        run_modes = (args.mode,)
++    csv_rows: List[Dict[str, object]] = []
++
++    for mode in run_modes:
++        shapes = prefill_shapes if mode == "eager" else decode_shapes
++        if rank == 0:
++            phase_name = "prefill(eager)" if mode == "eager" else "decode(graph)"
++            print("\n" + "=" * 120)
++            print(f"Mode: {phase_name}")
++            print(
++                "| Shape | Input bytes/rank | Split p50 (us) | Fused p50 (us) | Speedup | Fused available | Correctness |"
++            )
++            print(
++                "|:------|-----------------:|---------------:|---------------:|--------:|:----------------|:------------|"
++            )
++
++        for shape in shapes:
++            x, residual, weight = _make_inputs(
++                shape=shape,
++                dtype=dtype,
++                seed=args.seed,
++                residual_mode=args.residual_mode,
++                rank=rank,
++                device=device,
++            )
++
++            if mode == "eager":
++                metrics = bench_eager(
++                    x=x,
++                    residual=residual,
++                    weight=weight,
++                    eps=args.eps,
++                    warmup=args.warmup,
++                    iters=args.iters,
++                    repeats=args.repeats,
++                )
++            else:
++                metrics = bench_graph(
++                    x=x,
++                    residual=residual,
++                    weight=weight,
++                    eps=args.eps,
++                    warmup=args.warmup,
++                    iters=args.iters,
++                    repeats=args.repeats,
++                )
++
++            split_us = _mean_across_ranks(float(metrics["split_us"]), device)
++            fused_available = _all_true_across_ranks(
++                bool(metrics["fused_available"]), device
++            )
++            correctness_ok = _all_true_across_ranks(
++                bool(metrics["correctness_ok"]), device
++            )
++
++            fused_us: Optional[float] = None
++            if fused_available and metrics["fused_us"] is not None:
++                fused_us = _mean_across_ranks(float(metrics["fused_us"]), device)
++
++            if rank == 0:
++                m, n = shape
++                shape_str = f"{m}x{n}"
++                bytes_per_rank = _shape_bytes(shape, dtype)
++                if fused_us is not None and fused_us > 0:
++                    speedup = split_us / fused_us
++                    speedup_str = f"{speedup:.3f}x"
++                    fused_str = f"{fused_us:.1f}"
++                else:
++                    speedup_str = "N/A"
++                    fused_str = "N/A"
++                correctness_text = (
++                    "PASS" if correctness_ok else str(metrics["correctness_detail"])
++                )
++                print(
++                    f"| {shape_str} | {bytes_per_rank} | {split_us:.1f} | {fused_str} | "
++                    f"{speedup_str} | {str(fused_available)} | {correctness_text} |"
++                )
++                csv_rows.append(
++                    {
++                        "mode": mode,
++                        "shape": shape_str,
++                        "m": m,
++                        "n": n,
++                        "bytes_per_rank": bytes_per_rank,
++                        "split_p50_us": split_us,
++                        "fused_p50_us": fused_us if fused_us is not None else "",
++                        "speedup_split_over_fused": (
++                            split_us / fused_us
++                            if fused_us is not None and fused_us > 0
++                            else ""
++                        ),
++                        "fused_available": fused_available,
++                        "correctness_ok": correctness_ok,
++                        "correctness_detail": correctness_text,
++                        "dtype": str(dtype),
++                        "world_size": world_size,
++                        "residual_mode": args.residual_mode,
++                        "warmup": args.warmup,
++                        "iters": args.iters,
++                        "repeats": args.repeats,
++                    }
++                )
++
++    if rank == 0 and args.csv_out:
++        os.makedirs(os.path.dirname(args.csv_out) or ".", exist_ok=True)
++        fieldnames = [
++            "mode",
++            "shape",
++            "m",
++            "n",
++            "bytes_per_rank",
++            "split_p50_us",
++            "fused_p50_us",
++            "speedup_split_over_fused",
++            "fused_available",
++            "correctness_ok",
++            "correctness_detail",
++            "dtype",
++            "world_size",
++            "residual_mode",
++            "warmup",
++            "iters",
++            "repeats",
++        ]
++        with open(args.csv_out, "w", newline="", encoding="utf-8") as f:
++            writer = csv.DictWriter(f, fieldnames=fieldnames)
++            writer.writeheader()
++            writer.writerows(csv_rows)
++        print(f"\nSaved CSV to: {args.csv_out}")
++
++    _barrier(device)
++    destroy_model_parallel()
++    destroy_distributed_environment()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/advanced_features/server_arguments.md b/docs/advanced_features/server_arguments.md
+index 7056fd0949fc..e6bd3e3e5980 100644
+--- a/docs/advanced_features/server_arguments.md
++++ b/docs/advanced_features/server_arguments.md
+@@ -313,6 +313,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
+ | `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
+ | `--flashinfer-mxfp4-moe-precision` | Choose the computation precision of flashinfer mxfp4 moe | `default` | `default`, `bf16` |
+ | `--enable-flashinfer-allreduce-fusion` | Enable FlashInfer allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
++| `--enable-aiter-allreduce-fusion` | Enable aiter allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
+ | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | `auto` | `normal`, `low_latency`, `auto` |
+ | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | `0` | Type: int |
+ | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | `None` | Type: str |
+diff --git a/python/sglang/srt/distributed/communication_op.py b/python/sglang/srt/distributed/communication_op.py
+index 95600edfb410..c5428a50b6df 100644
+--- a/python/sglang/srt/distributed/communication_op.py
++++ b/python/sglang/srt/distributed/communication_op.py
+@@ -1,6 +1,6 @@
+ # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
+ 
+-from typing import Any, Dict, Optional, Union
++from typing import Any, Dict, Optional, Tuple, Union
+ 
+ import torch
+ import torch.distributed
+@@ -13,6 +13,21 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     return get_tp_group().all_reduce(input_)
+ 
+ 
++def tensor_model_parallel_fused_allreduce_rmsnorm(
++    input_: torch.Tensor,
++    residual_inp_: torch.Tensor,
++    weight_: torch.Tensor,
++    eps: float,
++) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
++    """Fused TP all-reduce + RMSNorm.
++
++    Policy and backend selection are owned by GroupCoordinator:
++    it may dispatch to communicator-native fused APIs, custom fused kernels,
++    or return None so callers can run generic fallback paths.
++    """
++    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
++
++
+ def tensor_model_parallel_all_gather(
+     input_: torch.Tensor, dim: int = -1
+ ) -> torch.Tensor:
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index df3499a6532c..69ec320461c9 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -621,6 +621,58 @@ def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+             inplace_all_reduce(input_, group_name=self.unique_name)
+             return input_
+ 
++    def fused_allreduce_rmsnorm(
++        self,
++        input_: torch.Tensor,
++        residual_inp_: torch.Tensor,
++        weight_: torch.Tensor,
++        eps: float,
++    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
++        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
++        ca_comm = self.ca_comm
++        if ca_comm is None or getattr(ca_comm, "disabled", True):
++            return None
++
++        # Prefer communicator-native fused API when provided.
++        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
++            try:
++                return ca_comm.fused_allreduce_rmsnorm(
++                    input_, residual_inp_, weight_, eps
++                )
++            except Exception:
++                # Fall back to custom_fused_ar_rms path below.
++                pass
++
++        if not hasattr(ca_comm, "custom_fused_ar_rms"):
++            return None
++
++        # 1-stage policy for fused AR+RMSNorm:
++        # 1) Explicit env override wins.
++        # 2) Deterministic inference forces 1-stage for reproducibility.
++        # 3) Otherwise follow AITER's heuristic (small payloads only).
++        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
++            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
++        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
++            use_1stage_ar = True
++        else:
++            total_bytes = input_.numel() * input_.element_size()
++            hidden_dim = input_.shape[-1]
++            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
++                512,
++                1024,
++                2048,
++                4096,
++            }
++
++        fused_outputs = ca_comm.custom_fused_ar_rms(
++            input_,
++            residual_inp_,
++            weight_,
++            eps,
++            use_1stage_ar,
++        )
++        return fused_outputs
++
+     def _all_reduce_out_place(
+         self, input_: torch.Tensor, outplace_all_reduce_method: str
+     ) -> torch.Tensor:
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index ebd0d3bea5fc..fabb7c2d9b32 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -99,6 +99,20 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
+     )
+ 
+ 
++def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
++    n = input_tensor.shape[-1]
++    total_bytes = input_tensor.numel() * input_tensor.element_size()
++    return (
++        _use_aiter
++        and total_bytes > 0
++        and n <= 16384
++        and total_bytes < 8 * 1024 * 8192
++        and get_tensor_model_parallel_world_size() != 6
++        and not is_dp_attention_enabled()
++        and get_global_server_args().enable_aiter_allreduce_fusion
++    )
++
++
+ class ScatterMode(Enum):
+     """
+     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
+@@ -428,11 +442,20 @@ def prepare_attn(
+                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                 and hidden_states._sglang_needs_allreduce_fusion
+             ):
+-                hidden_states, residual = (
+-                    self.input_layernorm.forward_with_allreduce_fusion(
++                if (
++                    apply_aiter_all_reduce_fusion(hidden_states)
++                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
++                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
++                    hidden_states, residual = (
++                        self.input_layernorm.forward_with_allreduce_fusion(
++                            hidden_states, residual
++                        )
++                    )
++                else:
++                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
++                    hidden_states, residual = self.input_layernorm(
+                         hidden_states, residual
+                     )
+-                )
+             else:
+                 if residual is None:
+                     residual = hidden_states
+@@ -599,7 +622,15 @@ def should_fuse_mlp_allreduce_with_next_layer(
+         )
+ 
+         return (
+-            apply_flashinfer_allreduce_fusion(batch_size)
++            (
++                apply_flashinfer_allreduce_fusion(batch_size)
++                or (
++                    _use_aiter
++                    and batch_size > 0
++                    and get_tensor_model_parallel_world_size() != 6
++                    and get_global_server_args().enable_aiter_allreduce_fusion
++                )
++            )
+             and (not self.is_last_layer)
+             and (self._context.tp_size > 1)
+         )
+@@ -799,13 +830,17 @@ def _gather_hidden_states_and_residual(
+                 if hidden_states.shape[0] != 0:
+                     hidden_states = layernorm(hidden_states)
+         else:
+-            if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
+-                layernorm, "forward_with_allreduce_fusion"
+-            ):
++            handled = False
++            if (
++                apply_aiter_all_reduce_fusion(hidden_states)
++                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
++            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                     hidden_states, residual
+                 )
+-            else:
++                handled = True
++
++            if not handled:
+                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                 if _is_npu and context.cache is not None:
+                     _ = prepare_weight_cache(hidden_states, context.cache)
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 3e4fb829762c..b094729d4129 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -293,7 +293,11 @@ def forward_with_allreduce_fusion(
+         Forward method with allreduce fusion, prioritizing flashinfer fused operations
+         """
+         if residual is not None:
+-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
++            from sglang.srt.distributed import (
++                get_tensor_model_parallel_world_size,
++                tensor_model_parallel_all_reduce,
++                tensor_model_parallel_fused_allreduce_rmsnorm,
++            )
+             from sglang.srt.layers.flashinfer_comm_fusion import (
+                 flashinfer_allreduce_residual_rmsnorm,
+             )
+@@ -301,14 +305,31 @@ def forward_with_allreduce_fusion(
+             if get_tensor_model_parallel_world_size() > 1:
+                 if post_residual_addition is not None:
+                     residual = residual + post_residual_addition
+-                fused_result = flashinfer_allreduce_residual_rmsnorm(
+-                    input_tensor=x,
+-                    residual=residual,
+-                    weight=self.weight,
+-                    eps=self.variance_epsilon,
+-                )
+-                if fused_result[0] is not None:
+-                    return fused_result
++
++                # Prefer AITER fused AR+RMSNorm when enabled on AMD.
++                if _use_aiter:
++                    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
++                        x, residual, self.weight, self.variance_epsilon
++                    )
++                    if fused_result is not None:
++                        return fused_result
++                else:
++                    fused_result = flashinfer_allreduce_residual_rmsnorm(
++                        input_tensor=x,
++                        residual=residual,
++                        weight=self.weight,
++                        eps=self.variance_epsilon,
++                    )
++                    if fused_result[0] is not None:
++                        return fused_result
++
++                # For AITER route, preserve correctness when fused path is unavailable.
++                if (
++                    _use_aiter
++                    and get_global_server_args().enable_aiter_allreduce_fusion
++                ):
++                    x = tensor_model_parallel_all_reduce(x)
++                    return self.forward(x, residual, None)
+ 
+         return self.forward(x, residual, post_residual_addition)
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index caca351c1206..3e1441380204 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -492,6 +492,7 @@ class ServerArgs:
+     moe_runner_backend: str = "auto"
+     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+     enable_flashinfer_allreduce_fusion: bool = False
++    enable_aiter_allreduce_fusion: bool = False
+     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+     ep_num_redundant_experts: int = 0
+     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+@@ -1303,6 +1304,13 @@ def _handle_model_specific_adjustments(self):
+                     logger.info(
+                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
+                     )
++            elif is_hip():
++                if not self.enable_dp_attention and self.nnodes == 1:
++                    # TODO (Hubert): Put this back later
++                    # self.enable_aiter_allreduce_fusion = True
++                    logger.info(
++                        "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
++                    )
+ 
+                 if (
+                     self.quantization == "modelopt_fp4"
+@@ -1358,6 +1366,22 @@ def _handle_model_specific_adjustments(self):
+ 
+             quant_method = get_quantization_config(hf_config)
+             is_mxfp4_quant_format = quant_method == "mxfp4"
++            if is_blackwell_supported():
++                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
++                if not self.enable_dp_attention and self.nnodes == 1:
++                    self.enable_flashinfer_allreduce_fusion = True
++                    logger.info(
++                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
++                    )
++            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
++                # TODO (Hubert): Put this back later
++                # self.enable_aiter_allreduce_fusion = True
++                logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
++            quantization_config = getattr(hf_config, "quantization_config", None)
++            is_mxfp4_quant_format = (
++                quantization_config is not None
++                and quantization_config.get("quant_method") == "mxfp4"
++            )
+             if is_mxfp4_quant_format:
+                 # use bf16 for mxfp4 triton kernels
+                 self.dtype = "bfloat16"
+@@ -2644,6 +2668,12 @@ def _handle_deterministic_inference(self):
+             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+ 
+         if self.enable_deterministic_inference:
++            if self.enable_aiter_allreduce_fusion:
++                logger.warning(
++                    "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
++                )
++                self.enable_aiter_allreduce_fusion = False
++
+             # Check sampling backend
+             self.sampling_backend = "pytorch"
+             logger.warning(
+@@ -4022,6 +4052,11 @@ def add_cli_args(parser: argparse.ArgumentParser):
+             action="store_true",
+             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+         )
++        parser.add_argument(
++            "--enable-aiter-allreduce-fusion",
++            action="store_true",
++            help="Enable Aiter AllReduce Fusion.",
++        )
+         parser.add_argument(
+             "--deepep-mode",
+             type=str,
+diff --git a/test/registered/ops/test_aiter_allreduce_fusion_amd.py b/test/registered/ops/test_aiter_allreduce_fusion_amd.py
+new file mode 100644
+index 000000000000..5813ab09348b
+--- /dev/null
++++ b/test/registered/ops/test_aiter_allreduce_fusion_amd.py
+@@ -0,0 +1,123 @@
++import csv
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++import torch
++
++from sglang.test.ci.ci_register import register_amd_ci
++
++# Dedicated AMD 8-GPU suite for AITER fused allreduce+rmsnorm validation.
++register_amd_ci(est_time=240, suite="stage-c-test-aiter-fusion-8-gpu-amd")
++
++
++class TestAiterAllreduceFusionAmd(unittest.TestCase):
++    def test_fused_ar_rms_benchmark(self):
++        if not torch.cuda.is_available():
++            self.skipTest("CUDA/ROCm device is not available.")
++        if torch.cuda.device_count() < 8:
++            self.skipTest("This test requires at least 8 GPUs.")
++
++        repo_root = Path(__file__).resolve().parents[3]
++        benchmark_script = (
++            repo_root
++            / "benchmark"
++            / "kernels"
++            / "all_reduce"
++            / "benchmark_fused_ar_rms_amd.py"
++        )
++        self.assertTrue(
++            benchmark_script.exists(),
++            f"Missing benchmark script: {benchmark_script}",
++        )
++
++        with tempfile.TemporaryDirectory(prefix="aiter_fused_ar_rms_") as tmpdir:
++            csv_path = Path(tmpdir) / "fused_ar_rms_check.csv"
++            cmd = [
++                sys.executable,
++                "-m",
++                "torch.distributed.run",
++                "--standalone",
++                "--nproc_per_node=8",
++                str(benchmark_script),
++                "--dtype",
++                "bf16",
++                "--prefill-shapes",
++                # Include both <=64MiB and >64MiB shapes to verify default gate behavior.
++                "128x7168,512x7168,2048x7168,4096x7168,5120x7168",
++                "--decode-shapes",
++                "1x7168,8x7168,64x7168,512x7168",
++                "--warmup",
++                "3",
++                "--iters",
++                "15",
++                "--repeats",
++                "2",
++                "--csv-out",
++                str(csv_path),
++            ]
++
++            env = os.environ.copy()
++            result = subprocess.run(
++                cmd,
++                cwd=str(repo_root),
++                env=env,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                text=True,
++                timeout=1200,
++            )
++
++            if result.returncode != 0:
++                self.fail(
++                    "Benchmark command failed.\n"
++                    f"Return code: {result.returncode}\n"
++                    f"Command: {' '.join(cmd)}\n"
++                    f"Output:\n{result.stdout}"
++                )
++
++            self.assertTrue(csv_path.exists(), f"CSV output not found: {csv_path}")
++
++            with open(csv_path, "r", encoding="utf-8") as f:
++                rows = list(csv.DictReader(f))
++
++            self.assertGreater(len(rows), 0, "CSV contains no rows.")
++
++            eager_rows = [r for r in rows if r["mode"] == "eager"]
++            graph_rows = [r for r in rows if r["mode"] == "graph"]
++            self.assertGreater(len(eager_rows), 0, "Missing eager rows in CSV.")
++            self.assertGreater(len(graph_rows), 0, "Missing graph rows in CSV.")
++
++            # Correctness should always pass regardless of fused availability.
++            bad_rows = [r for r in rows if r["correctness_ok"] != "True"]
++            self.assertEqual(
++                [],
++                bad_rows,
++                f"Found correctness failures: {bad_rows}",
++            )
++
++            # We should see fused path active for small shapes in both modes.
++            self.assertTrue(
++                any(r["fused_available"] == "True" for r in eager_rows),
++                "Expected at least one eager row with fused_available=True.",
++            )
++            self.assertTrue(
++                any(r["fused_available"] == "True" for r in graph_rows),
++                "Expected at least one graph row with fused_available=True.",
++            )
++
++            # Default gate should reject at least one oversized eager shape.
++            large_eager_rows = [
++                r for r in eager_rows if int(r["bytes_per_rank"]) > 64 * 1024 * 1024
++            ]
++            self.assertTrue(
++                any(r["fused_available"] == "False" for r in large_eager_rows),
++                "Expected fused fallback for oversized eager shape(s) under default gate.",
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/run_suite.py b/test/run_suite.py
+index 313eed48e196..3a5868ce895b 100644
+--- a/test/run_suite.py
++++ b/test/run_suite.py
+@@ -25,6 +25,7 @@
+         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
+         "stage-b-test-large-1-gpu-amd",
+         "stage-b-test-large-2-gpu-amd",
++        "stage-c-test-aiter-fusion-8-gpu-amd",
+         "stage-c-test-large-8-gpu-amd-mi35x",
+     ],
+     HWBackend.CUDA: [

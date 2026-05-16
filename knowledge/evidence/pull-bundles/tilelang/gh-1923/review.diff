@@ -1,0 +1,846 @@
+diff --git a/examples/grouped_gemm/example_grouped_gemm_fwd_ptr.py b/examples/grouped_gemm/example_grouped_gemm_fwd_ptr.py
+new file mode 100644
+index 0000000000..ba4d2107fb
+--- /dev/null
++++ b/examples/grouped_gemm/example_grouped_gemm_fwd_ptr.py
+@@ -0,0 +1,186 @@
++import argparse
++import math
++import time
++
++import torch
++
++import tilelang as tl
++import tilelang.language as T
++
++
++def make_ptr_table(tensors):
++    assert tensors, "pointer table requires at least one tensor"
++    device = tensors[0].device
++    return torch.tensor([tensor.data_ptr() for tensor in tensors], device=device, dtype=torch.int64)
++
++
++def torch_grouped_gemm_ptr(a_list, b_list):
++    assert len(a_list) == len(b_list), "A/B group count mismatch"
++    outputs = []
++    for a, b in zip(a_list, b_list):
++        assert a.shape[1] == b.shape[0], "incompatible GEMM shapes"
++        outputs.append(torch.matmul(a, b))
++    return outputs
++
++
++def grouped_gemm_ptr(batch_sizes_list, K, N, block_M, block_N, block_K, num_stages=2, threads=128, dtype=T.float16):
++    # Keep per-group tensors separate and pass them via pointer tables.
++    # We currently use a common max_M storage shape per group because
++    # ptr-backed tensors with runtime-varying shapes are not stable enough yet.
++    # Multi-stage software pipelining on ptr-backed tensors is not correct yet.
++    # Keep a single-stage pipeline so the ptr path can still use T.copy lowering.
++    copy_num_stages = 1
++    batch_count = len(batch_sizes_list)
++    max_M = max(batch_sizes_list)
++    batch_tile_offsets = [0]
++    for size in batch_sizes_list[:-1]:
++        batch_tile_offsets.append(batch_tile_offsets[-1] + math.ceil(size / block_M))
++    total_m_blocks = sum(math.ceil(size / block_M) for size in batch_sizes_list)
++    accum_dtype = T.float32
++
++    @T.prim_func
++    def kernel(
++        A_ptrs: T.Tensor([batch_count], T.ptr),
++        B_ptrs: T.Tensor([batch_count], T.ptr),
++        C_ptrs: T.Tensor([batch_count], T.ptr),
++        batch_tile_offsets: T.Tensor([batch_count], T.int32),
++    ):
++        with T.Kernel(total_m_blocks, T.ceildiv(N, block_N), threads=threads) as (bx, by):
++            A_shared = T.alloc_shared((block_M, block_K), dtype)
++            B_shared = T.alloc_shared((block_K, block_N), dtype)
++            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            cur_batch_idx = T.alloc_var(dtype=T.int32)
++            cur_tile_offset = T.alloc_var(dtype=T.int32)
++
++            cur_batch_idx = 0
++            cur_tile_offset = 0
++            for i in range(batch_count):
++                in_cur_batch_idx = bx >= batch_tile_offsets[i]
++                cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
++                cur_tile_offset = T.if_then_else(in_cur_batch_idx, batch_tile_offsets[i], cur_tile_offset)
++
++            m_start = (bx - cur_tile_offset) * block_M
++            A = T.make_tensor(A_ptrs[cur_batch_idx], (max_M, K), dtype)
++            B = T.make_tensor(B_ptrs[cur_batch_idx], (K, N), dtype)
++            C = T.make_tensor(C_ptrs[cur_batch_idx], (max_M, N), dtype)
++
++            T.clear(C_local)
++            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=copy_num_stages):
++                T.copy(A[m_start, ko * block_K], A_shared)
++                T.copy(B[ko * block_K, by * block_N], B_shared)
++                T.gemm(A_shared, B_shared, C_local)
++
++            T.copy(C_local, C[m_start, by * block_N])
++
++    return kernel
++
++
++def construct_inputs(batch_sizes_list, K, N, block_M, device, dtype):
++    max_M = max(batch_sizes_list)
++    batch_tile_offsets_list = [0]
++    for size in batch_sizes_list[:-1]:
++        batch_tile_offsets_list.append(batch_tile_offsets_list[-1] + math.ceil(size / block_M))
++    # Each group owns an independent padded tensor; nothing is concatenated.
++    a_list = [torch.zeros(max_M, K, device=device, dtype=dtype) for _ in batch_sizes_list]
++    b_list = [torch.randn(K, N, device=device, dtype=dtype) for _ in batch_sizes_list]
++    c_list = [torch.empty(max_M, N, device=device, dtype=dtype) for _ in batch_sizes_list]
++    for a, size in zip(a_list, batch_sizes_list):
++        a[:size].copy_(torch.randn(size, K, device=device, dtype=dtype))
++    a_ptrs = make_ptr_table(a_list)
++    b_ptrs = make_ptr_table(b_list)
++    c_ptrs = make_ptr_table(c_list)
++    batch_tile_offsets = torch.tensor(batch_tile_offsets_list, device=device, dtype=torch.int32)
++    return a_list, b_list, c_list, a_ptrs, b_ptrs, c_ptrs, batch_tile_offsets
++
++
++def verify_outputs(outputs, refs, batch_sizes_list, atol=1e-2, rtol=1e-2):
++    for idx, (out, ref, batch_size) in enumerate(zip(outputs, refs, batch_sizes_list)):
++        try:
++            torch.testing.assert_close(out[:batch_size], ref, atol=atol, rtol=rtol)
++        except AssertionError as err:
++            raise AssertionError(f"group {idx}: {err}") from err
++
++
++def benchmark(kernel, inputs, warmup=50, rep=100):
++    for _ in range(warmup):
++        kernel(*inputs)
++    torch.cuda.synchronize()
++
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(rep):
++        kernel(*inputs)
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) / rep
++
++
++def run_tilelang_grouped_gemm_ptr(
++    batch_sizes_list,
++    K,
++    N,
++    block_M,
++    block_N,
++    block_K,
++    num_stages=2,
++    threads=128,
++    backend="tvm_ffi",
++    profile=False,
++):
++    device = torch.device("cuda")
++    dtype = torch.float16
++    program = grouped_gemm_ptr(batch_sizes_list, K, N, block_M, block_N, block_K, num_stages, threads)
++    kernel = tl.compile(
++        program,
++        execution_backend=backend,
++        pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True},
++    )
++    a_list, b_list, c_list, a_ptrs, b_ptrs, c_ptrs, batch_tile_offsets = construct_inputs(batch_sizes_list, K, N, block_M, device, dtype)
++    refs = torch_grouped_gemm_ptr([a[:size] for a, size in zip(a_list, batch_sizes_list)], b_list)
++
++    kernel(a_ptrs, b_ptrs, c_ptrs, batch_tile_offsets)
++    verify_outputs(c_list, refs, batch_sizes_list)
++    print("✅ TileLang ptr-grouped-gemm matches PyTorch")
++
++    if profile:
++        latency = benchmark(kernel, (a_ptrs, b_ptrs, c_ptrs, batch_tile_offsets))
++        total_flops = sum(size * K * N * 2 for size in batch_sizes_list)
++        print(f"Latency: {latency:.4f} ms")
++        print(f"TFlops: {total_flops / (latency * 1e9):.4f}")
++
++
++def test_grouped_gemm_ptr():
++    run_tilelang_grouped_gemm_ptr([16, 33, 64], 128, 96, 32, 32, 32)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--batch_sizes", type=str, default="64,128,256", help="comma-separated per-group M sizes")
++    parser.add_argument("--K", type=int, default=4096, help="reduce dim")
++    parser.add_argument("--N", type=int, default=4096, help="output dim")
++    parser.add_argument("--backend", type=str, default="tvm_ffi", choices=["tvm_ffi", "cython"], help="execution backend")
++    parser.add_argument("--profile", action="store_true", help="benchmark the kernel")
++    args = parser.parse_args()
++
++    batch_sizes_list = [int(x.strip()) for x in args.batch_sizes.split(",") if x.strip()]
++    block_M = 64
++    block_N = 128
++    block_K = 64
++    num_stages = 1
++    threads = 256
++
++    t0 = time.time()
++    run_tilelang_grouped_gemm_ptr(
++        batch_sizes_list,
++        args.K,
++        args.N,
++        block_M,
++        block_N,
++        block_K,
++        num_stages=num_stages,
++        threads=threads,
++        backend=args.backend,
++        profile=args.profile,
++    )
++    print(f"End-to-end: {time.time() - t0:.3f} s")
+diff --git a/src/transform/inject_pipeline.cc b/src/transform/inject_pipeline.cc
+index e9c1166903..15d7ff6bc5 100644
+--- a/src/transform/inject_pipeline.cc
++++ b/src/transform/inject_pipeline.cc
+@@ -203,8 +203,12 @@ class PipelineBodyRewriter : public StmtExprMutator {
+     };
+     Array<PrimExpr> new_args = call->args;
+     for (int i : arg_indices) {
+-      const Buffer &buffer =
+-          buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
++      auto buffer_var = Downcast<Var>(call->args[i]);
++      auto buf_it = buffer_data_to_buffer_.find(buffer_var);
++      if (buf_it == buffer_data_to_buffer_.end()) {
++        continue;
++      }
++      const Buffer &buffer = (*buf_it).second;
+       auto it = buffer_remap_.find(buffer);
+       if (it != buffer_remap_.end()) {
+         const Buffer &new_buffer = (*it).second;
+diff --git a/src/transform/thread_storage_sync.cc b/src/transform/thread_storage_sync.cc
+index aca2a20a45..cff80ecbd9 100644
+--- a/src/transform/thread_storage_sync.cc
++++ b/src/transform/thread_storage_sync.cc
+@@ -544,42 +544,62 @@ class ThreadPartialSyncRewriter : public IRMutatorWithAnalyzer {
+   std::unordered_map<ThreadBoundKey, size_t> thread_count_map_;
+ };
+ 
++struct ConditionThreadProperty {
++  bool depends_on_runtime{false};
++  bool is_block_uniform{true};
++  bool requires_hoist{false};
++
++  void Merge(const ConditionThreadProperty &other) {
++    depends_on_runtime = depends_on_runtime || other.depends_on_runtime;
++    is_block_uniform = is_block_uniform && other.is_block_uniform;
++    requires_hoist = requires_hoist || other.requires_hoist;
++  }
++};
++
+ /*!
+- * \brief Check if an if-condition depends on runtime-variable values.
++ * \brief Analyze whether an if-condition is runtime-dependent and/or uniform
++ * across all threads in a block.
+  *
+- * For sync hoisting decisions, we distinguish two types of non-uniform
+- * conditions:
++ * For sync hoisting decisions we care about two independent properties:
+  *
+- * 1. Conditions that only depend on threadIdx (e.g., `threadIdx.x >= 512`):
+- *    - The number of threads entering the if can be determined at compile time
+- *    - ThreadPartialSyncRewriter can handle this by computing the thread count
+- *    - No need to hoist sync
++ * 1. Does the condition depend on runtime values such as memory loads?
++ * 2. Even if it does, is it still block-uniform, i.e. identical for every
++ *    thread in the block?
+  *
+- * 2. Conditions that depend on runtime values (e.g., `shared_mem[tx] != -1`):
+- *    - Cannot determine at compile time how many threads will enter
+- *    - Must hoist sync to before the if to avoid potential deadlock
++ * Example:
++ * - `token_ids[tx] != -1` is runtime-dependent and non-uniform.
++ * - `batch_sizes[bx] > 0` is runtime-dependent but block-uniform.
+  *
+- * This checker identifies case (2) - conditions that depend on runtime values.
++ * Only runtime-dependent, non-uniform conditions need to force sync hoisting.
++ * In addition, some non-uniform threadIdx-only conditions still need hoisting
++ * when ThreadPartialSyncRewriter cannot handle them.
+  */
+-class RuntimeDependentConditionChecker : public IRMutatorWithAnalyzer {
++class ConditionThreadPropertyChecker : public IRMutatorWithAnalyzer {
+ public:
+-  explicit RuntimeDependentConditionChecker(arith::Analyzer *analyzer,
+-                                            int warp_size = 32)
+-      : IRMutatorWithAnalyzer(analyzer), warp_size_(warp_size) {}
++  explicit ConditionThreadPropertyChecker(
++      arith::Analyzer *analyzer, const Array<IterVar> &env_threads,
++      const std::unordered_map<const VarNode *, ConditionThreadProperty>
++          &let_var_properties,
++      int warp_size = 32)
++      : IRMutatorWithAnalyzer(analyzer), env_threads_(env_threads),
++        let_var_properties_(let_var_properties), warp_size_(warp_size) {}
+ 
+   /*!
+-   * \brief Check if expression depends on runtime-variable values.
+-   * \return true if the expression depends on values that cannot be determined
+-   *         at compile time (e.g., shared memory loads), false if it only
+-   *         depends on compile-time known values (constants, threadIdx,
+-   * blockIdx).
++   * \brief Analyze condition properties relevant to thread-sync hoisting.
+    */
+-  bool DependsOnRuntimeValue(const PrimExpr &expr, const IterVar &iv) {
+-    depends_on_runtime_ = false;
++  ConditionThreadProperty AnalyzeExpr(const PrimExpr &expr) {
++    current_ = ConditionThreadProperty();
++    this->VisitExpr(expr);
++    return current_;
++  }
++
++  ConditionThreadProperty AnalyzeCondition(const PrimExpr &expr,
++                                           const IterVar &iv) {
++    current_ = ConditionThreadProperty();
+     this->VisitExpr(expr);
+     auto extent_opt = as_const_int(iv->dom->extent);
+     ICHECK(extent_opt != nullptr)
+-        << "DependsOnRuntimeValue: thread extent must be a "
++        << "AnalyzeCondition: thread extent must be a "
+            "constant, but got: "
+         << iv->dom->extent;
+     int64_t thread_extent = *extent_opt;
+@@ -588,36 +608,88 @@ class RuntimeDependentConditionChecker : public IRMutatorWithAnalyzer {
+       auto count = analyzer_->z3_prover.CountSatisfyingValues(
+           iv->var, thread_extent, /*min_consecutive=*/warp_size_);
+       if (count < 0) {
+-        // failed to count satisfying values, return true
+-        depends_on_runtime_ = true;
++        // ThreadPartialSyncRewriter cannot safely lower this condition.
++        current_.requires_hoist = true;
+       }
+     }
+-    return depends_on_runtime_;
++    return current_;
+   }
+ 
+ private:
++  StorageScope GetScope(Var buffer_var) const {
++    return StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
++  }
++
++  bool IsThreadVar(const VarNode *op) const {
++    for (const auto &iv : env_threads_) {
++      if (iv->var.get() == op &&
++          runtime::ThreadScope::Create(iv->thread_tag).rank == 1) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  bool IsThreadLocalScope(const StorageScope &scope) const {
++    switch (scope.rank) {
++    case StorageRank::kWarp:
++    case StorageRank::kLocal:
++    case StorageRank::kWMMAMatrixA:
++    case StorageRank::kWMMAMatrixB:
++    case StorageRank::kWMMAAccumulator:
++    case StorageRank::kAMXTMM:
++    case StorageRank::kMMAMatrixA:
++    case StorageRank::kMMAMatrixB:
++    case StorageRank::kMMAMatrixC:
++    case StorageRank::kMetalSimdGroup:
++      return true;
++    case StorageRank::kGlobal:
++    case StorageRank::kShared:
++    case StorageRank::kTexture:
++      return false;
++    }
++    return false;
++  }
++
++  PrimExpr VisitExpr_(const VarNode *op) final {
++    if (IsThreadVar(op)) {
++      current_.is_block_uniform = false;
++    }
++    auto it = let_var_properties_.find(op);
++    if (it != let_var_properties_.end()) {
++      current_.Merge(it->second);
++    }
++    return GetRef<Var>(op);
++  }
++
+   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+-    // Any buffer load introduces runtime dependency
+-    // (we don't know the buffer contents at compile time)
+-    depends_on_runtime_ = true;
++    current_.depends_on_runtime = true;
++    if (IsThreadLocalScope(GetScope(op->buffer->data))) {
++      current_.is_block_uniform = false;
++    }
+     return IRMutatorWithAnalyzer::VisitExpr_(op);
+   }
+ 
+   PrimExpr VisitExpr_(const CallNode *op) final {
+-    // Check tvm_access_ptr and address_of - if used in condition, it's reading
+-    // memory
+     if (op->op.same_as(builtin::tvm_access_ptr()) ||
+         op->op.same_as(builtin::address_of())) {
+-      depends_on_runtime_ = true;
+-      return IRMutatorWithAnalyzer::VisitExpr_(op);
++      current_.depends_on_runtime = true;
++      if (op->op.same_as(builtin::tvm_access_ptr()) && op->args.size() >= 2) {
++        if (const auto *data_var = op->args[1].as<VarNode>()) {
++          if (IsThreadLocalScope(GetScope(GetRef<Var>(data_var)))) {
++            current_.is_block_uniform = false;
++          }
++        }
++      }
+     }
+-    // Other calls might also introduce runtime dependency
+-    // but we'll be conservative and check children
+     return IRMutatorWithAnalyzer::VisitExpr_(op);
+   }
+ 
+ private:
+-  bool depends_on_runtime_{false};
++  ConditionThreadProperty current_;
++  const Array<IterVar> &env_threads_;
++  const std::unordered_map<const VarNode *, ConditionThreadProperty>
++      &let_var_properties_;
+   int warp_size_;
+ };
+ 
+@@ -774,8 +846,21 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     allow_append_ = false;
+     // traverse body block
+     {
++      auto let_prop = AnalyzeExprProperty(op->value);
++      auto it = let_var_properties_.find(op->var.get());
++      bool had_prev = it != let_var_properties_.end();
++      ConditionThreadProperty prev_prop;
++      if (had_prev) {
++        prev_prop = it->second;
++      }
++      let_var_properties_[op->var.get()] = let_prop;
+       auto guard = MakeGuard(op->var, op->value);
+       this->VisitStmt(op->body);
++      if (had_prev) {
++        let_var_properties_[op->var.get()] = prev_prop;
++      } else {
++        let_var_properties_.erase(op->var.get());
++      }
+     }
+   }
+   void VisitStmt_(const BlockNode *op) final {
+@@ -926,29 +1011,26 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     bool has_syncs_inside = !syncs_in_then.empty() || !syncs_in_else.empty();
+ 
+     if (has_syncs_inside) {
+-      // Check if the condition depends on runtime values (e.g., shared memory
+-      // loads). If so, we cannot determine at compile time how many threads
+-      // will enter the if, so we must hoist the sync to before the if to avoid
+-      // potential deadlock.
++      // Runtime-dependent conditions are only problematic when they can differ
++      // across threads in the same block. Block-uniform runtime conditions
++      // such as `batch_sizes[blockIdx.z] > 0` are safe to keep in-place.
+       //
+-      // If the condition only depends on threadIdx (e.g., `threadIdx.x >=
+-      // 512`), we use Z3 to check if the thread count is a multiple of 32.
+-      // If not, ThreadPartialSyncRewriter cannot handle it properly, so we
+-      // must also hoist the sync.
++      // Separately, some threadIdx-only non-uniform conditions still need
++      // hoisting when ThreadPartialSyncRewriter cannot lower them safely.
+       arith::Analyzer analyzer;
+       ConstrSet constr_set = GetConstrSet();
+       constr_set.Populate(analyzer);
+-      RuntimeDependentConditionChecker checker(&analyzer, warp_size_);
++      ConditionThreadPropertyChecker checker(&analyzer, env_threads_,
++                                             let_var_properties_, warp_size_);
+       IterVar tx = GetThreadVar("threadIdx.x");
+-      bool depends_on_runtime =
+-          checker.DependsOnRuntimeValue(op->condition, tx);
++      auto condition_prop = checker.AnalyzeCondition(op->condition, tx);
+ 
+-      if (depends_on_runtime) {
+-        // Condition depends on runtime values - must hoist sync
+-        // Condition depends on runtime values - must hoist sync
++      if ((condition_prop.depends_on_runtime &&
++           !condition_prop.is_block_uniform) ||
++          condition_prop.requires_hoist) {
+         LOG(WARNING)
+             << "[ThreadSync] Hoisting sync from inside if to before if. "
+-            << "Condition depends on runtime value: " << op->condition;
++            << "Condition is not safe for in-if sync: " << op->condition;
+         for (const auto &sync : syncs_in_then) {
+           syncs_inserted_.erase(sync);
+         }
+@@ -1374,6 +1456,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+   const Array<IterVar> &env_threads() const { return env_threads_; }
+ 
+ private:
++  ConditionThreadProperty AnalyzeExprProperty(const PrimExpr &expr) const {
++    arith::Analyzer analyzer;
++    ConstrSet constr_set = GetConstrSet();
++    constr_set.Populate(analyzer);
++    ConditionThreadPropertyChecker checker(&analyzer, env_threads_,
++                                           let_var_properties_, warp_size_);
++    return checker.AnalyzeExpr(expr);
++  }
++
+   bool Enabled(const VarNode *buf, const StorageScope &scope) {
+     return in_device_env() && scope == sync_scope_;
+   }
+@@ -1396,6 +1487,10 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+   StmtEntry curr_stmt_;
+   // The involving threads
+   Array<IterVar> env_threads_;
++  // Thread-uniform/runtime properties for let-bound vars visible in the
++  // current lexical scope.
++  std::unordered_map<const VarNode *, ConditionThreadProperty>
++      let_var_properties_;
+   // The buffer map
+   Map<Var, Buffer> buffer_data_to_buffer_;
+   // synchronization scope
+diff --git a/testing/python/language/test_tilelang_language_ptr.py b/testing/python/language/test_tilelang_language_ptr.py
+index dd167efe56..1ec81c9cb4 100644
+--- a/testing/python/language/test_tilelang_language_ptr.py
++++ b/testing/python/language/test_tilelang_language_ptr.py
+@@ -1,3 +1,4 @@
++import math
+ import torch
+ from tilelang import tvm as tvm
+ import tilelang.testing
+@@ -39,6 +40,76 @@ def main(
+     return main
+ 
+ 
++def pointer_table_copy_test(N, dtype=T.float16):
++    @T.prim_func
++    def main(
++        src_ptrs: T.Tensor([1], T.ptr),
++        out: T.Tensor([N], dtype),
++    ):
++        with T.Kernel(1, threads=1) as _:
++            Src = T.make_tensor(src_ptrs[0], (N,), dtype)
++            for i in T.serial(N):
++                out[i] = Src[i]
++
++    return main
++
++
++def pointer_table_multi_copy_test(G, N, dtype=T.float16):
++    @T.prim_func
++    def main(
++        src_ptrs: T.Tensor([G], T.ptr),
++        out: T.Tensor([G, N], dtype),
++    ):
++        with T.Kernel(G, threads=1) as bx:
++            Src = T.make_tensor(src_ptrs[bx], (N,), dtype)
++            for i in T.serial(N):
++                out[bx, i] = Src[i]
++
++    return main
++
++
++def pointer_table_grouped_matmul_test(batch_sizes_list, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
++    batch_count = len(batch_sizes_list)
++    max_M = max(batch_sizes_list)
++    total_m_blocks = sum(math.ceil(size / block_M) for size in batch_sizes_list)
++
++    @T.prim_func
++    def main(
++        a_ptrs: T.Tensor([batch_count], T.ptr),
++        b_ptrs: T.Tensor([batch_count], T.ptr),
++        c_ptrs: T.Tensor([batch_count], T.ptr),
++        batch_tile_offsets: T.Tensor([batch_count], T.int32),
++    ):
++        with T.Kernel(total_m_blocks, T.ceildiv(N, block_N), threads=32) as (bx, by):
++            A_shared = T.alloc_shared((block_M, block_K), dtype)
++            B_shared = T.alloc_shared((block_K, block_N), dtype)
++            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            cur_batch_idx = T.alloc_var(dtype=T.int32)
++            cur_tile_offset = T.alloc_var(dtype=T.int32)
++
++            cur_batch_idx = 0
++            cur_tile_offset = 0
++            for i in range(batch_count):
++                in_cur_batch_idx = bx >= batch_tile_offsets[i]
++                cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
++                cur_tile_offset = T.if_then_else(in_cur_batch_idx, batch_tile_offsets[i], cur_tile_offset)
++
++            m_start = (bx - cur_tile_offset) * block_M
++            A = T.make_tensor(a_ptrs[cur_batch_idx], (max_M, K), dtype)
++            B = T.make_tensor(b_ptrs[cur_batch_idx], (K, N), dtype)
++            C = T.make_tensor(c_ptrs[cur_batch_idx], (max_M, N), dtype)
++
++            T.clear(C_local)
++            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=1):
++                T.copy(A[m_start, ko * block_K], A_shared)
++                T.copy(B[ko * block_K, by * block_N], B_shared)
++                T.gemm(A_shared, B_shared, C_local)
++
++            T.copy(C_local, C[m_start, by * block_N])
++
++    return main
++
++
+ def run_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+     program = matmul_test(M, N, K, block_M, block_N, block_K, dtype, accum_dtype)
+     cython_jit_kernel = tl.compile(program, execution_backend="cython")
+@@ -58,9 +129,109 @@ def ref_program(a, b):
+     torch.testing.assert_close(cython_c, ffi_c, atol=1e-2, rtol=1e-2)
+ 
+ 
++def run_pointer_table_copy(N, dtype=T.float16):
++    program = pointer_table_copy_test(N, dtype)
++    cython_jit_kernel = tl.compile(program, execution_backend="cython")
++    ffi_jit_kernel = tl.compile(program, execution_backend="tvm_ffi")
++    src = torch.randn(N, device="cuda", dtype=map_torch_type(dtype))
++    src_ptrs = torch.tensor([src.data_ptr()], device="cuda", dtype=torch.int64)
++    ffi_out = torch.empty(N, device="cuda", dtype=map_torch_type(dtype))
++    cython_out = torch.empty(N, device="cuda", dtype=map_torch_type(dtype))
++
++    ffi_jit_kernel(src_ptrs, ffi_out)
++    cython_jit_kernel(src_ptrs, cython_out)
++
++    torch.testing.assert_close(ffi_out, src)
++    torch.testing.assert_close(cython_out, src)
++    torch.testing.assert_close(cython_out, ffi_out)
++
++
++def run_pointer_table_multi_copy(G, N, dtype=T.float16):
++    program = pointer_table_multi_copy_test(G, N, dtype)
++    cython_jit_kernel = tl.compile(program, execution_backend="cython")
++    ffi_jit_kernel = tl.compile(program, execution_backend="tvm_ffi")
++    srcs = [torch.randn(N, device="cuda", dtype=map_torch_type(dtype)) for _ in range(G)]
++    src_ptrs = torch.tensor([src.data_ptr() for src in srcs], device="cuda", dtype=torch.int64)
++    ref = torch.stack(srcs, dim=0)
++    ffi_out = torch.empty((G, N), device="cuda", dtype=map_torch_type(dtype))
++    cython_out = torch.empty((G, N), device="cuda", dtype=map_torch_type(dtype))
++
++    ffi_jit_kernel(src_ptrs, ffi_out)
++    cython_jit_kernel(src_ptrs, cython_out)
++
++    torch.testing.assert_close(ffi_out, ref)
++    torch.testing.assert_close(cython_out, ref)
++    torch.testing.assert_close(cython_out, ffi_out)
++
++
++def run_pointer_table_grouped_matmul(batch_sizes_list, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
++    program = pointer_table_grouped_matmul_test(batch_sizes_list, N, K, block_M, block_N, block_K, dtype, accum_dtype)
++    compile_kwargs = {"pass_configs": {"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True}}
++    cython_jit_kernel = tl.compile(program, execution_backend="cython", **compile_kwargs)
++    ffi_jit_kernel = tl.compile(program, execution_backend="tvm_ffi", **compile_kwargs)
++
++    device = "cuda"
++    torch_dtype = map_torch_type(dtype)
++    torch_accum_dtype = map_torch_type(accum_dtype)
++    max_M = max(batch_sizes_list)
++    batch_tile_offsets = [0]
++    for size in batch_sizes_list[:-1]:
++        batch_tile_offsets.append(batch_tile_offsets[-1] + math.ceil(size / block_M))
++    batch_tile_offsets_t = torch.tensor(batch_tile_offsets, device=device, dtype=torch.int32)
++
++    a_exact = [torch.randn(size, K, device=device, dtype=torch_dtype) for size in batch_sizes_list]
++    b_list = [torch.randn(K, N, device=device, dtype=torch_dtype) for _ in batch_sizes_list]
++    ref = [(a @ b).to(torch_accum_dtype) for a, b in zip(a_exact, b_list)]
++
++    def build_backend_buffers():
++        a_list = [torch.zeros(max_M, K, device=device, dtype=torch_dtype) for _ in batch_sizes_list]
++        c_list = [torch.empty(max_M, N, device=device, dtype=torch_dtype) for _ in batch_sizes_list]
++        for buf, src in zip(a_list, a_exact):
++            buf[: src.shape[0]].copy_(src)
++        return (
++            a_list,
++            c_list,
++            torch.tensor([buf.data_ptr() for buf in a_list], device=device, dtype=torch.int64),
++            torch.tensor([buf.data_ptr() for buf in b_list], device=device, dtype=torch.int64),
++            torch.tensor([buf.data_ptr() for buf in c_list], device=device, dtype=torch.int64),
++        )
++
++    ffi_a_list, ffi_c_list, ffi_a_ptrs, ffi_b_ptrs, ffi_c_ptrs = build_backend_buffers()
++    cython_a_list, cython_c_list, cython_a_ptrs, cython_b_ptrs, cython_c_ptrs = build_backend_buffers()
++
++    ffi_jit_kernel(ffi_a_ptrs, ffi_b_ptrs, ffi_c_ptrs, batch_tile_offsets_t)
++    cython_jit_kernel(cython_a_ptrs, cython_b_ptrs, cython_c_ptrs, batch_tile_offsets_t)
++
++    for out, expected, size in zip(ffi_c_list, ref, batch_sizes_list):
++        torch.testing.assert_close(out[:size].to(torch_accum_dtype), expected, atol=1e-2, rtol=1e-2)
++    for out, expected, size in zip(cython_c_list, ref, batch_sizes_list):
++        torch.testing.assert_close(out[:size].to(torch_accum_dtype), expected, atol=1e-2, rtol=1e-2)
++
++
+ def test_matmul():
+     run_matmul(1024, 1024, 1024, 128, 128, 32)
+ 
+ 
++def test_pointer_table_annotation_lowers_to_int64_buffer():
++    program = pointer_table_multi_copy_test(4, 8)
++    src_ptrs = program.buffer_map[program.params[0]]
++
++    assert src_ptrs.dtype == "int64"
++    assert [int(dim) for dim in src_ptrs.shape] == [4]
++
++
++def test_pointer_table_copy():
++    run_pointer_table_copy(256)
++
++
++def test_pointer_table_multi_copy():
++    run_pointer_table_multi_copy(4, 128)
++
++
++def test_pointer_table_grouped_matmul():
++    run_pointer_table_grouped_matmul([16, 24, 33], 48, 64, 16, 16, 16)
++
++
+ if __name__ == "__main__":
+-    tilelang.testing.main()
++    # tilelang.testing.main()
++    run_pointer_table_multi_copy(4, 128)
+diff --git a/testing/python/transform/test_tilelang_transform_thread_sync.py b/testing/python/transform/test_tilelang_transform_thread_sync.py
+index 8df8dd7fe1..fac5471f26 100644
+--- a/testing/python/transform/test_tilelang_transform_thread_sync.py
++++ b/testing/python/transform/test_tilelang_transform_thread_sync.py
+@@ -548,6 +548,32 @@ def func():
+     assert 'T.tvm_storage_sync("shared")' in s, f"Expected sync:\n{s}"
+ 
+ 
++@tilelang.testing.requires_cuda
++def test_sync_inside_uniform_if_runtime_block_uniform_condition():
++    """Runtime-loaded but block-uniform conditions should keep syncs in the if."""
++
++    @T.prim_func(private=True)
++    def func(flags: T.Buffer((4,), "int32")):
++        temp_shared = T.alloc_buffer([128], dtype="float32", scope="shared")
++        result_local = T.alloc_buffer([1], dtype="float32", scope="local")
++        bx = T.launch_thread("blockIdx.x", 4)
++        tx = T.launch_thread("threadIdx.x", 128)
++        ty = T.launch_thread("threadIdx.y", 1)
++        tz = T.launch_thread("threadIdx.z", 1)
++        result_local[0] = T.float32(0)
++        if flags[bx] > 0:
++            temp_shared[tx] = T.float32(tx)
++            result_local[0] = temp_shared[(tx + 64) % 128]
++
++    mod = tvm.IRModule({"main": func})
++    mod = tilelang.transform.ThreadSync("shared")(mod)
++    s = str(mod)
++    assert s.count('T.tvm_storage_sync("shared")') == 1, f"Expected exactly one sync:\n{s}"
++    if_pos = s.index("if flags[bx] > 0")
++    sync_pos = s.index('T.tvm_storage_sync("shared")')
++    assert sync_pos > if_pos, f"Block-uniform runtime condition should keep sync inside if:\n{s}"
++
++
+ @tilelang.testing.requires_cuda
+ def test_sync_hoist_nested_non_uniform_if():
+     """Test sync hoisting with nested if statements where outer is non-uniform."""
+diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
+index ddc170b0bc..9fc05a62da 100644
+--- a/tilelang/language/__init__.py
++++ b/tilelang/language/__init__.py
+@@ -14,7 +14,7 @@
+ from .eager import *  # noqa: F401
+ from .tir.ir import *  # noqa: F401
+ from tilelang.layout import Layout, Fragment  # noqa: F401
+-from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
++from .proxy import ptr, make_tensor, make_tensor_from_addr, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+ from .loop import (
+     Parallel,  # noqa: F401
+     Persistent,  # noqa: F401
+diff --git a/tilelang/language/proxy.py b/tilelang/language/proxy.py
+index c5936a0338..00d847fb29 100644
+--- a/tilelang/language/proxy.py
++++ b/tilelang/language/proxy.py
+@@ -6,9 +6,9 @@
+ from tilelang._typing import DType, ShapeType
+ from typing_extensions import Self
+ 
+-from tvm import tir
++from tvm import DataType, ir as tvm_ir, tir
+ from tvm.tir import Var, PrimExpr
+-from tvm.script.ir_builder.tir import buffer, handle, match_buffer
++from tvm.script.ir_builder.tir import LetStmt, buffer, handle, match_buffer
+ from tilelang.utils import deprecated
+ from tilelang.jit.exceptions import JITNoBuilderError
+ 
+@@ -71,6 +71,15 @@ def from_ptr(
+         return match_buffer(pointer_var, shape, dtype=dtype, strides=strides)
+ 
+ 
++def _normalize_tensor_dtype(dtype: DType) -> DType:
++    # `T.Tensor(..., T.ptr)` is a frontend-only marker for pointer tables.
++    # Keep the runtime ABI as int64 storage and rely on T.make_tensor(...)
++    # to reinterpret loaded addresses back into typed pointers as needed.
++    if dtype is ptr:
++        return _dtypes.int64
++    return dtype
++
++
+ class BaseTensorProxy:
+     """Base proxy class for tensor types with configurable defaults.
+ 
+@@ -97,6 +106,7 @@ def __call__(
+         axis_separators=None,
+     ) -> tir.Buffer:
+         # Use class defaults if not specified
++        dtype = _normalize_tensor_dtype(dtype)
+         scope = scope or self.default_scope
+         align = align or self.default_align
+         offset_factor = offset_factor or self.default_offset_factor
+@@ -133,6 +143,7 @@ def from_ptr(
+         Returns:
+             A buffer created from the given parameters
+         """
++        dtype = _normalize_tensor_dtype(dtype)
+         return match_buffer(pointer_var, shape, dtype=dtype, strides=strides)
+ 
+ 
+@@ -277,9 +288,54 @@ def ptr(dtype: DType | None = None, storage_scope: str = "global", *, is_size_va
+     return handle(dtype=dtype, storage_scope=storage_scope, is_size_var=is_size_var)
+ 
+ 
+-def make_tensor(ptr: Var, shape: ShapeType, dtype: DType = "float32", strides: tuple[PrimExpr, ...] | None = None) -> tir.Buffer:
++def _get_pointer_type_annotation(value: object) -> tvm_ir.PointerType | None:
++    type_annotation = getattr(value, "type_annotation", None)
++    if isinstance(type_annotation, tvm_ir.PointerType):
++        return type_annotation
++    return None
++
++
++def _materialize_pointer_from_addr(addr: PrimExpr, dtype: DType, storage_scope: str = "global") -> Var:
++    from tilelang.language.eager.builder import Builder
++
++    builder = Builder.current()
++    if builder is None:
++        raise JITNoBuilderError("T.make_tensor() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
++
++    value = addr if str(addr.dtype) == "handle" else tir.reinterpret("handle", addr)
++    ptr_type = tvm_ir.PointerType(tvm_ir.PrimType(DataType(dtype)), storage_scope)
++    return builder.enter_frame(LetStmt(value, type_annotation=ptr_type))
++
++
++def make_tensor_from_addr(
++    addr: PrimExpr,
++    shape: ShapeType,
++    dtype: DType = "float32",
++    strides: tuple[PrimExpr, ...] | None = None,
++    storage_scope: str = "global",
++) -> tir.Buffer:
++    from tilelang.language.eager.builder import Builder
++
++    if Builder.current() is None:
++        raise JITNoBuilderError(
++            "T.make_tensor_from_addr() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available."
++        )
++
++    dtype = _normalize_tensor_dtype(dtype)
++    pointer_var = _materialize_pointer_from_addr(addr, dtype, storage_scope)
++    return buffer(shape, dtype=dtype, data=pointer_var, strides=strides, scope=storage_scope)
++
++
++def make_tensor(ptr: Var | PrimExpr, shape: ShapeType, dtype: DType = "float32", strides: tuple[PrimExpr, ...] | None = None) -> tir.Buffer:
+     from tilelang.language.eager.builder import Builder
+ 
+     if Builder.current() is None:
+         raise JITNoBuilderError("T.make_tensor() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+-    return Tensor.from_ptr(ptr, shape, dtype, strides)
++
++    dtype = _normalize_tensor_dtype(dtype)
++    if isinstance(ptr, Var):
++        return Tensor.from_ptr(ptr, shape, dtype, strides)
++
++    ptr_type = _get_pointer_type_annotation(ptr)
++    storage_scope = ptr_type.storage_scope if ptr_type is not None and ptr_type.storage_scope else "global"
++    return make_tensor_from_addr(ptr, shape, dtype=dtype, strides=strides, storage_scope=storage_scope)

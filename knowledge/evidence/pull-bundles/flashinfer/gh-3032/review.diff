@@ -1,0 +1,179 @@
+diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+index c8caf3def9..2374ff3261 100644
+--- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
++++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+@@ -720,6 +720,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+       return Function::FromTyped([this]() -> int64_t { return mGemm1TacticCount; });
+     } else if (name == "get_gemm2_tactic_count") {
+       return Function::FromTyped([this]() -> int64_t { return mGemm2TacticCount; });
++    } else if (name == "get_tactic_occupancy") {
++      // Returns the max active blocks per SM for the given tactic index.
++      // Returns 0 if the tactic is not supported on the current device (e.g., SM89 tile
++      // configs with insufficient shared memory when running on SM120 Blackwell).
++      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
++        std::lock_guard<std::mutex> lock(mMutex);
++        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
++          return 0;
++        }
++        return static_cast<int64_t>(
++            mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
++      });
+     } else if (name == "run_moe") {
+       return Function::FromTyped(
+           [this](TensorView output, TensorView input, TensorView token_selected_experts,
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h
+index 4e85da745c..f91a235c8f 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h
+@@ -315,6 +315,12 @@ class MoeGemmRunner {
+ 
+   [[nodiscard]] int getSM() const;
+ 
++  // Query the occupancy (max active blocks per SM) for a given GEMM configuration.
++  // Returns 0 if the configuration is not supported on the current device.
++  // This is useful for pre-filtering tactics that would fail at execution time due to
++  // insufficient shared memory resources (e.g., SM89 tile configs run on SM120 Blackwell).
++  int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config);
++
+  private:
+   template <typename EpilogueTag>
+   void dispatchToArch(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+index a5e786b148..3b408dc24e 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+@@ -455,6 +455,9 @@ class CutlassMoeFCRunnerInterface {
+   virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
+                          std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) = 0;
+   virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) = 0;
++  // Query occupancy for a GEMM config without executing the kernel.
++  // Returns 0 if the config is incompatible with the current device.
++  virtual int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) = 0;
+ 
+   virtual void runMoe(void const* input_activations, void const* input_sf,
+                       bool const swizzled_input_sf, int const* token_selected_experts,
+@@ -635,6 +638,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+     return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+   }
+ 
++  int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) override {
++    return moe_gemm_runner_.queryOccupancyForConfig(config);
++  }
++
+   static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id) {
+     using RunnerType = decltype(moe_gemm_runner_);
+     return RunnerType::getConfigs(sm,
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h
+index 0a6c085882..859cb1e24f 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h
+@@ -166,12 +166,18 @@ struct genericMoeGemmKernelLauncher {
+ 
+       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+ 
++      // Use the same runtime device check for both the occupancy query path and the
++      // execution path. This is important for SM89 (Ada) kernels running on SM120 (Blackwell):
++      // pure FP8 MoE on SM120 falls back to SM89 kernels since no native SM120 FP8 GEMM
++      // kernels are available. Some SM89 tile configs have 0 occupancy on SM120 due to
++      // hardware resource differences. Using GemmGrouped::maximum_active_blocks() ensures
++      // the occupancy query returns 0 for these configs, allowing the static heuristic to
++      // correctly skip them rather than selecting a config that will fail at execution time.
++      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
+       if (inputs.occupancy != nullptr) {
+-        *inputs.occupancy =
+-            tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
++        *inputs.occupancy = occupancy;
+         return;
+       }
+-      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
+       TLLM_CHECK_WITH_INFO(occupancy > 0,
+                            "GPU lacks the shared memory resources to run GroupedGEMM kernel");
+       int const threadblock_count = sm_count_ * occupancy;
+@@ -1055,4 +1061,34 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemm(
+   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
+ }
+ 
++template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
++          bool IsMXFPX>
++int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::queryOccupancyForConfig(
++    cutlass_extensions::CutlassGemmConfig const& config) {
++  // TMA warp-specialized configs (Hopper/Blackwell native) do not use the Ampere GroupedGEMM
++  // occupancy path, so we conservatively report them as supported (occupancy > 0).
++  if (config.is_tma_warp_specialized) {
++    return 1;
++  }
++
++  // Dispatch with inputs.occupancy set to query occupancy without running the kernel.
++  // Tensor pointers (A, B, C, etc.) are not accessed when inputs.occupancy != nullptr,
++  // so they can safely be left as null.
++  int occupancy = 0;
++  GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs;
++  inputs.occupancy = &occupancy;
++  inputs.gemm_config = config;
++  // Use default epilogue for the query; epilogue type does not affect occupancy.
++  // Pass a default-constructed TmaWarpSpecializedGroupedGemmInput (isValid() == false)
++  // so that no TMA warp-specialized paths are taken for Ampere-style configs.
++  try {
++    runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, TmaWarpSpecializedGroupedGemmInput{});
++  } catch (...) {
++    // If the dispatch throws (e.g., assertion failure for unsupported config/arch combination),
++    // the config is incompatible with this device — report occupancy 0.
++    return 0;
++  }
++  return occupancy;
++}
++
+ }  // namespace tensorrt_llm::kernels::cutlass_kernels
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index f7a1522333..485556cae5 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -312,10 +312,44 @@ def get_valid_tactics(
+ 
+             stage = getattr(self, "gemm_idx_for_tuning", None)
+             if stage == 1:
+-                return list(range(gemm1_count))
+-            if stage == 2:
+-                return list(range(gemm1_count, gemm1_count + gemm2_count))
+-            return list(range(total))
++                all_tactics = list(range(gemm1_count))
++            elif stage == 2:
++                all_tactics = list(range(gemm1_count, gemm1_count + gemm2_count))
++            else:
++                all_tactics = list(range(total))
++
++            # Pre-filter tactics with zero occupancy on the current device.
++            # This eliminates tactics that would fail during profiling with
++            # "GPU lacks the shared memory resources" errors — notably, SM89 (Ada)
++            # tile configs used as fallback for pure FP8 MoE on SM120 (Blackwell CC 12.0)
++            # where native SM120 FP8 MoE GEMM kernels are not yet available.
++            try:
++                get_occ = self.fused_moe_runner.get_tactic_occupancy
++            except AttributeError:
++                # get_tactic_occupancy not available in this build; skip pre-filtering
++                return all_tactics if all_tactics else [-1]
++
++            valid_tactics = []
++            for t in all_tactics:
++                try:
++                    if get_occ(t) > 0:
++                        valid_tactics.append(t)
++                except Exception as e:
++                    # If the query fails unexpectedly, include the tactic and let
++                    # the autotuner handle any errors during profiling.
++                    logger.warning(
++                        "get_tactic_occupancy failed for tactic %d: %s; including in autotuner",
++                        t,
++                        e,
++                    )
++                    valid_tactics.append(t)
++            # Fall back to all tactics if occupancy check eliminated everything
++            # (e.g., on an unexpected architecture where all tactics report 0).
++            # If all_tactics itself is empty (zero-tactic stage), return [-1] as
++            # a sentinel so the autotuner contract is never violated with an empty list.
++            if not all_tactics:
++                return [-1]
++            return valid_tactics if valid_tactics else all_tactics
+ 
+         def forward(
+             self,

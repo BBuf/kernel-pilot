@@ -1,0 +1,728 @@
+diff --git a/csrc/fmhaReduction.cu b/csrc/fmhaReduction.cu
+new file mode 100644
+index 0000000000..51e4b86ca3
+--- /dev/null
++++ b/csrc/fmhaReduction.cu
+@@ -0,0 +1,357 @@
++/*
++ * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <cuda_runtime_api.h>
++#include <float.h>
++
++#include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
++#include "flashinfer/trtllm/common/cudaUtils.h"
++#include "flashinfer/trtllm/fmha/fmhaReduction.h"
++#include "flashinfer/trtllm/fmha/kernelUtils.h"
++#include "flashinfer/utils.cuh"
++
++namespace tensorrt_llm {
++namespace kernels {
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++#define NumThreadsPerCta 512
++
++template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm,
++          typename DtypeO, typename DtypePartialO>
++__global__ void __launch_bounds__(NumThreadsPerCta, 2)
++    fmhaReductionKernel(KernelParams const params, int32_t numCtasForReduction,
++                        int32_t numCtasForAllHeads, int32_t numHeadDimCtasV) {
++  // clang-format off
++  // The shape of partialO buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ, headDimPerCta].
++  // The shape of final O buffer: [batchSize, numCtasQ, numHeadsQ, headDim].
++  // The shape of attentionSinks buffer: [numHeadsQ].
++  // The shape of partialStats buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ], where each element is a float2 (max/sum).
++  // The shape of softmaxStats buffer: [batchSize, numCtasQ, numHeadsQ], where each element is a float2 (max/sum).
++  // Note that numValidRows includes both numValidTokens and numHeadsQPerKv if grouping headsQ.
++  // clang-format on
++
++  // The batchIdx.
++  int32_t const batchIdx{static_cast<int32_t>(blockIdx.z)};
++  // The headCtaIdxO.
++  int32_t const headCtaIdxO{static_cast<int32_t>(blockIdx.y)};
++  // The headDimCtaIdxV.
++  int32_t const headDimCtaIdxV{static_cast<int32_t>(blockIdx.y % numHeadDimCtasV)};
++  // The headGrpIdxO.
++  int32_t const headGrpIdxO{static_cast<int32_t>(blockIdx.y / numHeadDimCtasV)};
++  // The ctaIdxQ.
++  int32_t const ctaIdxQ{static_cast<int32_t>(blockIdx.x % params.mMaxNumCtasQ)};
++  // The ctaIdx for the reduction work.
++  int32_t const ctaIdxForReduction{static_cast<int32_t>(blockIdx.x / params.mMaxNumCtasQ)};
++  // The headIdxO.
++  int32_t const headIdxO{headGrpIdxO * TileSizePerCtaQ};
++  // The warpGrpThreadIdx.
++  int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
++
++  // The number of validRows.
++  int32_t const numValidRows{TileSizePerCtaQ};
++  // The actual number of seqLenKv.
++  int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
++  // Consider the causal-mask speculative decoding.
++  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
++  // The actual number of CtasKv (TileSizeKv is always 128 for now).
++  int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
++
++  // The tileIdx in the batch/head dimension.
++  int64_t const batchHeadTileIdx{
++      ((batchIdx * static_cast<int32_t>(gridDim.y) + headCtaIdxO) * params.mMaxNumCtasQ + ctaIdxQ)};
++
++  // The offset of the partialStats buffer.
++  int64_t const partialStatsOffset{batchHeadTileIdx * params.mMaxNumCtasKv * TileSizePerCtaQ};
++  // The offset of the partialO buffer.
++  int64_t const partialOOffset{partialStatsOffset * HeadDimPerCta};
++  // The offset of the softmaxStats buffer.
++  int64_t const softmaxStatsOffset{
++      ((batchIdx * params.mMaxNumCtasQ + ctaIdxQ) * numCtasForAllHeads + headGrpIdxO) *
++      TileSizePerCtaQ};
++  // The offset of the O buffer.
++  int64_t const oOffset{softmaxStatsOffset * HeadDim + headDimCtaIdxV * HeadDimPerCta};
++
++  // The partialStats pointer.
++  float2* partialStatsPtr = reinterpret_cast<float2*>(params.ptrPartialStats) + partialStatsOffset;
++  // The partialO pointer.
++  DtypePartialO* partialOPtr =
++      reinterpret_cast<DtypePartialO*>(params.ptrPartialO) + partialOOffset;
++  // The softmaxStats pointer.
++  float2* softmaxStatsPtr = reinterpret_cast<float2*>(params.ptrSoftmaxStats) + softmaxStatsOffset;
++  // The O pointer.
++  DtypeO* oPtr = reinterpret_cast<DtypeO*>(params.ptrO) + oOffset;
++  // The attentionSinks pointer.
++  float const* attentionSinksPtr = params.ptrAttentionSinks + headIdxO;
++
++  // Whether to store the softmax stats.
++  bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
++
++  // The softmaxScaleLog2.
++  float const softmaxScaleLog2 = params.mScaleSoftmaxLog2;
++
++  int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
++  static_assert(NumBytesPerPartialElt == 2,
++                "The data type of partialO should be either fp16 or bf16.");
++
++  // The threads in the warp-group should load different values from one partial output
++  // [numValidRows, headDim], and then iterate over partial outputs from different CTAs.
++  int32_t constexpr NumEltsPer16BVec{16 / NumBytesPerPartialElt};
++  static_assert((HeadDimPerCta * NumBytesPerPartialElt) % 16 == 0, "Not implemented");
++
++  // The number of unrolled iterations to issue multiple LDGs.
++  int32_t constexpr UnrollSize{4};
++
++  // The number of processed rows in one slice where each CTA will process one slice.
++  int32_t constexpr NumBytesPerHeadDim{HeadDimPerCta * NumBytesPerPartialElt};
++  int32_t constexpr NumBytePerSlice{NumThreadsPerCta * 16};
++  static_assert(NumBytePerSlice % NumBytesPerHeadDim == 0, "Not implemented");
++  int32_t constexpr NumRowsPerSlice{NumBytePerSlice / NumBytesPerHeadDim};
++  // The actual number of tensor slices for the reduction.
++  int32_t numSlices{(numValidRows + NumRowsPerSlice - 1) / NumRowsPerSlice};
++
++  // The number of slices that each CTA will process.
++  int32_t numSlicesPerCta{(numSlices + numCtasForReduction - 1) / numCtasForReduction};
++  // The start slice index for the current CTA.
++  int32_t startSliceIdx{ctaIdxForReduction * numSlicesPerCta};
++  // The end slice index for the current CTA.
++  int32_t endSliceIdx{min(startSliceIdx + numSlicesPerCta, numSlices)};
++
++  // The total number of rows in the partial buffers.
++  int32_t numRowsInPartialBuffers{TileSizePerCtaQ};
++
++  // Iterate over different slices.
++  // Split the reduction work across multiple CtasKv to reduce the latency.
++  for (int32_t sliceIdx = startSliceIdx; sliceIdx < endSliceIdx; ++sliceIdx) {
++    // The base offset that each thread points to.
++    int32_t const baseOffset{warpGrpThreadIdx * NumEltsPer16BVec};
++    // The index in the row dimension.
++    int32_t const rowIdx{sliceIdx * NumRowsPerSlice + (baseOffset / HeadDimPerCta)};
++    // Does this thread point to a valid row ?
++    bool const isValidRow{rowIdx < numValidRows};
++    int32_t validRowIdx{min(rowIdx, numValidRows - 1)};
++    int32_t loadRowIdx{validRowIdx};
++    // The index in the headDim dimension.
++    int32_t const headDimIdx{baseOffset % HeadDimPerCta};
++    // The memory load offset.
++    int64_t const destMemOffset{loadRowIdx * HeadDimPerCta + headDimIdx};
++    // The memory store offset.
++    int64_t gmemStoreOffset{validRowIdx * HeadDim + headDimIdx};
++    // The local headIdxO.
++    int32_t localHeadIdxO{validRowIdx};
++
++// Wait for the primary kernel to complete.
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    cudaGridDependencySynchronize();
++#endif
++
++    // Add offset to the pointers.
++    float2* localPartialStatsPtr = partialStatsPtr + loadRowIdx;
++    DtypePartialO* localPartialOPtr = partialOPtr + destMemOffset;
++
++    // Reduce max, sum and partialO vectors from different CtasKv.
++    float sumVal{0.f};
++    float oldMaxVal{-FLT_MAX}, maxVal{-FLT_MAX};
++    float outputVals[NumEltsPer16BVec] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++    for (int32_t ii = 0; ii < numCtasKv; ii += UnrollSize) {
++      // The partialStats array and partialO array.
++      float2 partialStatsArray[UnrollSize];
++      uint4 partialOArray[UnrollSize];
++#pragma unroll
++      for (int32_t jj = 0; jj < UnrollSize; ++jj) {
++        int32_t ctaIdxKv = min(ii + jj, numCtasKv - 1);
++        partialStatsArray[jj] = localPartialStatsPtr[ctaIdxKv * numRowsInPartialBuffers];
++        partialOArray[jj] = *reinterpret_cast<uint4 const*>(
++            localPartialOPtr + ctaIdxKv * numRowsInPartialBuffers * HeadDimPerCta);
++      }
++#pragma unroll
++      for (int32_t jj = 0; jj < UnrollSize; ++jj) {
++        // Whether the ctaIdxKv is valid.
++        bool const isValidCtaIdxKv = (ii + jj) < numCtasKv;
++        // The local max and sum values.
++        auto partialStats = partialStatsArray[jj];
++        float localMax = partialStats.x;
++        float localSum = partialStats.y;
++        // Update the max value.
++        maxVal = fmaxf(maxVal, localMax);
++        // Compute the correction scales.
++        float corrScale0 = isValidCtaIdxKv ? exp2f(softmaxScaleLog2 * (oldMaxVal - maxVal)) : 1.f;
++        float corrScale1 = isValidCtaIdxKv ? exp2f(softmaxScaleLog2 * (localMax - maxVal)) : 0.f;
++        // Update the old max value.
++        oldMaxVal = maxVal;
++        // The partialO value.
++        uint4 vec = partialOArray[jj];
++        // Reduce sum and finalO.
++        sumVal = sumVal * corrScale0 + localSum * corrScale1;
++        convertToFloatAndAccumulate<DtypePartialO>(outputVals, vec, corrScale0, corrScale1);
++      }
++    }
++
++    // Update the sums with the attention sink value.
++    if (attentionSinksPtr != nullptr) {
++      float attentionSinkVal =
++          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
++      // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
++      // has also included the 448.f quantization scale.
++      sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
++    }
++
++    // Stores the final softmax stats values to global memory if needed (Helix attention, which
++    // splits seqLenKv across GPUs).
++    if (storesSoftmaxStats && isValidRow && headDimIdx == 0) {
++      // The softmaxScale.
++      float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
++      // The sumScale to unscale the 448.f quantization scale from P.
++      float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
++      // The final max and sum values.
++      float2 stats{maxVal * softmaxScale, sumVal * sumScale};
++      // Store the final max and sum values to global memory.
++      reinterpret_cast<float2*>(softmaxStatsPtr)[validRowIdx] = stats;
++    }
++
++    // The final normalized scale.
++    // If the output data type is e4m3, make sure that sumVal is divided by the quantization scale
++    // (448.f), so 1.0f / (sumVal / 448.f) = 448.f / sumVal.
++    float normalizedScale{IsE4m3Bmm ? (448.f / sumVal) : (1.0f / sumVal)};
++    float2 normalizedScale2{normalizedScale, normalizedScale};
++
++    // Apply the normalized scale to the reduced O values.
++    for (int ii = 0; ii < NumEltsPer16BVec / 2; ++ii) {
++      float2& f2 = reinterpret_cast<float2*>(outputVals)[ii];
++      mul(f2, f2, normalizedScale2);
++    }
++
++    // Convert the float values to DtypeO, and Store it to global memory.
++    if (isValidRow) {
++      convertAndStoreToGmem<DtypeO>(reinterpret_cast<char*>(oPtr + gmemStoreOffset), outputVals);
++    }
++  }
++
++// Trigger the secondary kernel.
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  cudaTriggerProgrammaticLaunchCompletion();
++#endif
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++#define SELECT_FMHA_REDUCTION_KERNEL(HeadDimPerCta)                                               \
++  if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3) {                                                  \
++    if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3) {                                                \
++      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, __nv_fp8_e4m3, half>;           \
++    } else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16) {                                         \
++      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, half, half>;                    \
++    } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                         \
++      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, __nv_bfloat16, __nv_bfloat16>;  \
++    } else {                                                                                      \
++      TORCH_CHECK(false, "Not implemented");                                                      \
++    }                                                                                             \
++  } else {                                                                                        \
++    TORCH_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");               \
++    if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                                \
++      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, half, half>;                   \
++    } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                         \
++      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, __nv_bfloat16, __nv_bfloat16>; \
++    } else {                                                                                      \
++      TORCH_CHECK(false, "Not implemented");                                                      \
++    }                                                                                             \
++  }
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
++                      int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream) {
++  // Skip the kernel if not using the separate reduction kernel.
++  if (!isGmemReductionWithSeparateKernel(
++          static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))) {
++    return;
++  }
++
++  // This should only be enabled when the keepsMmaAbForGeneration MLA kernel (either 1-CTA or 2-CTA)
++  // is used.
++  TORCH_CHECK(
++      kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512 &&
++          isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
++      "Not implemented");
++  // The tileSizeQ and tileSizeKv should be 64 and 128 for those kernels.
++  TORCH_CHECK(kernelMeta.mTileSizeQ == 64 && kernelMeta.mTileSizeKv == 128, "Not implemented");
++
++  // The headDimPerCtaV.
++  int32_t const headDimPerCtaV =
++      kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
++  TORCH_CHECK(headDimPerCtaV == 128 || headDimPerCtaV == 256 || headDimPerCtaV == 512,
++              "Not implemented");
++
++  // The number of slices for the reduction work.
++  int32_t const numSlices = (headDimPerCtaV * /* bytesPerPartialElt */ 2 * kernelMeta.mTileSizeQ) /
++                            (NumThreadsPerCta * 16);
++  // The number of Ctas for all heads.
++  int32_t const numCtasForAllHeads{params.mNumHeadsQ / kernelMeta.mTileSizeQ};
++  // The number of Ctas for headDim.
++  int32_t const numHeadDimCtasV{kernelMeta.mHeadDimV / headDimPerCtaV};
++
++  // The 512 threads will split the reduction work of TileSizePerCtaQ * HeadDimPerCta.
++  dim3 blockDim(NumThreadsPerCta);
++  dim3 gridDim;
++  // Each CTA processes one tokenQ.
++  gridDim.x = params.mMaxNumCtasQ;
++  // The head dimension.
++  gridDim.y = numCtasForAllHeads * numHeadDimCtasV;
++  // The batch dimension.
++  gridDim.z = params.mBatchSize;
++
++  // The maximum number of Ctas for the reduction work.
++  // This avoids having too many waves of CTAs which can have obvious launching overheads.
++  int32_t const maxNumCtasForReduction{(multiProcessorCount * 2) /
++                                       static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z)};
++  // The number of Ctas for the reduction work.
++  int32_t const numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
++  // Launch more CTAs to split the reduction work if needed.
++  gridDim.x *= numCtasForReduction;
++
++  // The PDL attribute.
++  cudaLaunchAttribute attribute[1];
++  attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++  attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
++  cudaLaunchConfig_t config;
++  config.gridDim = gridDim;
++  config.blockDim = blockDim;
++  config.stream = stream;
++  config.dynamicSmemBytes = 0;
++  config.attrs = attribute;
++  config.numAttrs = 1;
++
++  // Select the kernel function pointer.
++  void (*kernel)(KernelParams const, int32_t, int32_t, int32_t) = nullptr;
++  if (headDimPerCtaV == 128) {
++    SELECT_FMHA_REDUCTION_KERNEL(128);
++  } else if (headDimPerCtaV == 256) {
++    SELECT_FMHA_REDUCTION_KERNEL(256);
++  } else if (headDimPerCtaV == 512) {
++    SELECT_FMHA_REDUCTION_KERNEL(512);
++  }
++
++  // Launch the kernel.
++  cudaLaunchKernelEx(&config, kernel, params, numCtasForReduction, numCtasForAllHeads,
++                     numHeadDimCtasV);
++  cudaError_t err = cudaGetLastError();
++  TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++}  // namespace kernels
++}  // namespace tensorrt_llm
+diff --git a/flashinfer/artifacts.py b/flashinfer/artifacts.py
+index 0f0d18d680..29e47598c7 100644
+--- a/flashinfer/artifacts.py
++++ b/flashinfer/artifacts.py
+@@ -109,7 +109,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
+ 
+ 
+ class ArtifactPath:
+-    TRTLLM_GEN_FMHA: str = "037e528e719ec3456a7d7d654f26b805e44c63b1/fmha/trtllm-gen/"
++    TRTLLM_GEN_FMHA: str = "538f8e38ace07f701f61e26b138b2b8c70ce9e8e/fmha/trtllm-gen/"
+     TRTLLM_GEN_BMM: str = (
+         "e6f22dcc3fdeb29ff87af2f4a2cb3d30b8d273e0/batched_gemm-45beda1-ee6a802/"
+     )
+@@ -122,7 +122,7 @@ class ArtifactPath:
+ 
+ class MetaInfoHash:
+     TRTLLM_GEN_FMHA: str = (
+-        "0ff77215b86997665cf75973e13cd2932f551d46b4e008f851d32d47e1d9560f"
++        "71f06a8fc03d28cc94ee6fc180fb7e37256a9e1c30ab2a6c0bf20a2d97af3eff"
+     )
+     TRTLLM_GEN_BMM: str = (
+         "c98b4ce69a39fd41556d67033c30ea814ef76b0a2fe16e798e55baf0104acc34"
+diff --git a/flashinfer/jit/attention/pytorch.py b/flashinfer/jit/attention/pytorch.py
+index 7a6f805e7d..bb68fc78c1 100644
+--- a/flashinfer/jit/attention/pytorch.py
++++ b/flashinfer/jit/attention/pytorch.py
+@@ -1584,6 +1584,7 @@ def gen_trtllm_gen_fmha_module():
+         "fmha_gen",
+         [
+             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
++            jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+         ],
+         extra_ldflags=["-lcuda"],
+         # link "include" sub-directory in cache
+diff --git a/include/flashinfer/trtllm/common/cudaUtils.h b/include/flashinfer/trtllm/common/cudaUtils.h
+index 2fa1a4d0c4..3fd3ad0f50 100644
+--- a/include/flashinfer/trtllm/common/cudaUtils.h
++++ b/include/flashinfer/trtllm/common/cudaUtils.h
+@@ -22,6 +22,7 @@
+ // #include "tensorrt_llm/common/logger.h"
+ // #include "tensorrt_llm/common/tllmException.h"
+ 
++#include <c10/util/Exception.h>
+ #include <cublasLt.h>
+ #include <cublas_v2.h>
+ #include <cuda.h>
+@@ -31,12 +32,14 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <fstream>
+ #include <iomanip>
+ #include <memory>
+ #include <optional>
+ #include <sstream>
+ #include <string>
++
+ // #ifndef _WIN32 // Linux
+ // #include <sys/sysinfo.h>
+ // #endif         // not WIN32
+@@ -94,7 +97,7 @@ namespace tensorrt_llm::common {
+ inline std::optional<bool> isCudaLaunchBlocking() {
+   thread_local bool firstCall = true;
+   thread_local std::optional<bool> result = std::nullopt;
+-  if (!firstCall) {
++  if (firstCall) {
+     char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
+     if (env != nullptr && std::string(env) == "1") {
+       result = true;
+diff --git a/include/flashinfer/trtllm/fmha/fmhaKernels.cuh b/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
+index 5c71e88363..d100a8a249 100644
+--- a/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
++++ b/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
+@@ -28,6 +28,7 @@
+ #include "../common.h"
+ #include "cuda_runtime_api.h"
+ #include "flashInferMetaInfo.h"
++#include "fmhaReduction.h"
+ #include "fmhaRunnerParams.h"
+ #include "kernelParams.h"
+ #include "lse.cuh"
+@@ -252,6 +253,10 @@ class TllmGenFmhaKernel {
+       }
+       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+ 
++      // Run the separate reduction kernel if needed.
++      runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.enable_pdl,
++                       params.stream);
++
+       if (params.lsePtr != nullptr) {
+         flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
+                                      params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
+@@ -462,6 +467,10 @@ class TllmGenFmhaKernel {
+       } else {
+         // Otherwise, we use the high-throughput kernel.
+         kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
++        // Always use the separate reduction kernel.
++        if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
++          selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
++        }
+         // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
+         if (params.mNumHeadsQPerKv == 128) {
+           selectKernelParams.mUses2CtaMma = true;
+diff --git a/include/flashinfer/trtllm/fmha/fmhaReduction.h b/include/flashinfer/trtllm/fmha/fmhaReduction.h
+new file mode 100644
+index 0000000000..5ff7dfb755
+--- /dev/null
++++ b/include/flashinfer/trtllm/fmha/fmhaReduction.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "flashInferMetaInfo.h"
++#include "fmhaRunnerParams.h"
++#include "kernelParams.h"
++
++namespace tensorrt_llm {
++namespace kernels {
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
++                      int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream);
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++}  // namespace kernels
++}  // namespace tensorrt_llm
+diff --git a/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h b/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
+index ac2be083c9..b05ce51ae3 100755
+--- a/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
++++ b/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
+@@ -134,10 +134,14 @@ enum class TileScheduler {
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ enum class MultiCtasKvMode {
+-  // No multiCtasKvMode.
++  // Disable the multiCtasKvMode.
+   Disabled = 0,
+   // Do the reduction through the global memory and atomic counters.
+   GmemReduction,
++  // Same as GmemReduction, but use a separate kernel for the reduction.
++  // It is only supported/needed for 2-CTA or 1-CTA keepsMmaAbForGeneration MLA kernels with large
++  // reduction tiles.
++  GmemReductionWithSeparateKernel,
+   // Do the reduction through the CGA remote shared memory.
+   CgaSmemReduction
+ };
+@@ -156,6 +160,7 @@ inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode) {
+ 
+ MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
+ MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
++MULTI_CTAS_KV_MODE_FUNCTION(GmemReductionWithSeparateKernel)
+ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
+ 
+ #undef MULTI_CTAS_KV_MODE_FUNCTION
+diff --git a/include/flashinfer/trtllm/fmha/kernelUtils.h b/include/flashinfer/trtllm/fmha/kernelUtils.h
+new file mode 100644
+index 0000000000..64505142de
+--- /dev/null
++++ b/include/flashinfer/trtllm/fmha/kernelUtils.h
+@@ -0,0 +1,160 @@
++/*
++ * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp8.h>
++
++namespace tensorrt_llm {
++namespace kernels {
++
++///////////////////////////////////////////////////////////////////////////////////////////////////
++
++// Helper functions to convert float2 to half, bfloat16, and e4m3.
++
++inline __device__ uint32_t convert_float2_to_half(float a, float b) {
++  uint32_t output;
++  reinterpret_cast<__half2&>(output) = __float22half2_rn(make_float2(a, b));
++  return output;
++}
++
++inline __device__ uint32_t convert_float2_to_bfloat16(float a, float b) {
++  uint32_t output;
++  reinterpret_cast<__nv_bfloat162&>(output) = __float22bfloat162_rn(make_float2(a, b));
++  return output;
++}
++
++inline __device__ uint32_t convert_float4_to_e4m3(float a, float b, float c, float d) {
++  uint32_t output;
++  reinterpret_cast<__nv_fp8x4_e4m3&>(output) = __nv_fp8x4_e4m3(make_float4(a, b, c, d));
++  return output;
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////
++
++// Helper functions for float2 mul and fma.
++
++inline __device__ void mul(float2& c, float2 const& a, float2 const& b) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
++  asm volatile("mul.f32x2 %0, %1, %2;\n"
++               : "=l"(reinterpret_cast<uint64_t&>(c))
++               : "l"(reinterpret_cast<uint64_t const&>(a)),
++                 "l"(reinterpret_cast<uint64_t const&>(b)));
++#else
++  c.x = a.x * b.x;
++  c.y = a.y * b.y;
++#endif
++}
++
++inline __device__ void fma(float2& d, float2 const& a, float2 const& b, float2 const& c) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
++  asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
++               : "=l"(reinterpret_cast<uint64_t&>(d))
++               : "l"(reinterpret_cast<uint64_t const&>(a)),
++                 "l"(reinterpret_cast<uint64_t const&>(b)),
++                 "l"(reinterpret_cast<uint64_t const&>(c)));
++#else
++  d.x = a.x * b.x + c.x;
++  d.y = a.y * b.y + c.y;
++#endif
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++template <typename Dtype, int32_t NumElts>
++inline __device__ void convertAndStoreToGmem(char* gmemPtr, float (&input)[NumElts]) {
++  static_assert(sizeof(Dtype) == 0, "Not implemented.");
++}
++
++template <typename Dtype, int32_t NumElts>
++inline __device__ void convertAndStoreToGmem(char* gmemPtr, char* oSfPtr, float (&input)[NumElts],
++                                             float sfScale, bool isValidRow) {
++  static_assert(sizeof(Dtype) == 0, "Not implemented.");
++}
++
++template <>
++inline __device__ void convertAndStoreToGmem<__half, 8>(char* gmemPtr, float (&input)[8]) {
++  uint4 output;
++  output.x = convert_float2_to_half(input[0], input[1]);
++  output.y = convert_float2_to_half(input[2], input[3]);
++  output.z = convert_float2_to_half(input[4], input[5]);
++  output.w = convert_float2_to_half(input[6], input[7]);
++  *reinterpret_cast<uint4*>(gmemPtr) = output;
++}
++
++template <>
++inline __device__ void convertAndStoreToGmem<__nv_bfloat16, 8>(char* gmemPtr, float (&input)[8]) {
++  uint4 output;
++  output.x = convert_float2_to_bfloat16(input[0], input[1]);
++  output.y = convert_float2_to_bfloat16(input[2], input[3]);
++  output.z = convert_float2_to_bfloat16(input[4], input[5]);
++  output.w = convert_float2_to_bfloat16(input[6], input[7]);
++  *reinterpret_cast<uint4*>(gmemPtr) = output;
++}
++
++template <>
++inline __device__ void convertAndStoreToGmem<__nv_fp8_e4m3, 8>(char* gmemPtr, float (&input)[8]) {
++  uint2 output;
++  output.x = convert_float4_to_e4m3(input[0], input[1], input[2], input[3]);
++  output.y = convert_float4_to_e4m3(input[4], input[5], input[6], input[7]);
++  *reinterpret_cast<uint2*>(gmemPtr) = output;
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++template <typename Dtype, int32_t NumElts>
++inline __device__ void convertToFloatAndAccumulate(float (&output)[NumElts], uint4 input,
++                                                   float scale0, float scale1) {
++  static_assert(sizeof(Dtype) == 0, "Not implemented.");
++}
++
++template <>
++inline __device__ void convertToFloatAndAccumulate<__half, 8>(float (&output)[8], uint4 input,
++                                                              float scale0, float scale1) {
++  float2 scales0 = make_float2(scale0, scale0);
++  float2 scales1 = make_float2(scale1, scale1);
++#pragma unroll
++  for (int32_t ii = 0; ii < 4; ++ii) {
++    float2 a = __half22float2(reinterpret_cast<__half2*>(&input)[ii]);
++    float2& c = reinterpret_cast<float2(&)[4]>(output)[ii];
++    // FFMA2: output = input * scale1 + output * scale0.
++    mul(c, c, scales0);
++    fma(c, a, scales1, c);
++  }
++}
++
++template <>
++inline __device__ void convertToFloatAndAccumulate<__nv_bfloat16, 8>(float (&output)[8],
++                                                                     uint4 input, float scale0,
++                                                                     float scale1) {
++  float2 scales0 = make_float2(scale0, scale0);
++  float2 scales1 = make_float2(scale1, scale1);
++#pragma unroll
++  for (int32_t ii = 0; ii < 4; ++ii) {
++    float2 a = __bfloat1622float2(reinterpret_cast<__nv_bfloat162*>(&input)[ii]);
++    float2& c = reinterpret_cast<float2(&)[4]>(output)[ii];
++    // FFMA2: output = input * scale1 + output * scale0.
++    mul(c, c, scales0);
++    fma(c, a, scales1, c);
++  }
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++}  // namespace kernels
++}  // namespace tensorrt_llm
+diff --git a/tests/test_attention_sink_blackwell.py b/tests/test_attention_sink_blackwell.py
+index 8cb637ba44..3359c47632 100644
+--- a/tests/test_attention_sink_blackwell.py
++++ b/tests/test_attention_sink_blackwell.py
+@@ -18,6 +18,7 @@
+ import pytest
+ import torch
+ from sink_attention_reference import sink_attention_unified
++from conftest import assert_close_with_mismatch_tolerance
+ 
+ import flashinfer
+ from flashinfer.utils import get_compute_capability
+@@ -121,7 +122,13 @@ def test_blackwell_trtllm_gen_decode_attention_sink(
+     else:
+         raise ValueError(f"Unsupported dtype: {dtype}")
+ 
+-    torch.testing.assert_close(o_ref, output, atol=atol, rtol=rtol)
++    assert_close_with_mismatch_tolerance(
++        o_ref,
++        output,
++        atol=atol,
++        rtol=rtol,
++        max_mismatched_elements=int(output.numel() * 0.01),
++    )
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

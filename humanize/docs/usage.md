@@ -74,7 +74,7 @@ The quiz is advisory, not a gate. You always have the option to proceed. But tha
 
 OPTIONS:
   --plan-file <path>     Explicit plan file path (alternative to positional arg)
-  --max <N>              Maximum iterations before auto-stop (default: 42)
+  --max <N>              Maximum iterations before auto-stop (default: 84)
   --codex-model <MODEL:EFFORT>
                          Codex model and reasoning effort (default from config, fallback gpt-5.5:high)
   --codex-timeout <SECONDS>

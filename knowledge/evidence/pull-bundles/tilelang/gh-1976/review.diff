@@ -1,0 +1,1811 @@
+diff --git a/src/op/finalize_reducer.cc b/src/op/finalize_reducer.cc
+index c6e01e923f..c53bcb1307 100644
+--- a/src/op/finalize_reducer.cc
++++ b/src/op/finalize_reducer.cc
+@@ -41,6 +41,12 @@ FinalizeReducerOp::FinalizeReducerOp(Array<PrimExpr> args,
+   node->reducer = reducer_access.region->buffer;
+   node->SetAccessRegions({reducer_access});
+   node->op = (ReducerOpType)*as_const_int(args[1]);
++  // Read explicit batch size from annotations (0 means auto-detect).
++  if (annotations.count("batch")) {
++    node->batch = (int)*as_const_int(Downcast<PrimExpr>(annotations["batch"]));
++    CHECK_GE(node->batch, 1)
++        << "finalize_reducer: batch must be >= 1, got " << node->batch;
++  }
+   data_ = std::move(node);
+ }
+ 
+@@ -98,8 +104,64 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
+ 
+   // adopted from ReduceOp
+   int reducing_threads = extent;
+-  std::stringstream ss;
+   auto thread_offset = T.thread_bounds->min;
++
++  // Validate batch against the layout's total output element count.
++  int64_t layout_batch_size = 1;
++  for (int i = 0; i < layout->OutputDim(); ++i) {
++    const int64_t *p = as_const_int(layout->OutputShape()[i]);
++    if (p == nullptr) {
++      layout_batch_size = -1;
++      break;
++    }
++    layout_batch_size *= *p;
++  }
++
++  int64_t effective_batch = static_cast<int64_t>(this->batch);
++
++  if (effective_batch > 1 && layout_batch_size > 0) {
++    CHECK_LE(effective_batch, layout_batch_size)
++        << "finalize_reducer: batch (" << effective_batch
++        << ") exceeds total output elements (" << layout_batch_size << ")";
++    CHECK_EQ(layout_batch_size % effective_batch, 0)
++        << "finalize_reducer: batch (" << effective_batch
++        << ") must evenly divide total output elements (" << layout_batch_size
++        << ")";
++  }
++
++  // ROCm wavefronts are 64-wide; only batch when reducing across warps.
++  const int warp_size = TargetIsRocm(T.target) ? 64 : 32;
++  bool use_batch = effective_batch > 1 && reducing_threads > warp_size;
++
++  if (use_batch) {
++    // Batched AllReduce: single butterfly pass for all output elements.
++    int workspace_stride =
++        static_cast<int>(*as_const_int(T.thread_bounds->extent));
++    std::stringstream ss;
++    if (TargetHasSMVersionGE(T.target, 90)) {
++      auto all_threads = T.thread_bounds->extent;
++      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
++         << ", " << thread_offset << ", tl::NamedBarrier<" << all_threads
++         << ">, " << effective_batch << ", " << workspace_stride
++         << ">::run_batch";
++    } else if (TargetIsRocm(T.target)) {
++      // HIP AllReduce has no Barrier type parameter.
++      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
++         << ", " << thread_offset << ", " << effective_batch << ", "
++         << workspace_stride << ">::run_batch";
++    } else {
++      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
++         << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
++         << effective_batch << ", " << workspace_stride << ">::run_batch";
++    }
++    int ws_size = workspace_stride * static_cast<int>(effective_batch);
++    PrimExpr workspace = T.AddWorkspace(ws_size, buffer->dtype);
++    Array<PrimExpr> args = {StringImm(ss.str()), buffer->data, workspace};
++    return Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
++  }
++
++  // Scalar AllReduce path (original).
++  std::stringstream ss;
+   if (TargetHasSMVersionGE(T.target, 90)) {
+     auto all_threads = T.thread_bounds->extent;
+     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
+diff --git a/src/op/finalize_reducer.h b/src/op/finalize_reducer.h
+index a3903ed143..ee4ddb20d1 100644
+--- a/src/op/finalize_reducer.h
++++ b/src/op/finalize_reducer.h
+@@ -26,6 +26,9 @@ class FinalizeReducerOpNode : public TileOperatorNode {
+ public:
+   tir::Buffer reducer;
+   ReducerOpType op;
++  // Batch size for batched AllReduce (1 = scalar path, same as T.reduce
++  // default).
++  int batch{1};
+ 
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.FinalizeReducerOp",
+                                     FinalizeReducerOpNode, TileOperatorNode);
+@@ -34,7 +37,8 @@ class FinalizeReducerOpNode : public TileOperatorNode {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<FinalizeReducerOpNode>()
+         .def_ro("reducer", &FinalizeReducerOpNode::reducer)
+-        .def_ro("op", &FinalizeReducerOpNode::op);
++        .def_ro("op", &FinalizeReducerOpNode::op)
++        .def_ro("batch", &FinalizeReducerOpNode::batch);
+   }
+ 
+   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+diff --git a/src/op/reduce.cc b/src/op/reduce.cc
+index aff8ba1986..c0ed1ecc0a 100644
+--- a/src/op/reduce.cc
++++ b/src/op/reduce.cc
+@@ -45,6 +45,14 @@ ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+   node->dim = args[3].as<IntImm>().value()->value;
+   node->type = ReduceType(reduce_type);
+   node->clear = args[4].as<Bool>().value();
++  // Optional "batch" annotation: number of output elements per batched
++  // AllReduce call (default 1 = scalar).
++  if (auto opt = annotations.Get("batch")) {
++    if (auto i = opt.value().as<IntImm>()) {
++      node->batch = static_cast<int>(i.value()->value);
++      CHECK_GE(node->batch, 1) << "ReduceOp: batch must be >= 1";
++    }
++  }
+   // Optional annotation: "nan_propagate" — for fp16/bf16 max/min/absmax,
+   // when true, lower to CUDA __hmax_nan/__hmin_nan so NaNs propagate.
+   if (auto opt = annotations.Get("nan_propagate")) {
+@@ -401,21 +409,85 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+         src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }), {});
+     auto iter_sum =
+         arith::NormalizeToIterSum(src_thread, ToVMap(src_vars), analyzer);
+-    for (const auto &iter_split : iter_sum->args) {
+-      auto mark = iter_split->source->source.as<Var>();
+-      if (!mark)
+-        continue;
+-      if (mark.value().same_as(src_vars[this->dim]->var)) {
+-        // `scale` is the stride of participating threads in the thread index
+-        // space.  When the thread-to-data mapping for the reduce dimension is
+-        // normalized as  threadIdx = source * scale + ...,
+-        //   * scale == 1  means threads are contiguous (0, 1, 2, ...),
+-        //   * scale  > 1  means threads are interleaved (0, scale, 2*scale,
+-        //     ...).
+-        // Both cases use the recursive XOR-butterfly reduce.
+-        // `extent` is the number of distinct thread positions along the reduce
+-        // dimension, so reducing_threads = extent * scale covers the full
+-        // thread index range that participates in the reduction.
++
++    // batch is set by the user via the "batch" annotation (default 1 = scalar).
++    // When batch > 1 the compiler phases the reduction:
++    //   1. init + local reduce loop
++    //   2. ceil(N/batch) batched AllReduce calls, each sharing one barrier pair
++    //   3. copy-back loop (only when need_duplicate)
++    const int batch = this->batch;
++
++    // Validate batch against the actual per-thread element count N.
++    if (batch > 1) {
++      int64_t N_total = 1;
++      for (const auto &s : clear_buffer->shape) {
++        const int64_t *p = as_const_int(s);
++        ICHECK(p != nullptr) << "ReduceOp: batch > 1 requires compile-time "
++                                "constant output shape";
++        N_total *= *p;
++      }
++      CHECK_LE(batch, N_total)
++          << "ReduceOp: batch=" << batch
++          << " exceeds per-thread output element count N=" << N_total;
++      CHECK_EQ(N_total % batch, 0)
++          << "ReduceOp: batch=" << batch << " must evenly divide N=" << N_total;
++    }
++
++    bool use_batch = batch > 1;
++
++    // Helper: wrap a body in the dst_vars loops with partitioning & unrolling.
++    auto make_dst_loop = [&](Stmt body, const Array<IterVar> &vars) -> Stmt {
++      for (int i = static_cast<int>(vars.size()) - 1; i >= 0; --i) {
++        body = For(vars[i]->var, 0, vars[i]->dom->extent, ForKind::kParallel,
++                   body);
++      }
++      body = PartitionLoop(Downcast<For>(body), T.thread_var, analyzer,
++                           red_layout);
++      body = PragmaUnrollLoop(Downcast<For>(body));
++      return body;
++    };
++
++    // Helper: create fresh dst loop variables (needed so that pre/post loops
++    // do not reuse the same Var objects).
++    auto make_fresh_dst_vars = [&](const std::string &suffix)
++        -> std::tuple<Array<IterVar>, Array<PrimExpr>, Array<PrimExpr>> {
++      Array<IterVar> vars;
++      for (size_t i = 0; i < dst_dim; ++i) {
++        Var v(std::string{char('i' + i)} + suffix);
++        vars.push_back(IterVar(Range(0, dst_layout->InputShape()[i]), v,
++                               IterVarType::kDataPar));
++      }
++      auto d_idx = dst_layout->Forward(
++          vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
++      auto r_idx = red_layout->Forward(
++          vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
++      return {vars, d_idx, r_idx};
++    };
++
++    if (use_batch) {
++      // ================================================================
++      // Batched AllReduce path — three phases:
++      //   1. Loop: init + thread-local reduce
++      //   2. Flat: batched AllReduce (single butterfly pass for all values)
++      //   3. Loop: copy-back (only when need_duplicate)
++      // ================================================================
++
++      // Phase 1: pre-reduce loop
++      Stmt pre_body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
++      pre_body = make_dst_loop(pre_body, dst_vars);
++
++      Array<Stmt> phases;
++      phases.push_back(pre_body);
++
++      // Phase 2: batched AllReduce call(s).
++      // workspace_stride = reducing_threads (SoA layout in smem:
++      //   slot for batch item b, thread t = red_buf[b * reducing_threads + t])
++      for (const auto &iter_split : iter_sum->args) {
++        auto mark = iter_split->source->source.as<Var>();
++        if (!mark)
++          continue;
++        if (!mark.value().same_as(src_vars[this->dim]->var))
++          continue;
+         auto scale = as_const_int(iter_split->scale);
+         auto extent = as_const_int(iter_split->extent);
+         ICHECK(scale != nullptr && extent != nullptr);
+@@ -423,113 +495,235 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+           continue;
+ 
+         int reducing_threads = (*extent) * (*scale);
++        auto thread_offset = T.thread_bounds->min;
+         std::stringstream ss;
+ 
+-        auto thread_offset = T.thread_bounds->min;
++        // Use run_batch (not run) to avoid overload-resolution ambiguity when
++        // a pointer is passed as first argument.
+         if (TargetHasSMVersionGE(T.target, 90)) {
+           auto all_threads = T.thread_bounds->extent;
+           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+              << reducing_threads << ", " << (*scale) << ", " << thread_offset
+-             << ", tl::NamedBarrier<" << all_threads << ">>::run";
++             << ", tl::NamedBarrier<" << all_threads << ">, " << batch << ", "
++             << reducing_threads << ">::run_batch";
++        } else if (TargetIsRocm(T.target)) {
++          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
++             << reducing_threads << ", " << (*scale) << ", " << thread_offset
++             << ", " << batch << ", " << reducing_threads << ">::run_batch";
+         } else {
+           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+              << reducing_threads << ", " << (*scale) << ", " << thread_offset
+-             << ">::run";
++             << ", tl::SyncThreadsBarrier, " << batch << ", "
++             << reducing_threads << ">::run_batch";
+         }
+-        Array<PrimExpr> thread_reduce_args = {
+-            StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
+-        // The butterfly reduce path needs one shared-memory slot per
+-        // thread in the block.
+-        if (reducing_threads > 32) {
+-          int workspace_size =
+-              static_cast<int>(*as_const_int(T.thread_bounds->extent));
+-          PrimExpr workspace =
+-              T.AddWorkspace(workspace_size, clear_buffer->dtype);
+-          thread_reduce_args.push_back(workspace);
++
++        // Workspace is only needed for cross-warp reduce (> 32 threads).
++        // Allocate once; all chunks share the same workspace buffer.
++        PrimExpr workspace;
++        bool need_workspace = reducing_threads > 32;
++        if (need_workspace) {
++          int ws_size = reducing_threads * batch;
++          workspace = T.AddWorkspace(ws_size, clear_buffer->dtype);
+         }
+-        auto call = Call(clear_buffer->dtype, builtin::call_extern(),
+-                         thread_reduce_args);
+-        stmts.push_back(BufferStore(clear_buffer, call, red_indices));
+-      }
+-    }
+ 
+-    // Layout status in the loop:
+-    //     clear_buffer: red_layout
+-    //     dst_buffer:   dst_layout
+-    //     loop_layout:  red_layout
+-    // At each step of the loop, we do reduction on
+-    // `clear_buffer[red_layout(loop_idx)]`
+-    //   and then transfer it to `dst_buffer[dst_layout(loop_idx)]`
+-    // However, since the red_layout is larger than dst_layout, not all write
+-    // operations are valid We need to add predicate to guard the write
+-    // operations
+-    PrimExpr predicate = Bool(true);
+-    {
+-      // dst_indices is the same as loop_indices
+-      auto dst_th_indices = dst_indices;
+-      dst_th_indices.push_back(T.thread_var);
+-      // 1. compute loop_idx based on thread: [dst_indices, T.thread_var] =>
+-      // [loop_indices]
+-      auto inv = dst_layout->Inverse()->Forward(dst_th_indices);
+-      inv.pop_back(); // remove replicate var
+-      // 2. ensure computed loop_idx maps back to the same [loop_indices]
+-      for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++) {
+-        predicate = predicate && (inv[i] == dst_vars[i]->var);
++        // Compute N_total and num_chunks for this buffer.
++        int64_t N_total = 1;
++        for (const auto &s : clear_buffer->shape)
++          N_total *= *as_const_int(s);
++        int num_chunks = static_cast<int>(N_total / batch);
++
++        // Compute strides for reverse-linearisation of clear_buffer->shape.
++        int buf_ndim = static_cast<int>(clear_buffer->shape.size());
++        std::vector<int64_t> buf_shape_vals;
++        for (const auto &s : clear_buffer->shape)
++          buf_shape_vals.push_back(*as_const_int(s));
++        std::vector<int64_t> buf_strides(buf_ndim, 1);
++        for (int d = buf_ndim - 2; d >= 0; d--)
++          buf_strides[d] = buf_strides[d + 1] * buf_shape_vals[d + 1];
++
++        for (int chunk = 0; chunk < num_chunks; chunk++) {
++          int64_t flat_offset = (int64_t)chunk * batch;
++          // Map flat_offset to multi-dim indices in clear_buffer.
++          Array<PrimExpr> chunk_indices;
++          for (int d = 0; d < buf_ndim; d++) {
++            int64_t idx = (flat_offset / buf_strides[d]) % buf_shape_vals[d];
++            chunk_indices.push_back(Integer(idx));
++          }
++          // Pointer to the start of this chunk's elements in clear_buffer.
++          PrimExpr ptr = Call(DataType::Handle(), builtin::address_of(),
++                              {BufferLoad(clear_buffer, chunk_indices)});
++
++          Array<PrimExpr> args = {StringImm(ss.str()), ptr};
++          if (need_workspace)
++            args.push_back(workspace);
++          phases.push_back(
++              Evaluate(Call(DataType::Handle(), builtin::call_extern(), args)));
++        }
+       }
+-      // 3. simplify predicate
+-      predicate = analyzer->Simplify(predicate);
+-    }
+-    if (need_duplicate) {
+-      PrimExpr update;
+-      if (need_update) {
+-        auto src_val = BufferLoad(clear_buffer, red_indices);
+-        auto dst_val = BufferLoad(dst_buffer, dst_indices);
+-        if (this->type->isSum() || this->type->isAbsSum()) {
+-          update = dst_val + src_val;
+-        } else if (this->type->isBitAnd()) {
+-          update = this->clear ? src_val : bitwise_and(dst_val, src_val);
+-        } else if (this->type->isBitOr()) {
+-          update = bitwise_or(dst_val, src_val);
+-        } else if (this->type->isBitXor()) {
+-          update = bitwise_xor(dst_val, src_val);
+-        } else if (this->type->isMax() || this->type->isAbsMax()) {
+-          update = Max(dst_val, src_val);
+-        } else if (this->type->isMin()) {
+-          update = Min(dst_val, src_val);
++
++      // Phase 3: copy-back (only when a temp buffer was used)
++      if (need_duplicate) {
++        auto [post_vars, post_dst_idx, post_red_idx] =
++            make_fresh_dst_vars("_p");
++
++        // Recompute predicate with post_vars.
++        PrimExpr predicate = Bool(true);
++        {
++          auto dst_th = post_dst_idx;
++          dst_th.push_back(T.thread_var);
++          auto inv = dst_layout->Inverse()->Forward(dst_th);
++          inv.pop_back();
++          for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++)
++            predicate = predicate && (inv[i] == post_vars[i]->var);
++          predicate = analyzer->Simplify(predicate);
++        }
++
++        PrimExpr update;
++        if (need_update) {
++          auto src_val = BufferLoad(clear_buffer, post_red_idx);
++          auto dst_val = BufferLoad(dst_buffer, post_dst_idx);
++          if (this->type->isSum() || this->type->isAbsSum()) {
++            update = dst_val + src_val;
++          } else if (this->type->isBitAnd()) {
++            update = this->clear ? src_val : bitwise_and(dst_val, src_val);
++          } else if (this->type->isBitOr()) {
++            update = bitwise_or(dst_val, src_val);
++          } else if (this->type->isBitXor()) {
++            update = bitwise_xor(dst_val, src_val);
++          } else if (this->type->isMax() || this->type->isAbsMax()) {
++            update = Max(dst_val, src_val);
++          } else if (this->type->isMin()) {
++            update = Min(dst_val, src_val);
++          } else {
++            LOG(FATAL) << "Unsupported reduce type: " << this->type->type;
++          }
+         } else {
+-          LOG(FATAL) << "Unsupported reduce type: " << this->type->type;
++          update = BufferLoad(clear_buffer, post_red_idx);
+         }
+-      } else {
+-        update = BufferLoad(clear_buffer, red_indices);
+-      }
+-      auto store = BufferStore(dst_buffer, update, dst_indices);
+-      if (analyzer->CanProve(predicate)) {
+-        stmts.push_back(store);
+-      } else {
+-        stmts.push_back(IfThenElse(predicate, store));
++        auto store = BufferStore(dst_buffer, update, post_dst_idx);
++        Stmt post_body;
++        if (analyzer->CanProve(predicate)) {
++          post_body = store;
++        } else {
++          post_body = IfThenElse(predicate, store);
++        }
++        phases.push_back(make_dst_loop(post_body, post_vars));
+       }
+-    }
+ 
+-    auto body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
+-    for (int i = static_cast<int>(dst_layout->InputDim()) - 1; i >= 0; --i) {
+-      body = For(dst_vars[i]->var, 0, dst_vars[i]->dom->extent,
+-                 ForKind::kParallel, body);
+-    }
++      Stmt body = phases.size() > 1 ? SeqStmt(phases) : phases[0];
++      if (need_duplicate) {
++        body = Allocate(clear_buffer->data, clear_buffer->dtype,
++                        clear_buffer->shape, const_true(), body);
++      }
++      return body;
+ 
+-    if (dst_layout->InputDim() > 0) {
+-      body = PartitionLoop(Downcast<For>(body), T.thread_var, analyzer,
+-                           red_layout);
+-      body = PragmaUnrollLoop(Downcast<For>(body));
+     } else {
+-      auto guard = (T.thread_var == T.thread_bounds->min);
+-      body = IfThenElse(guard, body);
+-    }
++      // ================================================================
++      // Original scalar AllReduce path (unchanged).
++      // ================================================================
++      for (const auto &iter_split : iter_sum->args) {
++        auto mark = iter_split->source->source.as<Var>();
++        if (!mark)
++          continue;
++        if (mark.value().same_as(src_vars[this->dim]->var)) {
++          auto scale = as_const_int(iter_split->scale);
++          auto extent = as_const_int(iter_split->extent);
++          ICHECK(scale != nullptr && extent != nullptr);
++          if (*extent == 1)
++            continue;
++
++          int reducing_threads = (*extent) * (*scale);
++          std::stringstream ss;
++
++          auto thread_offset = T.thread_bounds->min;
++          if (TargetHasSMVersionGE(T.target, 90)) {
++            auto all_threads = T.thread_bounds->extent;
++            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
++               << reducing_threads << ", " << (*scale) << ", " << thread_offset
++               << ", tl::NamedBarrier<" << all_threads << ">>::run";
++          } else {
++            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
++               << reducing_threads << ", " << (*scale) << ", " << thread_offset
++               << ">::run";
++          }
++          Array<PrimExpr> thread_reduce_args = {
++              StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
++          if (reducing_threads > 32) {
++            int workspace_size =
++                static_cast<int>(*as_const_int(T.thread_bounds->extent));
++            PrimExpr workspace =
++                T.AddWorkspace(workspace_size, clear_buffer->dtype);
++            thread_reduce_args.push_back(workspace);
++          }
++          auto call = Call(clear_buffer->dtype, builtin::call_extern(),
++                           thread_reduce_args);
++          stmts.push_back(BufferStore(clear_buffer, call, red_indices));
++        }
++      }
+ 
+-    if (need_duplicate) {
+-      body = Allocate(clear_buffer->data, clear_buffer->dtype,
+-                      clear_buffer->shape, const_true(), body);
++      PrimExpr predicate = Bool(true);
++      {
++        auto dst_th_indices = dst_indices;
++        dst_th_indices.push_back(T.thread_var);
++        auto inv = dst_layout->Inverse()->Forward(dst_th_indices);
++        inv.pop_back();
++        for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++) {
++          predicate = predicate && (inv[i] == dst_vars[i]->var);
++        }
++        predicate = analyzer->Simplify(predicate);
++      }
++      if (need_duplicate) {
++        PrimExpr update;
++        if (need_update) {
++          auto src_val = BufferLoad(clear_buffer, red_indices);
++          auto dst_val = BufferLoad(dst_buffer, dst_indices);
++          if (this->type->isSum() || this->type->isAbsSum()) {
++            update = dst_val + src_val;
++          } else if (this->type->isBitAnd()) {
++            update = this->clear ? src_val : bitwise_and(dst_val, src_val);
++          } else if (this->type->isBitOr()) {
++            update = bitwise_or(dst_val, src_val);
++          } else if (this->type->isBitXor()) {
++            update = bitwise_xor(dst_val, src_val);
++          } else if (this->type->isMax() || this->type->isAbsMax()) {
++            update = Max(dst_val, src_val);
++          } else if (this->type->isMin()) {
++            update = Min(dst_val, src_val);
++          } else {
++            LOG(FATAL) << "Unsupported reduce type: " << this->type->type;
++          }
++        } else {
++          update = BufferLoad(clear_buffer, red_indices);
++        }
++        auto store = BufferStore(dst_buffer, update, dst_indices);
++        if (analyzer->CanProve(predicate)) {
++          stmts.push_back(store);
++        } else {
++          stmts.push_back(IfThenElse(predicate, store));
++        }
++      }
++
++      auto body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
++      for (int i = static_cast<int>(dst_layout->InputDim()) - 1; i >= 0; --i) {
++        body = For(dst_vars[i]->var, 0, dst_vars[i]->dom->extent,
++                   ForKind::kParallel, body);
++      }
++
++      if (dst_layout->InputDim() > 0) {
++        body = PartitionLoop(Downcast<For>(body), T.thread_var, analyzer,
++                             red_layout);
++        body = PragmaUnrollLoop(Downcast<For>(body));
++      } else {
++        auto guard = (T.thread_var == T.thread_bounds->min);
++        body = IfThenElse(guard, body);
++      }
++
++      if (need_duplicate) {
++        body = Allocate(clear_buffer->data, clear_buffer->dtype,
++                        clear_buffer->shape, const_true(), body);
++      }
++      return body;
+     }
+-    return body;
+   }
+ 
+   LOG(FATAL) << "Reduce for buffers in scope (" << src_scope << ", "
+diff --git a/src/op/reduce.h b/src/op/reduce.h
+index 5ddb3c64d1..bc776c44ae 100644
+--- a/src/op/reduce.h
++++ b/src/op/reduce.h
+@@ -84,9 +84,17 @@ class ReduceOpNode : public TileOperatorNode {
+   tir::Buffer src, dst; ///< Source and destination buffers
+   // Optional: keep the original regions used to construct this op
+   BufferRegion srcRegion_, dstRegion_;
+-  int dim;                   ///< Dimension to reduce along
+-  ReduceType type;           ///< Type of reduction operation
+-  bool clear;                ///< Whether to clear destination before reduction
++  int dim;         ///< Dimension to reduce along
++  ReduceType type; ///< Type of reduction operation
++  bool clear;      ///< Whether to clear destination before reduction
++  int batch{1};    ///< Number of output elements per batched AllReduce
++                   ///< call. Default 1 = scalar (current behaviour).
++                   ///< When batch > 1, the compiler emits
++                   ///< ceil(N/batch) batched AllReduce calls each
++                   ///< sharing a single pair of barriers across batch
++                   ///< elements. batch must evenly divide the
++                   ///< per-thread output element count N derived from
++                   ///< the fragment layout.
+   bool nan_propagate{false}; ///< For fp16/bf16 max/min/absmax: propagate NaN
+                              ///< (use __hmax_nan/__hmin_nan) instead of the
+                              ///< default __hmax/__hmin which return the
+@@ -105,6 +113,7 @@ class ReduceOpNode : public TileOperatorNode {
+         .def_ro("dim", &ReduceOpNode::dim)
+         .def_ro("type", &ReduceOpNode::type)
+         .def_ro("clear", &ReduceOpNode::clear)
++        .def_ro("batch", &ReduceOpNode::batch)
+         .def_ro("nan_propagate", &ReduceOpNode::nan_propagate);
+   }
+ 
+diff --git a/src/target/codegen_hip.cc b/src/target/codegen_hip.cc
+index fd22bab4f3..66ab13e0ea 100644
+--- a/src/target/codegen_hip.cc
++++ b/src/target/codegen_hip.cc
+@@ -195,7 +195,13 @@ void CodeGenTileLangHIP::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
+       // return
+       return;
+     }
+-    stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
++    // AMD wavefront size is 64.  Sub-wavefront thread counts (e.g. 32)
++    // with __launch_bounds__ can cause the compiler to miscompile 64-bit
++    // shuffle operations when combined with #pragma unroll.  Only emit
++    // launch_bounds when we have at least a full wavefront.
++    if (threadIdx_ext_int->value >= 64) {
++      stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
++    }
+   }
+ }
+ 
+@@ -1675,13 +1681,17 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
+                        CodeGenTileLangHIP *p) { // NOLINT(*)
+   // Type code is kBFloat
+   if (op->dtype.is_bfloat16()) {
+-    os << "bfloat16_t";
+-    os << '(' << std::scientific << op->value << 'f' << ')';
++    os << "bfloat16_t(";
++    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
++    PrintConst(const_f32.get(), os, p);
++    os << ')';
+     return;
+   } else if (op->dtype.is_float8_e4m3fnuz() || op->dtype.is_float8_e4m3() ||
+              op->dtype.is_float8_e4m3fn()) {
+-    os << "fp8_e4_t";
+-    os << '(' << std::scientific << op->value << 'f' << ')';
++    os << "fp8_e4_t(";
++    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
++    PrintConst(const_f32.get(), os, p);
++    os << ')';
+     return;
+   }
+   // Type code is kFloat
+diff --git a/src/tl_templates/cuda/reduce.h b/src/tl_templates/cuda/reduce.h
+index 539c246098..1099b89590 100644
+--- a/src/tl_templates/cuda/reduce.h
++++ b/src/tl_templates/cuda/reduce.h
+@@ -125,37 +125,60 @@ template <int all_threads> struct NamedBarrier {
+ // threads.
+ //
+ // Template parameters:
+-//   Reducer       - binary reduction functor (e.g. SumOp, MaxOp).
+-//   threads       - number of threads that span the reduce dimension,
+-//                   equal to extent * scale.
+-//   scale         - stride of participating threads in the thread index space.
+-//                   When the thread-to-data mapping is normalized as
+-//                     threadIdx = source * scale + ...
+-//                   `scale` is the stride between consecutive logical
+-//                   participants in the reduce dimension.
+-//                   The recursion terminates when threads == scale, meaning
+-//                   each reduce group has been collapsed to a single thread.
+-//                   Uses a recursive XOR-butterfly pattern: at each level,
+-//                   offset >= 32 goes through shared memory + barrier,
+-//                   offset < 32 uses warp shuffle (shfl_xor_sync).
+-//   thread_offset - base thread index offset within the block.
+-//   Barrier       - barrier policy type (SyncThreadsBarrier or
+-//                   NamedBarrier<N>).
++//   Reducer         - binary reduction functor (e.g. SumOp, MaxOp).
++//   threads         - number of threads that span the reduce dimension,
++//                     equal to extent * scale.
++//   scale           - stride of participating threads in the thread index
++//                     space. When the thread-to-data mapping is normalized as
++//                       threadIdx = source * scale + ...
++//                     `scale` is the stride between consecutive logical
++//                     participants in the reduce dimension.
++//                     The recursion terminates when threads == scale, meaning
++//                     each reduce group has been collapsed to a single thread.
++//                     Uses a recursive XOR-butterfly pattern: at each level,
++//                     offset >= 32 goes through shared memory + barrier,
++//                     offset < 32 uses warp shuffle (shfl_xor_sync).
++//   thread_offset   - base thread index offset within the block.
++//   Barrier         - barrier policy type (SyncThreadsBarrier or
++//                     NamedBarrier<N>).
++//   batch_size      - number of independent values to reduce in parallel,
++//                     sharing synchronization barriers across all values.
++//                     Default 1 preserves the original scalar behaviour.
++//   workspace_stride - stride between per-channel slices in the shared-memory
++//                     workspace (typically total threads in the block).
++//                     Only used when batch_size > 1.
+ template <class Reducer, int threads, int scale, int thread_offset = 0,
+-          class Barrier = SyncThreadsBarrier>
++          class Barrier = SyncThreadsBarrier, int batch_size = 1,
++          int workspace_stride = 0>
+ struct AllReduce {
+   static_assert(threads % scale == 0);
++
++  // Scalar interface (backward-compatible).
+   template <typename T> static TL_DEVICE T run(T x, T *red_buf = nullptr) {
+     if constexpr (threads == scale) {
+-      // Recursion base case: each reduce group has exactly one thread left.
+       return x;
+     } else {
+-      return butterfly_reduce(x, red_buf);
++      return butterfly_reduce_scalar(x, red_buf);
++    }
++  }
++
++  // Batch interface (named run_batch to avoid overload-resolution ambiguity
++  // with the scalar run(T x, T*) when a pointer is passed as the first arg).
++  template <typename T>
++  static TL_DEVICE void run_batch(T *x, T *red_buf = nullptr) {
++    if constexpr (threads == scale) {
++      return;
++    } else {
++      butterfly_reduce_batch(x, red_buf);
+     }
+   }
+ 
+ private:
+-  template <typename T> static TL_DEVICE T butterfly_reduce(T x, T *red_buf) {
++  using Next = AllReduce<Reducer, threads / 2, scale, thread_offset, Barrier,
++                         batch_size, workspace_stride>;
++
++  template <typename T>
++  static TL_DEVICE T butterfly_reduce_scalar(T x, T *red_buf) {
+     constexpr int offset = threads / 2;
+     if constexpr (offset >= 32) {
+       Barrier::template sync<1>();
+@@ -168,8 +191,36 @@ struct AllReduce {
+     if constexpr (offset == scale) {
+       return x;
+     } else {
+-      return AllReduce<Reducer, offset, scale, thread_offset, Barrier>::run(
+-          x, red_buf);
++      return Next::run(x, red_buf);
++    }
++  }
++
++  template <typename T>
++  static TL_DEVICE void butterfly_reduce_batch(T *x, T *red_buf) {
++    constexpr int offset = threads / 2;
++    if constexpr (offset >= 32) {
++      Barrier::template sync<1>();
++#pragma unroll
++      for (int i = 0; i < batch_size; i++) {
++        red_buf[(threadIdx.x - thread_offset) + i * workspace_stride] = x[i];
++      }
++      Barrier::template sync<2>();
++#pragma unroll
++      for (int i = 0; i < batch_size; i++) {
++        x[i] =
++            Reducer()(x[i], red_buf[((threadIdx.x - thread_offset) ^ offset) +
++                                    i * workspace_stride]);
++      }
++    } else {
++#pragma unroll
++      for (int i = 0; i < batch_size; i++) {
++        x[i] = Reducer()(x[i], tl::shfl_xor_sync(uint32_t(-1), x[i], offset));
++      }
++    }
++    if constexpr (offset == scale) {
++      return;
++    } else {
++      Next::run_batch(x, red_buf);
+     }
+   }
+ };
+diff --git a/src/tl_templates/hip/reduce.h b/src/tl_templates/hip/reduce.h
+index eaf41b6a91..dd12a1b886 100644
+--- a/src/tl_templates/hip/reduce.h
++++ b/src/tl_templates/hip/reduce.h
+@@ -87,13 +87,15 @@ struct SharedReduceWarp {
+   }
+ };
+ 
+-template <class Reducer, int threads, int scale, int thread_offset = 0>
++template <class Reducer, int threads, int scale, int thread_offset = 0,
++          int batch_size = 1, int workspace_stride = 0>
+ struct AllReduce {
+   static_assert(threads == 1024 || threads == 512 || threads == 256 ||
+                 threads == 128 || threads == 64 || threads == 32 ||
+                 threads == 16 || threads == 8 || threads == 4 || threads == 2);
+   static_assert(threads % scale == 0);
+ 
++  // Scalar interface (backward-compatible).
+   template <typename T> static __device__ T run(T x, T *red_buf = nullptr) {
+     constexpr int offset = threads / 2;
+     constexpr int warpSize = 64;
+@@ -109,7 +111,38 @@ struct AllReduce {
+     if constexpr (offset == scale) {
+       return x;
+     } else {
+-      return AllReduce<Reducer, offset, scale, thread_offset>::run(x, red_buf);
++      return AllReduce<Reducer, offset, scale, thread_offset, batch_size,
++                       workspace_stride>::run(x, red_buf);
++    }
++  }
++
++  // Batch interface (named run_batch to avoid overload-resolution ambiguity).
++  template <typename T>
++  static __device__ void run_batch(T *x, T *red_buf = nullptr) {
++    constexpr int offset = threads / 2;
++    constexpr int warpSize = 64;
++
++    if constexpr (offset >= warpSize) {
++      __syncthreads();
++#pragma unroll
++      for (int i = 0; i < batch_size; i++)
++        red_buf[(threadIdx.x - thread_offset) + i * workspace_stride] = x[i];
++      __syncthreads();
++#pragma unroll
++      for (int i = 0; i < batch_size; i++)
++        x[i] =
++            Reducer()(x[i], red_buf[((threadIdx.x - thread_offset) ^ offset) +
++                                    i * workspace_stride]);
++    } else {
++#pragma unroll
++      for (int i = 0; i < batch_size; i++)
++        x[i] = Reducer()(x[i], tl::shfl_xor(x[i], offset));
++    }
++    if constexpr (offset == scale) {
++      return;
++    } else {
++      AllReduce<Reducer, offset, scale, thread_offset, batch_size,
++                workspace_stride>::run_batch(x, red_buf);
+     }
+   }
+ };
+diff --git a/testing/python/language/test_tilelang_language_reduce.py b/testing/python/language/test_tilelang_language_reduce.py
+index 5db4a586c7..3b49fa6027 100644
+--- a/testing/python/language/test_tilelang_language_reduce.py
++++ b/testing/python/language/test_tilelang_language_reduce.py
+@@ -1,320 +1,310 @@
+-from tilelang import tvm as tvm
+-import tilelang.testing
++import tilelang
+ import tilelang as tl
+ import tilelang.language as T
++import tilelang.testing
+ import pytest
++import torch
+ 
+ tilelang.testing.set_random_seed()
+ 
+-REDUCE_SUM_CASES = [
+-    (T.float32, 128, 128),
+-    (T.int32, 128, 128),
+-    (T.int64, 128, 128),
+-    (T.float32, 192, 64),
+-    (T.int32, 192, 64),
+-    (T.int64, 192, 64),
+-]
+-REDUCE_OTHER_OP_CASES = [
+-    ("max", T.float32),
+-    ("max", T.int64),
+-    ("min", T.float32),
+-    ("min", T.int64),
+-    ("abssum", T.float32),
+-    ("abssum", T.int64),
+-    ("absmax", T.float32),
+-    ("absmax", T.int64),
+-]
+-
+-
+-def _make_shared_reduce(M, N, dtype, reduce_cb):
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1) as _:
+-            A_shared = T.alloc_shared((M, N), dtype)
+-            B_shared = T.alloc_shared((M,), dtype)
+-
+-            T.copy(A, A_shared)
+-            reduce_cb(T, A_shared, B_shared)
+-            T.copy(B_shared, B)
+-
+-    return main
+-
+-
+-def _run_program(program, ref_program, atol=1e-2, rtol=1e-2):
+-    jit_kernel = tl.compile(program, out_idx=-1)
+-    profiler = jit_kernel.get_profiler()
+-    profiler.assert_allclose(ref_program, atol=atol, rtol=rtol)
+-
+-
+-def reduce_test(M, N, dtype=T.float16, op="sum", threads=32):
+-    import tilelang.language as T
+-
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1, threads=threads) as _:
+-            A_local = T.alloc_fragment((M, N), dtype)
+-            B_local = T.alloc_fragment((M,), dtype)
+-
+-            T.copy(A, A_local)
+-            if op == "sum":
+-                T.reduce_sum(A_local, B_local, dim=1)
+-            elif op == "max":
+-                T.reduce_max(A_local, B_local, dim=1)
+-            elif op == "min":
+-                T.reduce_min(A_local, B_local, dim=1)
+-            elif op == "abssum":
+-                T.reduce_abssum(A_local, B_local, dim=1)
+-            elif op == "absmax":
+-                T.reduce_absmax(A_local, B_local, dim=1)
+-            elif op == "bitand":
+-                T.reduce_bitand(A_local, B_local, dim=1)
+-            elif op == "bitor":
+-                T.reduce_bitor(A_local, B_local, dim=1)
+-            elif op == "bitxor":
+-                T.reduce_bitxor(A_local, B_local, dim=1)
+-            T.copy(B_local, B)
+-
+-    return main
+-
+-
+-def reduce_sum_ss(M, N, dtype=T.float32):
+-    return _make_shared_reduce(M, N, dtype, lambda T, src, dst: T.reduce_sum(src, dst, dim=1))
+-
+-
+-def reduce_max_ss(M, N, dtype=T.float32):
+-    return _make_shared_reduce(M, N, dtype, lambda T, src, dst: T.reduce_max(src, dst, dim=1))
+-
+-
+-def reduce_min_ss(M, N, dtype=T.float32):
+-    return _make_shared_reduce(M, N, dtype, lambda T, src, dst: T.reduce_min(src, dst, dim=1))
+ 
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
+ 
+-def reduce_abssum_ss(M, N, dtype=T.float32):
+-    return _make_shared_reduce(M, N, dtype, lambda T, src, dst: T.reduce_abssum(src, dst, dim=1))
+ 
++def _make_input(M, N, dtype):
++    torch_dtype = getattr(torch, dtype)
++    if torch_dtype in (torch.int32, torch.int64):
++        return torch.randint(-100, 100, (M, N), dtype=torch_dtype).cuda()
++    return torch.randn(M, N, dtype=torch_dtype).cuda()
+ 
+-def reduce_absmax_ss(M, N, dtype=T.float32):
+-    return _make_shared_reduce(M, N, dtype, lambda T, src, dst: T.reduce_absmax(src, dst, dim=1))
+ 
+-
+-def run_reduce(M, N, dtype=T.float32, op="sum", mode="rr", threads=32):
+-    if mode == "rr":
+-        program = reduce_test(M, N, dtype, op, threads)
+-    elif mode == "ss":
+-        assert op == "sum", f"shared reduce only supports sum, got {op}"
+-        program = reduce_sum_ss(M, N, dtype)
+-    else:
+-        raise NotImplementedError(f"run_reduce only supports rr and ss, got {mode}")
+-
+-    import torch
+-
+-    def ref_fn(A):
+-        if op == "sum":
+-            res = A.sum(dim=1)
+-        elif op == "max":
+-            res = A.max(dim=1).values
+-        elif op == "min":
+-            res = A.min(dim=1).values
+-        elif op == "abssum":
+-            res = A.abs().sum(dim=1)
+-        elif op == "absmax":
+-            res = A.abs().max(dim=1).values
+-        if A.dtype in [torch.uint32, torch.int32, torch.int64]:
+-            return res.to(A.dtype)
+-        return res
+-
+-    _run_program(program, ref_fn)
+-
+-
+-def run_shared_reduce(program_builder, ref_program, M, N, dtype=T.float32):
+-    program = program_builder(M, N, dtype)
+-    _run_program(program, ref_program)
+-
+-
+-def run_reduce_max(M, N, dtype=T.float16):
+-    program = reduce_test(M, N, dtype, "max")
+-    _run_program(program, lambda A: A.max(dim=1).values, atol=1e-2, rtol=1e-2)
++def _ref(A, op):
++    if op == "sum":
++        return A.sum(dim=1).to(A.dtype)
++    if op == "max":
++        return A.max(dim=1).values
++    if op == "min":
++        return A.min(dim=1).values
++    if op == "abssum":
++        return A.abs().sum(dim=1).to(A.dtype)
++    if op == "absmax":
++        return A.abs().max(dim=1).values
++    raise ValueError(op)
++
++
++def _reduce_op(T, op, src, dst, dim, batch=1):
++    kwargs = {} if batch == 1 else {"batch": batch}
++    if op == "sum":
++        T.reduce_sum(src, dst, dim=dim, **kwargs)
++    elif op == "max":
++        T.reduce_max(src, dst, dim=dim, **kwargs)
++    elif op == "min":
++        T.reduce_min(src, dst, dim=dim, **kwargs)
++    elif op == "abssum":
++        T.reduce_abssum(src, dst, dim=dim, **kwargs)
++    elif op == "absmax":
++        T.reduce_absmax(src, dst, dim=dim, **kwargs)
++
++
++# ---------------------------------------------------------------------------
++# test_reduce  (op × dtype × src_scope × dst_scope × threads × batch)
++# ---------------------------------------------------------------------------
++
++# int types only support sum (no abssum/absmax for int in tilelang)
++REDUCE_CASES = [
++    # (op,      dtype,       M,   N,   src_scope,    dst_scope,  threads, batch)
++    ("sum", T.float32, 128, 128, "fragment", "fragment", 32, 1),
++    ("sum", T.int32, 128, 128, "fragment", "fragment", 32, 1),
++    ("sum", T.int64, 192, 64, "fragment", "fragment", 32, 1),
++    ("sum", T.float32, 192, 64, "fragment", "fragment", 32, 1),
++    ("sum", T.float32, 32, 32, "fragment", "fragment", 16, 1),
++    ("sum", T.float32, 16, 16, "fragment", "fragment", 8, 1),
++    ("sum", T.float32, 32, 32, "shared", "shared", 32, 1),
++    ("sum", T.float32, 32, 32, "fragment", "shared", 32, 1),
++    ("max", T.float32, 128, 128, "fragment", "fragment", 32, 1),
++    ("max", T.int64, 128, 128, "fragment", "fragment", 32, 1),
++    ("max", T.float32, 32, 32, "shared", "shared", 32, 1),
++    ("min", T.float32, 128, 128, "fragment", "fragment", 32, 1),
++    ("min", T.int64, 128, 128, "fragment", "fragment", 32, 1),
++    ("abssum", T.float32, 128, 128, "fragment", "fragment", 32, 1),
++    ("abssum", T.int64, 128, 128, "fragment", "fragment", 32, 1),
++    ("absmax", T.float32, 128, 128, "fragment", "fragment", 32, 1),
++    ("absmax", T.int64, 128, 128, "fragment", "fragment", 32, 1),
++    # batch > 1: verify run_batch codegen and correctness together
++    ("sum", T.float32, 128, 64, "shared", "fragment", 256, 2),
++    ("sum", T.float32, 128, 64, "shared", "fragment", 256, 4),
++    ("sum", T.float16, 64, 128, "fragment", "fragment", 256, 4),
++    ("max", T.bfloat16, 128, 64, "shared", "fragment", 256, 2),
++    ("max", T.float32, 128, 128, "fragment", "fragment", 256, 4),
++    ("min", T.float32, 64, 128, "shared", "fragment", 128, 2),
++    ("min", T.float16, 128, 128, "fragment", "fragment", 256, 8),
++    ("abssum", T.float32, 128, 128, "fragment", "fragment", 256, 4),
++    ("absmax", T.float32, 128, 128, "fragment", "fragment", 256, 4),
++]
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("dtype", "M", "N"),
+-    REDUCE_SUM_CASES,
+-    ids=[f"{dtype}-{M}x{N}" for dtype, M, N in REDUCE_SUM_CASES],
++    ("op", "dtype", "M", "N", "src_scope", "dst_scope", "threads", "batch"),
++    REDUCE_CASES,
++    ids=[
++        f"{op}-{dtype}-{M}x{N}-{src_scope[0]}2{dst_scope[0]}-t{threads}-b{batch}"
++        for op, dtype, M, N, src_scope, dst_scope, threads, batch in REDUCE_CASES
++    ],
+ )
+-def test_reduce_sum(dtype, M, N):
+-    run_reduce(M, N, dtype, "sum")
++def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
++    import re
++
++    @tilelang.jit(out_idx=-1)
++    def kernel(M, N, dtype, op, src_scope, dst_scope, threads, batch):
++        @T.prim_func
++        def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M,), dtype)):
++            with T.Kernel(1, threads=threads):
++                if src_scope == "fragment":
++                    src = T.alloc_fragment((M, N), dtype)
++                else:
++                    src = T.alloc_shared((M, N), dtype)
++                if dst_scope == "fragment":
++                    dst = T.alloc_fragment((M,), dtype)
++                else:
++                    dst = T.alloc_shared((M,), dtype)
++                T.copy(A, src, disable_tma=src_scope == "shared")
++                _reduce_op(T, op, src, dst, dim=1, batch=batch)
++                T.copy(dst, B)
++
++        return main
++
++    jit_kernel = kernel(M, N, dtype, op, src_scope, dst_scope, threads, batch)
++
++    if batch > 1:
++        src = jit_kernel.get_kernel_source()
++        m = re.search(r",\s*(\d+)\s*,\s*\d+\s*>::run_batch\(", src)
++        assert m is not None, f"Expected run_batch in generated source.\n{src}"
++        assert int(m.group(1)) > 1, f"Expected batch_size > 1, got {m.group(1)}.\n{src}"
++
++    A = _make_input(M, N, dtype)
++    B = jit_kernel(A)
++    # float16/bfloat16 accumulate more rounding error over large reductions
++    tol = 1e-1 if dtype in (T.float16, T.bfloat16) else 1e-2
++    torch.testing.assert_close(B, _ref(A, op), atol=tol, rtol=tol)
++
++
++# ---------------------------------------------------------------------------
++# test_reduce_clear  (op × src_scope × dst_scope, clear=False)
++# ---------------------------------------------------------------------------
++
++REDUCE_CLEAR_CASES = [
++    # (op,   dtype,       M,   N,  src_scope,   dst_scope,  init,   ref_fn_extra)
++    # sum: init=1, ref = A.sum(dim=1) + 1
++    ("sum", T.float32, 128, 128, "fragment", "fragment"),
++    ("sum", T.float32, 128, 128, "fragment", "shared"),
++    ("sum", T.float32, 32, 32, "shared", "shared"),
++    # max: init=-inf, ref = A.max(dim=1).values  (max(-inf, x) = x)
++    ("max", T.float16, 128, 128, "fragment", "fragment"),
++]
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("op", "dtype"),
+-    REDUCE_OTHER_OP_CASES,
+-    ids=[f"{op}-{dtype}" for op, dtype in REDUCE_OTHER_OP_CASES],
++    ("op", "dtype", "M", "N", "src_scope", "dst_scope"),
++    REDUCE_CLEAR_CASES,
++    ids=[f"{op}-{dtype}-{M}x{N}-{src_scope[0]}2{dst_scope[0]}" for op, dtype, M, N, src_scope, dst_scope in REDUCE_CLEAR_CASES],
+ )
+-def test_reduce_other_op(op, dtype):
+-    run_reduce(128, 128, dtype, op)
+-
+-
+-def test_reduce_sum_threads():
+-    run_reduce(32, 32, T.float32, "sum", mode="rr", threads=16)
+-    run_reduce(16, 16, T.float32, "sum", mode="rr", threads=8)
+-
+-
+-def test_reduce_sum_shared():
+-    run_reduce(32, 32, op="sum", mode="ss")
+-
+-
+-def test_reduce_max():
+-    run_reduce_max(128, 128, T.float16)
+-    run_reduce_max(192, 64, T.float32)
+-
+-
+-def test_reduce_max_shared():
+-    run_shared_reduce(reduce_max_ss, lambda A: A.max(dim=1).values, 32, 32, T.float32)
+-
+-
+-def test_reduce_min_shared():
+-    run_shared_reduce(reduce_min_ss, lambda A: A.min(dim=1).values, 32, 32, T.float32)
+-
+-
+-def test_reduce_abssum_shared():
+-    run_shared_reduce(reduce_abssum_ss, lambda A: A.abs().sum(dim=1), 32, 32, T.float32)
+-
+-
+-def test_reduce_absmax_shared():
+-    run_shared_reduce(reduce_absmax_ss, lambda A: A.abs().max(dim=1).values, 32, 32, T.float32)
+-
+-
+-def reduce_sum_test_clear(M, N, dtype=T.float32):
+-    import tilelang.language as T
+-
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1, threads=32) as _:
+-            A_local = T.alloc_fragment((M, N), dtype)
+-            B_local = T.alloc_fragment((M,), dtype)
+-
+-            T.copy(A, A_local)
+-            T.fill(B_local, 1)
+-            T.reduce_sum(A_local, B_local, dim=1, clear=False)
+-            T.copy(B_local, B)
+-
+-    return main
+-
+-
+-def run_reduce_sum_clear(M, N, dtype=T.float32, tl_func=reduce_sum_test_clear):
+-    program = tl_func(M, N, dtype)
+-    jit_kernel = tl.compile(program, out_idx=-1)
+-
+-    def ref_program(A):
+-        return A.sum(dim=1) + 1
+-
+-    import torch
+-
+-    dummy_A = torch.randn((M, N), dtype=getattr(torch, dtype)).cuda()
+-    ref_out = ref_program(dummy_A)
+-    tl_out = jit_kernel(dummy_A)
+-    torch.testing.assert_close(tl_out, ref_out, atol=1e-2, rtol=1e-2)
+-
+-
+-def test_reduce_sum_clear():
+-    run_reduce_sum_clear(128, 128, T.float32)
+-    run_reduce_sum_clear(192, 64, T.float32)
+-
+-
+-def reduce_max_test_clear(M, N, dtype=T.float16):
+-    import tilelang.language as T
+-
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1, threads=32) as _:
+-            A_local = T.alloc_fragment((M, N), dtype)
+-            B_local = T.alloc_fragment((M,), dtype)
+-
+-            T.copy(A, A_local)
+-            T.fill(B_local, -T.infinity(dtype))
+-            T.reduce_max(A_local, B_local, dim=1, clear=False)
+-            T.copy(B_local, B)
+-
+-    return main
+-
+-
+-def run_reduce_max_clear(M, N, dtype=T.float16):
+-    program = reduce_max_test_clear(M, N, dtype)
+-    jit_kernel = tl.compile(program, out_idx=-1)
+-
+-    def ref_program(A):
+-        return A.max(dim=1).values
+-
+-    import torch
+-
+-    dummy_A = torch.randn((M, N), dtype=getattr(torch, dtype)).cuda()
+-    ref_out = ref_program(dummy_A)
+-    tl_out = jit_kernel(dummy_A)
+-    torch.testing.assert_close(tl_out, ref_out, atol=1e-2, rtol=1e-2)
+-
+-
+-def test_reduce_max_clear():
+-    run_reduce_max_clear(128, 128, T.float16)
+-
++def test_reduce_clear(op, dtype, M, N, src_scope, dst_scope):
++    @tilelang.jit(out_idx=-1)
++    def kernel(M, N, dtype, op, src_scope, dst_scope):
++        @T.prim_func
++        def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M,), dtype)):
++            with T.Kernel(1, threads=32):
++                if src_scope == "fragment":
++                    src = T.alloc_fragment((M, N), dtype)
++                else:
++                    src = T.alloc_shared((M, N), dtype)
++                if dst_scope == "fragment":
++                    dst = T.alloc_fragment((M,), dtype)
++                else:
++                    dst = T.alloc_shared((M,), dtype)
++                T.copy(A, src, disable_tma=src_scope == "shared")
++                if op == "sum":
++                    T.fill(dst, 1)
++                    T.reduce_sum(src, dst, dim=1, clear=False)
++                elif op == "max":
++                    T.fill(dst, -T.infinity(dtype))
++                    T.reduce_max(src, dst, dim=1, clear=False)
++                T.copy(dst, B)
++
++        return main
++
++    torch_dtype = getattr(torch, dtype)
++    A = torch.randn(M, N, dtype=torch_dtype).cuda()
++    B = kernel(M, N, dtype, op, src_scope, dst_scope)(A)
++    if op == "sum":
++        ref = A.sum(dim=1) + 1
++    elif op == "max":
++        ref = A.max(dim=1).values
++    torch.testing.assert_close(B, ref, atol=1e-2, rtol=1e-2)
++
++
++# ---------------------------------------------------------------------------
++# T.finalize_reducer tests
++# ---------------------------------------------------------------------------
++
++_COMPILE_FLAGS = {
++    tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++}
++
++FINALIZE_REDUCER_CASES = [
++    # (op,   dtype,      block_M, block_N, batch)
++    ("sum", T.float32, 128, 64, 1),
++    ("sum", T.float32, 128, 64, 4),
++    ("max", T.float16, 64, 128, 1),
++    ("max", T.float16, 64, 128, 8),
++    ("min", T.float32, 128, 128, 1),
++    ("min", T.float32, 128, 128, 16),
++]
+ 
+-def reduce_sum_test_clear_B_shared(M, N, dtype=T.float32):
+-    import tilelang.language as T
+ 
++def _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch):
+     @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1, threads=32) as _:
+-            A_local = T.alloc_fragment((M, N), dtype)
+-            B_shared = T.alloc_shared((M,), dtype)
+-
+-            T.copy(A, A_local)
+-            T.fill(B_shared, 1)
+-            T.reduce_sum(A_local, B_shared, dim=1, clear=False)
+-            T.copy(B_shared, B)
+-
+-    return main
+-
++    def kernel(A: T.Tensor((block_M, block_N), dtype), B: T.Tensor((block_M,), dtype)):
++        with T.Kernel(1, threads=256):
++            o_reducer = T.alloc_reducer(block_M, dtype, op=op, replication="all")
++            T.clear(o_reducer)
++            A_smem = T.alloc_shared((block_M, block_N), dtype)
++            T.copy(A, A_smem)
++            A_frag = T.alloc_fragment((block_M, block_N), dtype)
++            T.copy(A_smem, A_frag)
++            for i, j in T.Parallel(block_M, block_N):
++                if op == "sum":
++                    o_reducer[i] += A_frag[i, j]
++                elif op == "max":
++                    o_reducer[i] = T.max(o_reducer[i], A_frag[i, j])
++                else:
++                    o_reducer[i] = T.min(o_reducer[i], A_frag[i, j])
++            T.finalize_reducer(o_reducer, batch=batch)
++            T.copy(o_reducer, B)
++
++    return kernel
+ 
+-def test_reduce_sum_clear_B_shared():
+-    run_reduce_sum_clear(128, 128, T.float32, reduce_sum_test_clear_B_shared)
+ 
++@pytest.mark.parametrize(
++    ("op", "dtype", "block_M", "block_N", "batch"),
++    FINALIZE_REDUCER_CASES,
++    ids=[f"{op}-{dtype}-{bM}x{bN}-b{batch}" for op, dtype, bM, bN, batch in FINALIZE_REDUCER_CASES],
++)
++def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
++    """batch=1 → scalar run; batch>1 → run_batch with correct template arg."""
++    import re
++
++    src = tl.compile(
++        _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch),
++        out_idx=-1,
++        pass_configs=_COMPILE_FLAGS,
++    ).get_kernel_source()
++
++    if batch == 1:
++        assert "run_batch" not in src, f"batch=1 must not emit run_batch.\n{src}"
++    else:
++        m = re.search(r",\s*(\d+)\s*,\s*\d+\s*>::run_batch\(", src)
++        assert m is not None, f"Expected run_batch in generated source.\n{src}"
++        assert int(m.group(1)) == batch, f"Expected batch={batch}, got {m.group(1)}.\n{src}"
+ 
+-def reduce_sum_test_clear_AB_shared(M, N, dtype=T.float32):
+-    import tilelang.language as T
+-
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor((M, N), dtype),
+-        B: T.Tensor((M,), dtype),
+-    ):
+-        with T.Kernel(1, threads=32) as _:
+-            A_shared = T.alloc_shared((M, N), dtype)
+-            B_shared = T.alloc_shared((M,), dtype)
+-
+-            T.copy(A, A_shared, disable_tma=True)
+-            T.fill(B_shared, 1)
+-            T.reduce_sum(A_shared, B_shared, dim=1, clear=False)
+-            T.copy(B_shared, B)
+ 
+-    return main
++@pytest.mark.parametrize(
++    ("op", "dtype", "block_M", "block_N", "batch"),
++    [c for c in FINALIZE_REDUCER_CASES if c[4] == 1],
++    ids=[f"{op}-{dtype}-{bM}x{bN}" for op, dtype, bM, bN, batch in FINALIZE_REDUCER_CASES if batch == 1],
++)
++def test_finalize_reducer_correctness(op, dtype, block_M, block_N, batch):
++    """Numerical correctness (batch=1 scalar path; batch>1 blocked by fragment layout bug)."""
++    A = torch.randn(block_M, block_N, dtype=getattr(torch, dtype)).cuda()
++    B = tl.compile(
++        _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch),
++        out_idx=-1,
++        pass_configs=_COMPILE_FLAGS,
++    )(A)
++    torch.testing.assert_close(B, _ref(A, op), atol=1e-2, rtol=1e-2)
++
++
++# (batch, exc_type, match)
++FINALIZE_REDUCER_INVALID_CASES = [
++    (0, ValueError, "batch must be >= 1"),
++    (-1, ValueError, "batch must be >= 1"),
++    (128, Exception, "exceeds total output elements"),  # block_M=64, batch=128
++    (3, Exception, "must evenly divide"),  # block_M=64, batch=3
++]
+ 
+ 
+-def test_reduce_sum_clear_AB_shared():
+-    run_reduce_sum_clear(32, 32, T.float32, reduce_sum_test_clear_AB_shared)
++@pytest.mark.parametrize(
++    ("batch", "exc_type", "match"),
++    FINALIZE_REDUCER_INVALID_CASES,
++    ids=["zero", "negative", "exceeds", "not-divisible"],
++)
++def test_finalize_reducer_invalid_batch(batch, exc_type, match):
++    block_M = 64
++
++    def make_kernel():
++        @T.prim_func
++        def kernel(A: T.Tensor((block_M, 64), T.float32), B: T.Tensor((block_M,), T.float32)):
++            with T.Kernel(1, threads=256):
++                o_reducer = T.alloc_reducer(block_M, T.float32, op="sum", replication="all")
++                T.clear(o_reducer)
++                A_smem = T.alloc_shared((block_M, 64), T.float32)
++                T.copy(A, A_smem)
++                A_frag = T.alloc_fragment((block_M, 64), T.float32)
++                T.copy(A_smem, A_frag)
++                for i, j in T.Parallel(block_M, 64):
++                    o_reducer[i] += A_frag[i, j]
++                T.finalize_reducer(o_reducer, batch=batch)
++                T.copy(o_reducer, B)
++
++        return kernel
++
++    with pytest.raises(exc_type, match=match):
++        # batch<1 raises at prim_func definition time; others at compile time
++        k = make_kernel()
++        tl.compile(k, out_idx=-1, pass_configs=_COMPILE_FLAGS)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tilelang/contrib/cutedsl/reduce.py b/tilelang/contrib/cutedsl/reduce.py
+index d946c39f35..b031bf1b45 100644
+--- a/tilelang/contrib/cutedsl/reduce.py
++++ b/tilelang/contrib/cutedsl/reduce.py
+@@ -384,7 +384,7 @@ def __init__(self, all_threads):
+         self.all_threads = all_threads
+ 
+ 
+-def AllReduce(reducer, threads, scale, thread_offset, all_threads=None):
++def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_size=1, workspace_stride=0):
+     """
+     AllReduce operation implementing warp/block-level reduction.
+     Based on tl::AllReduce from reduce.h
+@@ -394,7 +394,9 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None):
+         threads: Number of threads participating in reduction
+         scale: Reduction scale factor
+         thread_offset: Thread ID offset
+-        all_threads: Total number of threads in block
++        all_threads: Total number of threads in block (or NamedBarrier instance)
++        batch_size: Number of elements per thread to reduce in parallel (default 1)
++        workspace_stride: Stride between batch channels in shared memory (default 0)
+ 
+     Returns:
+         A callable object with run() and run_hopper() methods
+@@ -416,6 +418,8 @@ def __init__(
+             thread_offset: cutlass.Constexpr[int],
+             all_threads: cutlass.Constexpr[int],
+             use_named_barrier: cutlass.Constexpr[bool],
++            batch_size: cutlass.Constexpr[int],
++            workspace_stride: cutlass.Constexpr[int],
+         ):
+             self.reducer = reducer
+             self.threads = threads
+@@ -423,12 +427,15 @@ def __init__(
+             self.thread_offset = thread_offset
+             self.all_threads = all_threads if all_threads is not None else threads
+             self.use_named_barrier = use_named_barrier
++            self.batch_size = batch_size
++            self.workspace_stride = workspace_stride
+ 
+         def run(self, x, red_buf: cute.Pointer = None):
+             """
+             Perform all-reduce across threads.
+             Based on tl::AllReduce<...>::run from reduce.h
+             When NamedBarrier is used, delegates to run_hopper.
++            Supports both scalar (x is a value) and batched (x is a pointer) modes.
+             """
+             if self.use_named_barrier:
+                 return self.run_hopper(x, red_buf)
+@@ -436,47 +443,78 @@ def run(self, x, red_buf: cute.Pointer = None):
+             offset = self.threads // 2
+ 
+             if offset >= 32:
+-                # Use shared memory for large thread counts
+                 cute.arch.sync_threads()
+                 tidx, _, _ = cute.arch.thread_idx()
+-                cute.make_tensor(red_buf + tidx - self.thread_offset, (1,))[0] = x
+-                cute.arch.sync_threads()
+-                x = self.reducer()(x, cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset), (1,))[0])
++                if self.batch_size > 1:
++                    x_tensor = cute.make_tensor(x, (self.batch_size,))
++                    for i in range(self.batch_size):
++                        cute.make_tensor(red_buf + (tidx - self.thread_offset) + i * self.workspace_stride, (1,))[0] = x_tensor[i]
++                    cute.arch.sync_threads()
++                    for i in range(self.batch_size):
++                        x_tensor[i] = self.reducer()(
++                            x_tensor[i],
++                            cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset) + i * self.workspace_stride, (1,))[0],
++                        )
++                else:
++                    cute.make_tensor(red_buf + tidx - self.thread_offset, (1,))[0] = x
++                    cute.arch.sync_threads()
++                    x = self.reducer()(x, cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset), (1,))[0])
+             else:
+-                # Use warp shuffle for small thread counts
+-                # Use the pre-existing shuffle_sync_op with butterfly (XOR) mode
+-                other = shuffle_sync_op(x, offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
+-                x = self.reducer()(x, other)
+-
+-            return (
+-                x
+-                if offset == self.scale
+-                else AllReduce(self.reducer, offset, self.scale, self.thread_offset, self.all_threads).run(x, red_buf)
+-            )
++                if self.batch_size > 1:
++                    x_tensor = cute.make_tensor(x, (self.batch_size,))
++                    for i in range(self.batch_size):
++                        other = shuffle_sync_op(x_tensor[i], offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
++                        x_tensor[i] = self.reducer()(x_tensor[i], other)
++                else:
++                    other = shuffle_sync_op(x, offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
++                    x = self.reducer()(x, other)
++
++            if offset == self.scale:
++                return x
++            else:
++                return AllReduce(
++                    self.reducer, offset, self.scale, self.thread_offset, self.all_threads, self.batch_size, self.workspace_stride
++                ).run(x, red_buf)
+ 
+         def run_hopper(self, x, red_buf: cute.Pointer = None):
+             """
+             Perform all-reduce on Hopper architecture using bar.sync.
+             Based on tl::AllReduce<...>::run_hopper from reduce.h
++            Supports both scalar and batched modes.
+             """
+             offset = self.threads // 2
+             tidx, _, _ = cute.arch.thread_idx()
+             if offset >= 32:
+-                # Use inlined asm for bar.sync to avoid instruction reordering
+                 bar_sync_ptx(1, self.all_threads)
+-                cute.make_tensor(red_buf + tidx - self.thread_offset, (1,))[0] = x
+-                bar_sync_ptx(2, self.all_threads)
+-                x = self.reducer()(x, cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset), (1,))[0])
++                if self.batch_size > 1:
++                    x_tensor = cute.make_tensor(x, (self.batch_size,))
++                    for i in range(self.batch_size):
++                        cute.make_tensor(red_buf + (tidx - self.thread_offset) + i * self.workspace_stride, (1,))[0] = x_tensor[i]
++                    bar_sync_ptx(2, self.all_threads)
++                    for i in range(self.batch_size):
++                        x_tensor[i] = self.reducer()(
++                            x_tensor[i],
++                            cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset) + i * self.workspace_stride, (1,))[0],
++                        )
++                else:
++                    cute.make_tensor(red_buf + tidx - self.thread_offset, (1,))[0] = x
++                    bar_sync_ptx(2, self.all_threads)
++                    x = self.reducer()(x, cute.make_tensor(red_buf + ((tidx - self.thread_offset) ^ offset), (1,))[0])
+             else:
+-                # Use warp shuffle for small thread counts
+-                # Use the pre-existing shuffle_sync_op with butterfly (XOR) mode
+-                other = shuffle_sync_op(x, offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
+-                x = self.reducer()(x, other)
+-
+-            return (
+-                x
+-                if offset == self.scale
+-                else AllReduce(self.reducer, offset, self.scale, self.thread_offset, self.all_threads).run_hopper(x, red_buf)
+-            )
++                if self.batch_size > 1:
++                    x_tensor = cute.make_tensor(x, (self.batch_size,))
++                    for i in range(self.batch_size):
++                        other = shuffle_sync_op(x_tensor[i], offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
++                        x_tensor[i] = self.reducer()(x_tensor[i], other)
++                else:
++                    other = shuffle_sync_op(x, offset, mask=0xFFFFFFFF, mask_and_clamp=0x1F, kind=nvvm.ShflKind.bfly)
++                    x = self.reducer()(x, other)
++
++            if offset == self.scale:
++                return x
++            else:
++                return AllReduce(
++                    self.reducer, offset, self.scale, self.thread_offset, self.all_threads, self.batch_size, self.workspace_stride
++                ).run_hopper(x, red_buf)
+ 
+-    return AllReduceInstance(reducer, threads, scale, thread_offset, barrier_threads, use_named_barrier)
++    return AllReduceInstance(reducer, threads, scale, thread_offset, barrier_threads, use_named_barrier, batch_size, workspace_stride)
+diff --git a/tilelang/language/reduce_op.py b/tilelang/language/reduce_op.py
+index e0118ea6cd..fa82e8c72d 100644
+--- a/tilelang/language/reduce_op.py
++++ b/tilelang/language/reduce_op.py
+@@ -22,7 +22,9 @@ def _legalize_dim(buffer: tir.Buffer, dim: int):
+ 
+ 
+ # NOTE(chaofan): T.reduce is implemented as a macro, so no return
+-def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: int, clear: bool, nan_propagate: bool = False) -> None:
++def reduce(
++    buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: int, clear: bool, batch: int = 1, nan_propagate: bool = False
++) -> None:
+     """Perform a reduction operation on a buffer along a specified dimension.
+ 
+     Args:
+@@ -31,11 +33,18 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
+         reduce_type (str): Type of reduction ('max', 'min', 'sum', 'abssum')
+         dim (int): Dimension along which to perform reduction
+         clear (bool): Whether to initialize the output buffer before reduction
++        batch (int): Number of output elements per batched AllReduce call
++            (default 1 = scalar, current behaviour). When batch > 1 the
++            compiler emits ceil(N/batch) batched AllReduce calls each sharing
++            a single pair of barriers, reducing total barrier count by batch×.
++            batch must evenly divide the per-thread output element count N.
+         nan_propagate (bool): Only meaningful for max/min/absmax on
+             float16/bfloat16. When True, lower to CUDA __hmax_nan/__hmin_nan so
+             NaNs propagate through the reduction. When False (default), use
+             __hmax/__hmin which return the non-NaN operand. CUDA-only.
+     """
++    if batch < 1:
++        raise ValueError(f"batch must be >= 1, got {batch}")
+     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
+     expected_shapes = [buffer.shape[:dim] + buffer.shape[dim + 1 :], buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :]]
+     if list(out.shape) not in expected_shapes:
+@@ -45,7 +54,13 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
+             f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+         )
+ 
+-    annotations = {"nan_propagate": True} if nan_propagate else None
++    annotations = {}
++    if batch > 1:
++        annotations["batch"] = batch
++    if nan_propagate:
++        annotations["nan_propagate"] = True
++    if not annotations:
++        annotations = None
+ 
+     @macro
+     def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
+@@ -122,7 +137,7 @@ def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int
+     reduce_macro(buffer, out, reduce_type, dim, clear)
+ 
+ 
+-def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, nan_propagate: bool = False) -> None:
++def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False) -> None:
+     """Perform reduce max on input buffer, store the result to output buffer
+ 
+     Parameters
+@@ -135,6 +150,8 @@ def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+         The dimension to perform reduce on
+     clear : bool
+         If set to True, the output buffer will first be initialized to -inf.
++    batch : int
++        Number of output elements per batched AllReduce call (default 1).
+     nan_propagate : bool
+         For float16/bfloat16 only. When True, NaN inputs propagate through the
+         reduction (CUDA __hmax_nan). When False (default), NaN inputs are
+@@ -144,10 +161,10 @@ def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+     handle : PrimExpr
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "max", dim, clear, nan_propagate)
++    reduce(buffer, out, "max", dim, clear, batch=batch, nan_propagate=nan_propagate)
+ 
+ 
+-def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, nan_propagate: bool = False) -> None:
++def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False) -> None:
+     """Perform reduce min on input buffer, store the result to output buffer.
+ 
+     Args:
+@@ -155,6 +172,7 @@ def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+         out (tir.Buffer): The output buffer
+         dim (int): The dimension to perform reduce on
+         clear (bool, optional): If True, output buffer will be initialized to inf. Defaults to True.
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+         nan_propagate (bool, optional): For float16/bfloat16 only. When True,
+             NaN inputs propagate (CUDA __hmin_nan). When False (default), NaNs
+             are ignored (CUDA __hmin). CUDA-only.
+@@ -163,10 +181,10 @@ def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "min", dim, clear, nan_propagate)
++    reduce(buffer, out, "min", dim, clear, batch=batch, nan_propagate=nan_propagate)
+ 
+ 
+-def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
++def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+     """Perform reduce sum on input buffer, store the result to output buffer.
+ 
+     Args:
+@@ -176,6 +194,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+         clear (bool, optional): If True, output buffer will be cleared before reduction.
+                               If False, results will be accumulated on existing values.
+                               Defaults to True.
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+     Note: When clear=True, reduce_sum will not compute directly on the output buffer. This is because
+           during warp reduction, the same value would be accumulated multiple times (number of threads
+           in the warp). Therefore, the implementation with clear=True follows these steps:
+@@ -188,31 +207,35 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "sum", dim, clear)
++    reduce(buffer, out, "sum", dim, clear, batch=batch)
+ 
+ 
+-def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
++def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int = 1) -> None:
+     """Perform reduce absolute sum on input buffer, store the result to output buffer.
+ 
+     Args:
+         buffer (tir.Buffer): The input buffer
+         out (tir.Buffer): The output buffer
+         dim (int): The dimension to perform reduce on
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+ 
+     Returns:
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "abssum", dim, True)
++    reduce(buffer, out, "abssum", dim, True, batch=batch)
+ 
+ 
+-def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, nan_propagate: bool = False) -> None:
++def reduce_absmax(
++    buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False
++) -> None:
+     """Perform reduce absolute max on input buffer, store the result to output buffer.
+ 
+     Args:
+         buffer (tir.Buffer): The input buffer
+         out (tir.Buffer): The output buffer
+         dim (int): The dimension to perform reduce on
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+         nan_propagate (bool, optional): For float16/bfloat16 only. When True,
+             NaN inputs propagate (CUDA __hmax_nan). When False (default), NaNs
+             are ignored. CUDA-only.
+@@ -221,40 +244,42 @@ def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "absmax", dim, clear, nan_propagate)
++    reduce(buffer, out, "absmax", dim, clear, batch=batch, nan_propagate=nan_propagate)
+ 
+ 
+-def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
++def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+     """Perform reduce bitwise-and on input buffer, store the result to output buffer.
+ 
+     Args:
+         buffer (tir.Buffer): The input buffer
+         out (tir.Buffer): The output buffer
+         dim (int): The dimension to perform reduce on
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+ 
+     Returns:
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "bitand", dim, clear)
++    reduce(buffer, out, "bitand", dim, clear, batch=batch)
+ 
+ 
+-def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
++def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+     """Perform reduce bitwise-or on input buffer, store the result to output buffer.
+ 
+     Args:
+         buffer (tir.Buffer): The input buffer
+         out (tir.Buffer): The output buffer
+         dim (int): The dimension to perform reduce on
++        batch (int): Number of output elements per batched AllReduce call (default 1).
+ 
+     Returns:
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "bitor", dim, clear)
++    reduce(buffer, out, "bitor", dim, clear, batch=batch)
+ 
+ 
+-def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
++def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+     """Perform reduce bitwise-xor on input buffer, store the result to output buffer.
+ 
+     Args:
+@@ -266,7 +291,7 @@ def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
+         tir.Call: Handle to the reduction operation
+     """
+     dim = _legalize_dim(buffer, dim)
+-    reduce(buffer, out, "bitxor", dim, clear)
++    reduce(buffer, out, "bitxor", dim, clear, batch=batch)
+ 
+ 
+ @macro
+@@ -392,7 +417,7 @@ def cumsum(
+     )
+ 
+ 
+-def finalize_reducer(reducer: tir.Buffer) -> tir.PrimExpr:
++def finalize_reducer(reducer: tir.Buffer, batch: int = 1) -> tir.PrimExpr:
+     """
+     Finalize a reducer buffer by emitting the `tl.tileop.finalize_reducer` intrinsic.
+ 
+@@ -401,14 +426,25 @@ def finalize_reducer(reducer: tir.Buffer) -> tir.PrimExpr:
+ 
+     Parameters:
+         reducer (tir.Buffer): Reducer buffer whose writable pointer will be finalized.
++        batch (int): Batch size for the AllReduce call (default 1 = scalar path,
++            matching the T.reduce default).  When batch > 1, the compiler emits a
++            single batched AllReduce call covering `batch` output elements at a
++            time, reducing barrier count by batch×.  batch must evenly divide the
++            total number of per-thread output elements.
+ 
+     Returns:
+         tir.Call: Handle to the finalize reducer intrinsic call.
+     """
++    if batch < 1:
++        raise ValueError(f"finalize_reducer: batch must be >= 1, got {batch}")
++    annotations = {}
++    if batch > 1:
++        annotations["batch"] = batch
+     return tir.call_intrin(
+         "handle",
+         tir.op.Op.get("tl.tileop.finalize_reducer"),
+         to_buffer_region(reducer, access_type="w"),
++        annotations=annotations if annotations else None,
+     )
+ 
+ 

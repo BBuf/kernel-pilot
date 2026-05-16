@@ -1,0 +1,130 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 8f3c84bf8f22..745245bb49a1 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -18,6 +18,7 @@
+ from sglang.srt.layers.quantization.fp8_kernel import (
+     fp8_dtype,
+     fp8_max,
++    fp8_min,
+     is_fp8_fnuz,
+     mxfp8_block_scaled_matmul_triton,
+     per_token_group_quant_fp8,
+@@ -28,6 +29,7 @@
+     w8a8_block_fp8_matmul_deepgemm,
+     w8a8_block_fp8_matmul_triton,
+ )
++from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     ceil_align,
+     ceil_div,
+@@ -1462,12 +1464,32 @@ def apply_fp8_linear(
+         num_token_padding = output_padding
+         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+             num_token_padding = None
+-        qinput, x_scale = scaled_fp8_quant(
+-            input_2d,
+-            input_scale,
+-            num_token_padding=num_token_padding,
+-            use_per_token_if_dynamic=use_per_token_if_dynamic,
+-        )
++        # For static per-tensor activation scales when using inductor compiler,
++        # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
++        # Inductor fuses these with surrounding ops (RMSNorm, residual add),
++        # eliminating a separate kernel launch per linear layer.
++        # weight_scale shape does not matter here -- it is only used in the
++        # GEMM epilogue, not in the activation quant fusion. Only activates when
++        # piecewise_cuda_graph_compiler=inductor; eager PCG and decode both
++        # use the faster custom kernel.
++        if (
++            input_scale is not None
++            and input_scale.numel() == 1
++            and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
++        ):
++            qinput = (
++                (input_2d * input_scale.reciprocal())
++                .clamp(min=fp8_min, max=fp8_max)
++                .to(fp8_dtype)
++            )
++            x_scale = input_scale
++        else:
++            qinput, x_scale = scaled_fp8_quant(
++                input_2d,
++                input_scale,
++                num_token_padding=num_token_padding,
++                use_per_token_if_dynamic=use_per_token_if_dynamic,
++            )
+     else:
+         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
+         if input_scale is not None:
+diff --git a/python/sglang/srt/models/utils.py b/python/sglang/srt/models/utils.py
+index 13a0e70f0e88..80b12b26ecbb 100644
+--- a/python/sglang/srt/models/utils.py
++++ b/python/sglang/srt/models/utils.py
+@@ -30,6 +30,7 @@
+ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+@@ -388,6 +389,28 @@ def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+ 
+ 
++def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
++    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
++
++    On CUDA with the inductor piecewise-cuda-graph compiler, return a
++    stride-preserving view so inductor can fuse this reshape with the
++    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
++    single triton kernel -- the original motivation of #21734.
++
++    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
++    flat 2D reshape that forces a copy when the input is a non-contiguous
++    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
++    inputs and fault on strided tensors (root cause of the #21734 revert
++    in #23159).
++    """
++    if (
++        _is_cuda
++        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
++    ):
++        return x.view(*x.shape[:-1], -1, head_dim)
++    return x.reshape(-1, head_dim)
++
++
+ def apply_qk_norm(
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -422,6 +445,8 @@ def apply_qk_norm(
+         and allow_inplace  # TODO(dark): this can be relaxed if needed
+         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
+         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++        and get_global_server_args().piecewise_cuda_graph_compiler
++        != "inductor"  # let inductor fuse QK norm
+         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
+     ):
+         fused_inplace_qknorm(
+@@ -437,16 +462,16 @@ def apply_qk_norm(
+     if alt_stream is not None and get_is_capture_mode():
+         current_stream = get_current_device_stream_fast()
+         alt_stream.wait_stream(current_stream)
+-        q_by_head = q.reshape(-1, head_dim)
++        q_by_head = _reshape_for_qk_norm(q, head_dim)
+         q_by_head = q_norm(q_by_head)
+         with torch.cuda.stream(alt_stream):
+-            k_by_head = k.reshape(-1, head_dim)
++            k_by_head = _reshape_for_qk_norm(k, head_dim)
+             k_by_head = k_norm(k_by_head)
+         current_stream.wait_stream(alt_stream)
+     else:
+-        q_by_head = q.reshape(-1, head_dim)
++        q_by_head = _reshape_for_qk_norm(q, head_dim)
+         q_by_head = q_norm(q_by_head)
+-        k_by_head = k.reshape(-1, head_dim)
++        k_by_head = _reshape_for_qk_norm(k, head_dim)
+         k_by_head = k_norm(k_by_head)
+     q = q_by_head.view(q.shape)
+     k = k_by_head.view(k.shape)

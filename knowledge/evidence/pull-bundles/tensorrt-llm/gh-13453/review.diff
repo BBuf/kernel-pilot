@@ -1,0 +1,3684 @@
+diff --git a/tensorrt_llm/_torch/modules/mamba/causal_conv1d_triton.py b/tensorrt_llm/_torch/modules/mamba/causal_conv1d_triton.py
+index e6a2a0879adc..83467a06a0d6 100644
+--- a/tensorrt_llm/_torch/modules/mamba/causal_conv1d_triton.py
++++ b/tensorrt_llm/_torch/modules/mamba/causal_conv1d_triton.py
+@@ -24,7 +24,8 @@
+ import triton
+ import triton.language as tl
+ 
+-PAD_SLOT_ID = -1
++from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
++from tensorrt_llm._utils import get_sm_version
+ 
+ 
+ @triton.jit()
+@@ -980,6 +981,9 @@ def causal_conv1d_update(
+     metadata=None,
+     validate_data=False,
+     launch_dependent_kernels: bool = False,
++    _block_n: int | None = None,
++    _num_warps: int | None = None,
++    _num_stages: int | None = None,
+ ):
+     """x: (batch, dim) or (batch, dim, seqlen)
+         [shape=2: single token prediction]
+@@ -1007,7 +1011,12 @@ def causal_conv1d_update(
+         This kernel is typically followed by selective state update,
+         which can profitably start fetching already available inputs
+         like the state before needing the output of this kernel.
++        Ignored on hardware that doesn't support PDL (sm < 90).
+     """
++    # PDL needs sm >= 90.
++    if get_sm_version() < 90:
++        launch_dependent_kernels = False
++
+     if validate_data:
+         assert cache_seqlens is None  # not implemented yet - ok for vLLM
+         assert pad_slot_id is not None
+@@ -1164,10 +1173,12 @@ def grid(META):
+         NP2_STATELEN=np2_statelen,
+         NP2_SEQLEN=np2_seqlen,
+         USE_PAD_SLOT=pad_slot_id is not None,
+-        BLOCK_N=256,
++        BLOCK_N=_block_n if _block_n is not None else 128,
+         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+         LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
++        num_warps=_num_warps if _num_warps is not None else 4,
++        **({"num_stages": _num_stages} if _num_stages else {}),
+     )
+     if unsqueeze:
+         out = out.squeeze(-1)
+diff --git a/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py b/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
+index 23557ee2011c..d51f04f3764f 100644
+--- a/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
++++ b/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
+@@ -41,6 +41,7 @@
+                                    fused_split_rearrange_after_conv1d)
+ from .layernorm_gated import RMSNorm as RMSNormGated
+ from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
++from .replay_selective_state_update import replay_selective_state_update
+ from .selective_state_update import \
+     selective_state_update as selective_state_update_native
+ from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
+@@ -160,12 +161,16 @@ def __init__(
+                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
+         self._use_flashinfer = (head_dim in supported_head_dims and
+                                 head_group_ratio in supported_head_group_ratios)
+-        # Stochastic rounding requires FlashInfer and fp16 cache
+-        self._use_stochastic_rounding = (
+-            config.quant_config.mamba_ssm_stochastic_rounding
+-            and self._use_flashinfer
+-            and self._mamba_ssm_cache_dtype == torch.float16)
++        self._stochastic_rounding_requested = (
++            config.quant_config.mamba_ssm_stochastic_rounding)
+         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
++        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
++        # custom_op does not.  Only use_replay is resolved per-forward (from the
++        # cache manager), so precompute both gate values here.
++        sr_base = (self._stochastic_rounding_requested
++                   and self._mamba_ssm_cache_dtype == torch.float16)
++        self._stochastic_rounding_for_replay = sr_base
++        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
+ 
+         self._use_mtp_custom_op = os.environ.get(
+             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
+@@ -179,12 +184,18 @@ def __init__(
+                              key="selective_state_update")
+             self.selective_state_update_func = selective_state_update_native
+ 
+-        # Warn if stochastic rounding was requested but couldn't be enabled
+-        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
+-            logger.warning_once(
+-                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
+-                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
+-                key="stochastic_rounding_disabled")
++        # Warn if stochastic rounding was requested but no path can supply it.
++        if self._stochastic_rounding_requested:
++            if self._mamba_ssm_cache_dtype != torch.float16:
++                logger.warning_once(
++                    f"Stochastic rounding needs fp16 SSM cache, "
++                    f"have {self._mamba_ssm_cache_dtype}. Disabled.",
++                    key="stochastic_rounding_disabled")
++            elif not self._use_flashinfer:
++                logger.warning_once(
++                    "Stochastic rounding needs flashinfer or replay; "
++                    "neither available with current configuration.",
++                    key="stochastic_rounding_disabled")
+ 
+         # D
+         self.D = nn.Parameter(
+@@ -307,7 +318,6 @@ def forward(
+         # Split z and dt with views.
+         z = zxbcdt[:, :self.tp_d_inner]
+         dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
+-        z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
+         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
+ 
+         # Decode path uses regular view since no transpose is needed.
+@@ -317,10 +327,7 @@ def forward(
+         # Preallocate output tensor to avoid memcpy cost for merging prefill
+         # and decode outputs
+         preallocated_ssm_out = torch.empty(
+-            [
+-                zxbcdt.shape[0],
+-                (self.num_heads * self.head_dim) // self.tp_size,
+-            ],
++            [zxbcdt.shape[0], (self.tp_nheads * self.head_dim)],
+             dtype=zxbcdt.dtype,
+             device=zxbcdt.device,
+         )
+@@ -360,9 +367,6 @@ def forward(
+                 self.head_dim,
+             )
+             dt_p = dt_p.unsqueeze(0)
+-            z_p = rearrange(z_p.unsqueeze(0),
+-                            "b l (h p) -> b l h p",
+-                            h=self.tp_nheads)
+ 
+             initial_states = None
+             if mamba_metadata.use_initial_states:
+@@ -407,6 +411,8 @@ def forward(
+                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
+                 draft_token_num = spec_metadata.max_draft_len + 1
+                 intermediate_conv_states = layer_cache.intermediate_conv_window
++                use_replay = getattr(attn_metadata.kv_cache_manager,
++                                     'use_replay_state_update', False)
+ 
+                 intermediate_state_indices = _cached_arange(
+                     attn_metadata.kv_cache_manager.get_max_resource_count(),
+@@ -427,6 +433,8 @@ def conv1d():
+                         conv_state_indices=state_indices_d[:num_decodes],
+                         intermediate_conv_window=intermediate_conv_states,
+                         intermediate_state_indices=intermediate_state_indices,
++                        # PDL chain: conv1d → precompute → main (replay only)
++                        launch_dependent_kernels=use_replay,
+                     )
+ 
+                     return xbc_d_processed.transpose(1, 2).view(
+@@ -443,22 +451,21 @@ def conv1d():
+                         activation="silu",
+                         conv_state_indices=state_indices_d)
+ 
+-            # For flashinfer state update, dt dtype has to match dt_bias and D.
+-            def convert_dt():
+-                return dt_d.to(dtype=torch.float32)
+-
+-            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+-            # if PDL'd will launch when convert_dt is done and conv1d triggers
+-            # dependent kernels.  If these don't happen in parallel, then
+-            # convert will go second and we lose PDL, but we're using cuda
+-            # graphs for low latency so that seems ok.
+-            # If any of the contiguous calls below actually fire, that also breaks PDL.
+-            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+-                                                    convert_dt,
+-                                                    self.events[0],
+-                                                    self.events[1],
+-                                                    self.aux_steram,
+-                                                    disable_on_compile=True)
++            if is_target_verify and use_replay:
++                # Replay path: kernel handles bf16 dt natively (applies bias +
++                # softplus internally).  No dt conversion needed.
++                xbc_d = conv1d()
++            else:
++                # Non-replay paths: flashinfer/native needs fp32 dt.
++                def convert_dt():
++                    return dt_d.to(dtype=torch.float32)
++
++                xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
++                                                        convert_dt,
++                                                        self.events[0],
++                                                        self.events[1],
++                                                        self.aux_steram,
++                                                        disable_on_compile=True)
+ 
+             x_d, B_d, C_d = torch.split(
+                 xbc_d,
+@@ -469,101 +476,114 @@ def convert_dt():
+                 ],
+                 dim=-1,
+             )
+-            # Use .contiguous() to ensure proper 128-byte alignment required by
+-            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
+-            # into sliced tensors which may not be 128-byte aligned.
+-            x_d = rearrange(x_d, "b (h p) -> b h p",
+-                            p=self.head_dim).contiguous()
++            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
+-            B_d = rearrange(B_d, "b (g n) -> b g n",
+-                            g=self.tp_ngroups).contiguous()
+-            C_d = rearrange(C_d, "b (g n) -> b g n",
+-                            g=self.tp_ngroups).contiguous()
+-            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
++            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
++            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+ 
+             A = self._A_expanded
+             dt_bias = self._dt_bias_expanded
+             D = self._D_expanded
+             if is_target_verify:
++                # 4D views for multi-token processing (shared by all paths).
+                 intermediate_ssm_states = layer_cache.intermediate_ssm
+-                x_d_mtp = x_d.view(
+-                    num_decodes,
+-                    draft_token_num,
+-                    self.num_heads // self.tp_size,
+-                    self.head_dim,
+-                )
+-                dt_d_mtp = dt_d.view(
+-                    num_decodes,
+-                    draft_token_num,
+-                    self.num_heads // self.tp_size,
+-                    self.head_dim,
+-                )
+-                B_d_mtp = B_d.view(num_decodes, draft_token_num,
+-                                   self.tp_ngroups, -1)
+-                C_d_mtp = C_d.view(num_decodes, draft_token_num,
+-                                   self.tp_ngroups, -1)
+-                out_mtp = preallocated_ssm_out_d.view(
+-                    num_decodes,
+-                    draft_token_num,
+-                    self.num_heads // self.tp_size,
+-                    self.head_dim,
+-                )
+-
+-                if self._use_mtp_custom_op and not self._use_stochastic_rounding:
+-                    # Use the TRT-LLM CUDA custom op for MTP SSM cache
+-                    # update. This path does not support stochastic
+-                    # rounding (rand_seed / philox_rounds).
++                x_d_4d = x_d.view(num_decodes, draft_token_num, self.tp_nheads,
++                                  self.head_dim)
++                dt_d_4d = dt_d.view(num_decodes, draft_token_num,
++                                    self.tp_nheads, self.head_dim)
++                B_d_4d = B_d.view(num_decodes, draft_token_num, self.tp_ngroups,
++                                  -1)
++                C_d_4d = C_d.view(num_decodes, draft_token_num, self.tp_ngroups,
++                                  -1)
++                out_4d = preallocated_ssm_out_d.view(num_decodes,
++                                                     draft_token_num,
++                                                     self.tp_nheads,
++                                                     self.head_dim)
++                state_batch_indices = state_indices_d[:num_decodes]
++
++                use_stochastic_rounding = (
++                    self._stochastic_rounding_for_replay
++                    if use_replay else self._stochastic_rounding_for_flashinfer)
++
++                philox_kwargs = {}
++                if use_stochastic_rounding:
++                    philox_kwargs['rand_seed'] = torch.randint(
++                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
++                    philox_kwargs['philox_rounds'] = self._philox_rounds
++
++                if use_replay:
++                    replay_selective_state_update(
++                        ssm_states,
++                        layer_cache.old_x,
++                        layer_cache.old_B,
++                        layer_cache.old_dt,
++                        layer_cache.old_dA_cumsum,
++                        layer_cache.cache_buf_idx,
++                        layer_cache.prev_num_accepted_tokens,
++                        x_d_4d,
++                        dt_d_4d,
++                        A,
++                        B_d_4d,
++                        C_d_4d,
++                        D=D,
++                        dt_bias=dt_bias,
++                        dt_softplus=self.delta_softplus,
++                        state_batch_indices=state_batch_indices,
++                        out=out_4d,
++                        launch_with_pdl=True,
++                        **philox_kwargs,
++                    )
++                elif self._use_mtp_custom_op and not use_stochastic_rounding:
++                    # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
++                    # Does not support stochastic rounding.
+                     selective_state_update_mtp_ssm_cache_trtllm(
+                         ssm_states,
+-                        x_d_mtp,
+-                        dt_d_mtp,
++                        x_d_4d,
++                        dt_d_4d,
+                         A,
+-                        B_d_mtp,
+-                        C_d_mtp,
+-                        out_mtp,
++                        B_d_4d,
++                        C_d_4d,
++                        out_4d,
+                         intermediate_ssm_states,
+                         draft_token_num,
+                         D=D,
+                         z=None,
+                         dt_bias=dt_bias,
+                         dt_softplus=True,
+-                        state_batch_indices=state_indices_d[:num_decodes],
++                        state_batch_indices=state_batch_indices,
+                         disable_state_update=True,
+                         intermediate_state_indices=intermediate_state_indices,
+                     )
+                 else:
+-                    # Build kwargs for MTP selective_state_update
+-                    mtp_kwargs = dict(
++                    # Legacy flashinfer path: contiguous copies for alignment.
++                    x_d_4d = x_d_4d.contiguous()
++                    B_d_4d = B_d_4d.contiguous()
++                    C_d_4d = C_d_4d.contiguous()
++                    self.selective_state_update_func(
++                        ssm_states,
++                        x_d_4d,
++                        dt_d_4d,
++                        A,
++                        B_d_4d,
++                        C_d_4d,
++                        D,
+                         z=None,
+                         dt_bias=dt_bias,
+                         dt_softplus=True,
+-                        state_batch_indices=state_indices_d[:num_decodes],
+-                        out=out_mtp,
++                        state_batch_indices=state_batch_indices,
++                        out=out_4d,
+                         disable_state_update=True,
+                         intermediate_states_buffer=intermediate_ssm_states,
+                         cache_steps=draft_token_num,
+                         intermediate_state_indices=intermediate_state_indices,
+-                    )
+-                    if self._use_stochastic_rounding:
+-                        mtp_kwargs['rand_seed'] = torch.randint(
+-                            0,
+-                            2**62, (1, ),
+-                            device=x_d.device,
+-                            dtype=torch.int64)
+-                        mtp_kwargs['philox_rounds'] = self._philox_rounds
+-
+-                    self.selective_state_update_func(
+-                        ssm_states,
+-                        x_d_mtp,
+-                        dt_d_mtp,
+-                        A,
+-                        B_d_mtp,
+-                        C_d_mtp,
+-                        D,
+-                        **mtp_kwargs,
++                        **philox_kwargs,
+                     )
+             else:
+-                # Build kwargs for selective_state_update
++                # Non-MTP single-token decode
++                # flashinfer needs contiguous x/B/C with 128-byte alignment.
++                x_d = x_d.contiguous()
++                B_d = B_d.contiguous()
++                C_d = C_d.contiguous()
+                 ssu_kwargs = dict(
+                     z=None,
+                     dt_bias=dt_bias,
+@@ -573,7 +593,9 @@ def convert_dt():
+                                                     self.head_dim),
+                 )
+ 
+-                if self._use_stochastic_rounding:
++                # Non-MTP decode only runs through flashinfer, no replay path.
++                use_stochastic_rounding = self._stochastic_rounding_for_flashinfer
++                if use_stochastic_rounding:
+                     ssu_kwargs['rand_seed'] = torch.randint(0,
+                                                             2**62, (1, ),
+                                                             device=x_d.device,
+diff --git a/tensorrt_llm/_torch/modules/mamba/replay_selective_state_update.py b/tensorrt_llm/_torch/modules/mamba/replay_selective_state_update.py
+new file mode 100644
+index 000000000000..c8c6a655929b
+--- /dev/null
++++ b/tensorrt_llm/_torch/modules/mamba/replay_selective_state_update.py
+@@ -0,0 +1,1047 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# Adapted from: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py
++# SPDX-FileCopyrightText: Copyright contributors to the sglang project
++#
++# Copyright (c) 2024, Tri Dao, Albert Gu.
++# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
++from tensorrt_llm._utils import get_sm_version
++
++from .softplus import softplus
++
++
++@triton.jit
++def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
++    """Stochastic rounding: fp32 pair → fp16x2 using Philox random bits.
++
++    Uses PTX cvt.rs.f16x2.f32 which rounds each fp32 value to fp16 using
++    the random bits to break ties, avoiding systematic rounding bias that
++    accumulates over many decode steps with fp16 state.
++
++    Adapted from flashinfer (Apache-2.0, vLLM/mamba lineage).
++    """
++    return tl.inline_asm_elementwise(
++        asm="""{
++        cvt.rs.f16x2.f32 $0, $2, $1, $3;
++        }""",
++        constraints=("=r,r,r,r,r"),
++        args=(x, rand),
++        dtype=tl.float16,
++        is_pure=True,
++        pack=2,
++    )
++
++
++# Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
++# old_dt, old_dA_cumsum) to the WRITE buffer slot for next step's replay.
++# Grid: (batch, nheads // HEADS_PER_BLOCK).
++
++
++@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
++@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
++@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
++@triton.jit()
++def _replay_precompute_kernel(
++    # Input pointers
++    dt_ptr,
++    dt_bias_ptr,
++    A_ptr,
++    B_ptr,
++    C_ptr,
++    # Output pointers
++    cb_scaled_ptr,
++    decay_vec_ptr,
++    # Cache WRITE pointers (write-buffer for next step)
++    old_B_ptr,
++    old_dt_ptr,
++    old_dA_cumsum_ptr,
++    # Double-buffer index (per cache slot)
++    cache_buf_idx_ptr,
++    state_batch_indices_ptr,
++    pad_slot_id,
++    # Dimensions
++    T: tl.constexpr,
++    dstate: tl.constexpr,
++    nheads_ngroups_ratio: tl.constexpr,
++    # dt strides
++    stride_dt_batch,
++    stride_dt_T,
++    stride_dt_head,
++    stride_dt_bias_head,
++    stride_A_head,
++    # B strides
++    stride_B_batch,
++    stride_B_T,
++    stride_B_group,
++    stride_B_dstate,
++    # C strides
++    stride_C_batch,
++    stride_C_T,
++    stride_C_group,
++    stride_C_dstate,
++    # cb_scaled strides
++    stride_cb_batch,
++    stride_cb_head,
++    stride_cb_t,
++    stride_cb_j,
++    # decay_vec strides
++    stride_dv_batch,
++    stride_dv_head,
++    stride_dv_t,
++    # old_B strides: (cache, 2, T, ngroups, dstate)
++    stride_old_B_cache,
++    stride_old_B_dbuf,
++    stride_old_B_T,
++    stride_old_B_group,
++    stride_old_B_dstate,
++    # old_dt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
++    stride_old_dt_cache,
++    stride_old_dt_dbuf,
++    stride_old_dt_head,
++    stride_old_dt_T,
++    # old_dA_cumsum strides: (cache, 2, nheads, T) — T contiguous for coalesced access
++    stride_old_dA_cumsum_cache,
++    stride_old_dA_cumsum_dbuf,
++    stride_old_dA_cumsum_head,
++    stride_old_dA_cumsum_T,
++    # Meta-parameters
++    DT_SOFTPLUS: tl.constexpr,
++    HAS_DT_BIAS: tl.constexpr,
++    HAS_CACHE_BATCH_INDICES: tl.constexpr,
++    BLOCK_SIZE_DSTATE: tl.constexpr,
++    BLOCK_SIZE_T: tl.constexpr,
++    LAUNCH_WITH_PDL: tl.constexpr,
++    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
++    HEADS_PER_BLOCK: tl.constexpr,
++):
++    pid_b = tl.program_id(axis=0)
++    pid_hg = tl.program_id(axis=1)  # head-group index
++    first_head = pid_hg * HEADS_PER_BLOCK
++
++    # Resolve cache index for writes
++    if HAS_CACHE_BATCH_INDICES:
++        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
++        if cache_batch_idx == pad_slot_id:
++            return
++    else:
++        cache_batch_idx = pid_b.to(tl.int64)
++
++    # Signal main kernel to start (internal PDL).  Main's replay phase
++    # reads only from the READ buffer (written by the PREVIOUS step) —
++    # safe even if conv1d and this kernel are still running.  Main's
++    # gdc_wait() gates the output phase, which reads conv1d outputs
++    # (x, C) and this kernel's outputs (cb_scaled, decay_vec).
++    if LAUNCH_DEPENDENT_KERNELS:
++        tl.extra.cuda.gdc_launch_dependents()
++
++    # Read buffer index: replay reads from buf_read.  We WRITE to 1 - buf_read
++    # for next step's replay.
++    buf_read = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
++    buf_write = 1 - buf_read
++
++    offs_t = tl.arange(0, BLOCK_SIZE_T)
++    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
++    t_mask = offs_t < T
++    n_mask = offs_n < dstate
++
++    # Causal mask is shared across all heads (depends only on offs_t)
++    causal_mask = offs_t[:, None] >= offs_t[None, :]
++    valid_mask = causal_mask & t_mask[:, None] & t_mask[None, :]
++
++    # --- Loop 1: compute per-head dt/dA_cumsum/decay BEFORE gdc_wait ---
++    # These only depend on dt (from in_proj, not conv1d) and parameters (A, dt_bias).
++    # Store to cache; will reload after the wait for CB scaling.
++    for h_local in range(HEADS_PER_BLOCK):
++        head_idx = first_head + h_local
++
++        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
++        dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
++        if HAS_DT_BIAS:
++            dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
++            dt = dt + dt_bias
++        if DT_SOFTPLUS:
++            dt = softplus(dt)
++
++        A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
++        dA_cumsum = tl.cumsum(A * dt, axis=0)
++        decay_vec = tl.exp(dA_cumsum)
++
++        # Store dt, dA_cumsum, decay_vec to cache
++        old_dt_base = (
++            old_dt_ptr
++            + cache_batch_idx * stride_old_dt_cache
++            + buf_write * stride_old_dt_dbuf
++            + head_idx * stride_old_dt_head
++        )
++        tl.store(old_dt_base + offs_t * stride_old_dt_T, dt, mask=t_mask)
++
++        old_dA_cumsum_base = (
++            old_dA_cumsum_ptr
++            + cache_batch_idx * stride_old_dA_cumsum_cache
++            + buf_write * stride_old_dA_cumsum_dbuf
++            + head_idx * stride_old_dA_cumsum_head
++        )
++        tl.store(old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, dA_cumsum, mask=t_mask)
++
++        decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
++        tl.store(decay_vec_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
++
++    # --- Wait for upstream kernel (external PDL) before loading B and C ---
++    # All dt processing above is independent of conv1d outputs.
++    if LAUNCH_WITH_PDL:
++        tl.extra.cuda.gdc_wait()
++
++    # --- Load C and B once for the group (shared across HEADS_PER_BLOCK heads) ---
++    group_idx = first_head // nheads_ngroups_ratio
++    C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
++    B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
++
++    C_all = tl.load(
++        C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
++        mask=t_mask[:, None] & n_mask[None, :],
++        other=0.0,
++    )
++    B_all = tl.load(
++        B_base + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
++        mask=t_mask[:, None] & n_mask[None, :],
++        other=0.0,
++    )
++
++    # Compute raw CB once — shared across all heads in this block
++    raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
++
++    # Store B to cache (once per group, only if this block covers the first heads)
++    if first_head % nheads_ngroups_ratio == 0:
++        old_B_base = (
++            old_B_ptr
++            + cache_batch_idx * stride_old_B_cache
++            + buf_write * stride_old_B_dbuf
++            + group_idx * stride_old_B_group
++        )
++        tl.store(
++            old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
++            B_all,
++            mask=t_mask[:, None] & n_mask[None, :],
++        )
++
++    # --- Loop 2: reload per-head dA_cumsum/dt from cache, scale CB ---
++    # The cache was just written above, so these loads should hit L2.
++    for h_local in range(HEADS_PER_BLOCK):
++        head_idx = first_head + h_local
++
++        # Reload dt and dA_cumsum from cache (just written in loop 1)
++        old_dt_base = (
++            old_dt_ptr
++            + cache_batch_idx * stride_old_dt_cache
++            + buf_write * stride_old_dt_dbuf
++            + head_idx * stride_old_dt_head
++        )
++        dt = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(tl.float32)
++
++        old_dA_cumsum_base = (
++            old_dA_cumsum_ptr
++            + cache_batch_idx * stride_old_dA_cumsum_cache
++            + buf_write * stride_old_dA_cumsum_dbuf
++            + head_idx * stride_old_dA_cumsum_head
++        )
++        dA_cumsum = tl.load(
++            old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
++        ).to(tl.float32)
++
++        # Scale raw_CB with per-head decay and dt
++        decay_matrix = tl.exp(dA_cumsum[:, None] - dA_cumsum[None, :])
++        CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt[None, :], 0.0)
++
++        cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
++        tl.store(
++            cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
++            CB_scaled,
++            mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
++        )
++
++
++# Main kernel: tl.dot replay + precomputed CB output.
++# Grid: (cdiv(dim, M), batch, nheads).
++
++
++@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
++@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
++@triton.heuristics(
++    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
++)
++@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
++@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
++@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
++@triton.jit()
++def _replay_state_update_kernel(
++    # Pointers
++    state_ptr,
++    # Cache READ pointers (read-buffer from previous step)
++    old_x_ptr,
++    old_B_ptr,
++    old_dt_ptr,
++    old_dA_cumsum_ptr,
++    # Cache WRITE pointer (write-buffer for old_x only; B/dt/dA_cumsum written by precompute)
++    prev_num_accepted_tokens_ptr,
++    cache_buf_idx_ptr,
++    # New input pointers
++    x_ptr,
++    C_ptr,
++    D_ptr,
++    z_ptr,
++    out_ptr,
++    # Precomputed pointers
++    cb_scaled_ptr,
++    decay_vec_ptr,
++    state_batch_indices_ptr,
++    # Stochastic rounding
++    rand_seed_ptr,
++    pad_slot_id,
++    # Dimensions
++    T: tl.constexpr,
++    dim: tl.constexpr,
++    dstate: tl.constexpr,
++    nheads_ngroups_ratio: tl.constexpr,
++    # state strides
++    stride_state_batch,
++    stride_state_head,
++    stride_state_dim,
++    stride_state_dstate,
++    # old_x strides: (cache, T, nheads, dim) — single-buffered
++    stride_old_x_cache,
++    stride_old_x_T,
++    stride_old_x_head,
++    stride_old_x_dim,
++    # old_B strides: (cache, 2, T, ngroups, dstate)
++    stride_old_B_cache,
++    stride_old_B_dbuf,
++    stride_old_B_T,
++    stride_old_B_group,
++    stride_old_B_dstate,
++    # old_dt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
++    stride_old_dt_cache,
++    stride_old_dt_dbuf,
++    stride_old_dt_head,
++    stride_old_dt_T,
++    # old_dA_cumsum strides: (cache, 2, nheads, T) — T contiguous for coalesced access
++    stride_old_dA_cumsum_cache,
++    stride_old_dA_cumsum_dbuf,
++    stride_old_dA_cumsum_head,
++    stride_old_dA_cumsum_T,
++    # x strides
++    stride_x_batch,
++    stride_x_T,
++    stride_x_head,
++    stride_x_dim,
++    # C strides
++    stride_C_batch,
++    stride_C_T,
++    stride_C_group,
++    stride_C_dstate,
++    # D strides
++    stride_D_head,
++    stride_D_dim,
++    # z strides
++    stride_z_batch,
++    stride_z_T,
++    stride_z_head,
++    stride_z_dim,
++    # out strides
++    stride_out_batch,
++    stride_out_T,
++    stride_out_head,
++    stride_out_dim,
++    # cb_scaled strides
++    stride_cb_batch,
++    stride_cb_head,
++    stride_cb_t,
++    stride_cb_j,
++    # decay_vec strides
++    stride_dv_batch,
++    stride_dv_head,
++    stride_dv_t,
++    # Meta
++    BLOCK_SIZE_M: tl.constexpr,
++    HAS_D: tl.constexpr,
++    HAS_Z: tl.constexpr,
++    HAS_CACHE_BATCH_INDICES: tl.constexpr,
++    BLOCK_SIZE_DSTATE: tl.constexpr,
++    BLOCK_SIZE_T: tl.constexpr,
++    LAUNCH_WITH_PDL: tl.constexpr,
++    USE_RS_ROUNDING: tl.constexpr,
++    PHILOX_ROUNDS: tl.constexpr,
++):
++    pid_m = tl.program_id(axis=0)
++    pid_b = tl.program_id(axis=1)
++    pid_h = tl.program_id(axis=2)
++
++    if HAS_CACHE_BATCH_INDICES:
++        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
++        if cache_batch_idx == pad_slot_id:
++            return
++    else:
++        cache_batch_idx = pid_b.to(tl.int64)
++
++    # Double-buffer index: buf_read points to the buffer written by LAST step's
++    # precompute.  THIS step's precompute writes to 1-buf_read, which will be
++    # read by NEXT step's main kernel.  Anything not carried between steps is
++    # single-buffered.
++    buf_read = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
++
++    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
++    offs_t = tl.arange(0, BLOCK_SIZE_T)
++    m_mask = offs_m < dim
++    n_mask = offs_n < dstate
++    t_mask = offs_t < T
++
++    # Load state
++    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
++    state_ptrs = (
++        state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
++    )
++    state_mask = m_mask[:, None] & n_mask[None, :]
++    state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
++    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
++
++    # Phase 1: Replay via tl.dot fast-forward (reads from READ buffer)
++    group_idx = pid_h // nheads_ngroups_ratio
++
++    # Load precomputed dt and dA_cumsum from READ buffer
++    old_dt_base = (
++        old_dt_ptr
++        + cache_batch_idx * stride_old_dt_cache
++        + buf_read * stride_old_dt_dbuf
++        + pid_h * stride_old_dt_head
++    )
++    old_dt_all = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(
++        tl.float32
++    )
++
++    old_dA_cumsum_base = (
++        old_dA_cumsum_ptr
++        + cache_batch_idx * stride_old_dA_cumsum_cache
++        + buf_read * stride_old_dA_cumsum_dbuf
++        + pid_h * stride_old_dA_cumsum_head
++    )
++    old_dA_cumsum_all = tl.load(
++        old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
++    ).to(tl.float32)
++
++    # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
++    # Clamp to [0, T-1] defensively — out-of-contract PNAT > T would read OOB.
++    prev_k_idx = tl.minimum(tl.maximum(prev_num_accepted_tokens - 1, 0), T - 1)
++    total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(
++        tl.float32
++    )
++
++    # Step 0 invariant: PNAT=0 means `state` is already last step's state (not
++    # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
++    # replay leaves `state` unchanged — cache contents don't matter on step 0.
++    coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
++    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
++
++    # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
++    old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
++    old_x_all = tl.load(
++        old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
++        mask=t_mask[:, None] & m_mask[None, :],
++        other=0.0,
++    )
++
++    # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
++    old_B_base = (
++        old_B_ptr
++        + cache_batch_idx * stride_old_B_cache
++        + buf_read * stride_old_B_dbuf
++        + group_idx * stride_old_B_group
++    )
++    old_B_all = tl.load(
++        old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
++        mask=t_mask[:, None] & n_mask[None, :],
++        other=0.0,
++    ).to(tl.float32)
++
++    # Scale B by coefficients
++    dB_scaled = coeff[:, None] * old_B_all
++
++    # Apply total decay to initial state FIRST, then add contributions
++    total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
++    state *= total_decay
++
++    # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
++    state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
++
++    # Write post-replay state
++    if USE_RS_ROUNDING:
++        # Stochastic rounding for fp16 state using Philox-4x32 PRNG.
++        # Each Philox call produces 4 random ints.  We call randint4x on
++        # quarter-sized dstate offsets and join+reshape to get the full
++        # (M, dstate) random tensor — 4x fewer PRNG rounds.
++        rand_seed = tl.load(rand_seed_ptr)
++        base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
++        offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
++        rand_offsets_q = (
++            base_rand
++            + offs_m[:, None] * stride_state_dim
++            + offs_n_q[None, :] * (stride_state_dstate * 4)
++        )  # (M, dstate//4)
++        if PHILOX_ROUNDS > 0:
++            r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q, PHILOX_ROUNDS)
++        else:
++            r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q)
++        # Interleave 4 quarter-sized tensors → full (M, dstate) random tensor
++        r01 = tl.join(r0, r1)  # (M, dstate//4, 2)
++        r23 = tl.join(r2, r3)  # (M, dstate//4, 2)
++        r0123 = tl.join(r01, r23)  # (M, dstate//4, 2, 2)
++        rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
++        tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
++    else:
++        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
++
++    # Phase 2: Output using precomputed CB_scaled and decay_vec
++    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
++    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
++    if HAS_Z:
++        z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
++    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
++
++    if HAS_D:
++        D = tl.load(
++            D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim, mask=m_mask, other=0.0
++        ).to(tl.float32)
++
++    # Wait for precompute kernel (PDL) before reading its outputs.
++    # With chained PDL (conv1d → precompute → main), gdc_wait() ensures
++    # precompute has completed — which transitively ensures conv1d has
++    # completed (precompute waited on conv1d via its own gdc_wait).
++    # All loads below (x, C from conv1d; CB_scaled, decay_vec from precompute)
++    # are safe after this point.
++    if LAUNCH_WITH_PDL:
++        tl.extra.cuda.gdc_wait()
++
++    # Load conv1d outputs: C_all and x_all
++    C_all = tl.load(
++        C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
++        mask=t_mask[:, None] & n_mask[None, :],
++        other=0.0,
++    )
++
++    x_all = tl.load(
++        x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
++        mask=t_mask[:, None] & m_mask[None, :],
++        other=0.0,
++    )
++    # Store new x to cache (single-buffered; replay already read the old data)
++    tl.store(
++        old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
++        x_all,
++        mask=t_mask[:, None] & m_mask[None, :],
++    )
++    x_all = x_all.to(tl.float32)
++
++    # Load precomputed CB_scaled and decay_vec
++    cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
++    CB_scaled = tl.load(
++        cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
++        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
++        other=0.0,
++    ).to(tl.float32)
++
++    decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
++    decay_vec = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(
++        tl.float32
++    )
++
++    # init_out = C_all @ state^T * decay_vec
++    init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
++
++    # cb_out = CB_scaled @ x_all
++    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
++
++    out_all = init_out + cb_out
++
++    if HAS_D:
++        out_all = out_all + x_all * D[None, :]
++
++    if HAS_Z:
++        for t in range(T):
++            z_t = tl.load(
++                z_ptr + t * stride_z_T + offs_m * stride_z_dim, mask=m_mask, other=0.0
++            ).to(tl.float32)
++            out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
++            out_t = out_t * z_t * tl.sigmoid(z_t)
++            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim, out_t, mask=m_mask)
++    else:
++        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
++        tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
++
++
++# Python wrapper
++
++
++def replay_selective_state_update(
++    state: torch.Tensor,
++    old_x: torch.Tensor,
++    old_B: torch.Tensor,
++    old_dt: torch.Tensor,
++    old_dA_cumsum: torch.Tensor,
++    cache_buf_idx: torch.Tensor,
++    prev_num_accepted_tokens: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    out: torch.Tensor,
++    D: torch.Tensor | None = None,
++    z: torch.Tensor | None = None,
++    dt_bias: torch.Tensor | None = None,
++    dt_softplus: bool = False,
++    state_batch_indices: torch.Tensor | None = None,
++    pad_slot_id: int = PAD_SLOT_ID,
++    rand_seed: torch.Tensor | None = None,
++    philox_rounds: int = 10,
++    launch_with_pdl=False,
++    use_internal_pdl=True,
++    _block_size_m: int | None = None,
++    _num_warps: int | None = None,
++    _num_stages: int | None = None,
++    _precompute_num_warps: int | None = None,
++    _precompute_num_stages: int | None = None,
++    _heads_per_block: int | None = None,
++):
++    """
++    Replay SSM state update with precomputed CB and tl.dot fast-forward.
++
++    Two-kernel architecture:
++      1. Precompute kernel: computes CB_scaled and decay_vec from B, C, dt, A.
++         Writes processed dt/dA_cumsum/B to double-buffered cache for next step.
++      2. Main kernel: replays old tokens via tl.dot fast-forward on cached data,
++         then computes output using precomputed CB_scaled and new x/C inputs.
++
++    PDL (Programmatic Dependent Launch) chain:
++      conv1d → (external PDL) → precompute → (internal PDL) → main
++      External PDL: precompute starts while conv1d is running; gdc_wait()
++        in precompute blocks until conv1d completes before loading B/C.
++      Internal PDL: main starts while precompute is running; main's replay
++        phase uses only cached data from the previous step.  gdc_wait() in
++        main blocks until precompute completes before loading conv1d outputs
++        (x, C) and precompute outputs (CB_scaled, decay_vec).
++
++    Uses double-buffered cache tensors.  cache_buf_idx[slot] indicates which
++    buffer (0 or 1) to READ from for replay.  The WRITE buffer is 1 - read.
++    Caller must flip cache_buf_idx[slot] after each call.
++
++    Arguments:
++        state: (cache, nheads, dim, dstate) in-place.  After the call, contains
++            the state after replaying prev_num_accepted_tokens old tokens.
++        old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
++        old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
++        old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
++        old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
++        cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
++        prev_num_accepted_tokens: (cache,) int32.
++        x: (batch, T, nheads, dim) new token inputs.
++        dt: (batch, T, nheads, dim) with stride(-1)==0 (tie_hdim).
++        A: (nheads, dim, dstate) with stride(-1)==0, stride(-2)==0 (tie_hdim).
++        B: (batch, T, ngroups, dstate).
++        C: (batch, T, ngroups, dstate).
++        out: (batch, T, nheads, dim) preallocated output.
++        D: (nheads, dim) optional feed-through parameter.
++        z: (batch, T, nheads, dim) optional silu gate.
++        dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
++        state_batch_indices: (batch,) optional cache slot mapping.
++        rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
++            When provided, state is stochastically rounded to fp16 on store.
++            When None, standard deterministic rounding is used.
++        philox_rounds: number of Philox PRNG rounds (default 10).
++        launch_with_pdl: enable external PDL (conv1d → precompute chain).
++            Defaults False; caller opts in when the upstream chain is PDL-safe.
++            Ignored on hardware that doesn't support PDL (sm < 90).
++        use_internal_pdl: enable internal PDL (precompute → main overlap).
++            Defaults True; override for testing only.
++            Ignored on hardware that doesn't support PDL (sm < 90).
++
++        _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
++        _precompute_num_warps, _precompute_num_stages, _heads_per_block) are
++        benchmark-only overrides; production callers should leave them None
++        to use the heuristic-tuned defaults.
++    """
++    # PDL needs sm >= 90.
++    if get_sm_version() < 90:
++        launch_with_pdl = False
++        use_internal_pdl = False
++
++    # --- Unsqueeze inputs to canonical shapes ---
++    if state.dim() == 3:
++        state = state.unsqueeze(1)
++    if x.dim() == 2:
++        x = x.unsqueeze(1)
++    if x.dim() == 3:
++        x = x.unsqueeze(1)
++    if dt.dim() == 2:
++        dt = dt.unsqueeze(1)
++    if dt.dim() == 3:
++        dt = dt.unsqueeze(1)
++    if A.dim() == 2:
++        A = A.unsqueeze(0)
++    if B.dim() == 2:
++        B = B.unsqueeze(1)
++    if B.dim() == 3:
++        B = B.unsqueeze(1)
++    if C.dim() == 2:
++        C = C.unsqueeze(1)
++    if C.dim() == 3:
++        C = C.unsqueeze(1)
++    if D is not None and D.dim() == 1:
++        D = D.unsqueeze(0)
++    if z is not None:
++        if z.dim() == 2:
++            z = z.unsqueeze(1)
++        if z.dim() == 3:
++            z = z.unsqueeze(1)
++    if dt_bias is not None and dt_bias.dim() == 1:
++        dt_bias = dt_bias.unsqueeze(0)
++    if out.dim() == 2:
++        out = out.unsqueeze(1)
++    if out.dim() == 3:
++        out = out.unsqueeze(1)
++
++    cache_size, nheads, dim, dstate = state.shape
++    batch, T, _, _ = x.shape
++    ngroups = B.shape[2]
++    assert nheads % ngroups == 0
++
++    assert x.shape == (batch, T, nheads, dim)
++    assert dt.shape == x.shape
++    assert A.shape == (nheads, dim, dstate)
++    assert B.shape == (batch, T, ngroups, dstate)
++    assert C.shape == B.shape
++    assert old_x.shape == (cache_size, T, nheads, dim)
++    assert old_B.shape == (cache_size, 2, T, ngroups, dstate)
++    assert old_dt.shape == (cache_size, 2, nheads, T)
++    assert old_dA_cumsum.shape == (cache_size, 2, nheads, T)
++    assert cache_buf_idx.shape == (cache_size,)
++    assert prev_num_accepted_tokens.shape == (cache_size,)
++
++    tie_hdim = (
++        A.stride(-1) == 0
++        and A.stride(-2) == 0
++        and dt.stride(-1) == 0
++        and (dt_bias is None or dt_bias.stride(-1) == 0)
++    )
++    assert tie_hdim
++
++    device = x.device
++    BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
++
++    # Allocate precomputed intermediates (per-call, not cached)
++    cb_scaled = torch.empty(
++        batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_T, device=device, dtype=torch.float32
++    )
++    decay_vec = torch.empty(batch, nheads, BLOCK_SIZE_T, device=device, dtype=torch.float32)
++
++    z_strides = (
++        (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
++    )
++
++    # Kernel tuning: BLOCK_SIZE_M, num_warps, HEADS_PER_BLOCK, precompute_num_warps.
++    # Dtype-aware heuristic from B200 sweeps (batch 1-512, T=6/32, TP=8, conv1d +
++    # chained PDL).  Keyed on total_heads, BLOCK_SIZE_T, and state dtype; 16-bit
++    # states prefer different tiles from fp32 due to lower bandwidth.  Philox
++    # gets its own branch — stochastic rounding shifts compute toward CUDA cores,
++    # so small-batch configs want more warps to hide the extra work.
++    total_heads = batch * nheads
++    heads_per_group = nheads // ngroups
++    state_is_16bit = state.dtype in (torch.float16, torch.bfloat16)
++    use_philox = rand_seed is not None
++    if BLOCK_SIZE_T <= 16:
++        if use_philox and state_is_16bit:
++            # Philox: more warps at small batch to hide CUDA core work.
++            # At large batch, converges to non-Philox fp16 config.
++            if total_heads <= 16:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 4, 4, 4, 1
++            elif total_heads <= 512:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
++            else:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
++        elif state_is_16bit:
++            if total_heads <= 16:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 4, 1
++            elif total_heads <= 64:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
++            elif total_heads <= 256:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 2, 1
++            elif total_heads <= 512:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    32,
++                    1,
++                    1,
++                    min(2, heads_per_group),
++                )
++            else:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
++        else:  # fp32 state (no Philox — fp32 doesn't need stochastic rounding)
++            if total_heads <= 32:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
++            elif total_heads <= 64:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
++            elif total_heads <= 128:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 2, 2, 1
++            elif total_heads <= 256:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
++            elif total_heads <= 512:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    64,
++                    2,
++                    2,
++                    min(2, heads_per_group),
++                )
++            else:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
++    else:  # T > 16
++        if state_is_16bit:
++            if total_heads <= 128:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
++            elif total_heads <= 256:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    16,
++                    1,
++                    4,
++                    min(2, heads_per_group),
++                )
++            elif total_heads <= 512:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    32,
++                    1,
++                    1,
++                    min(4, heads_per_group),
++                )
++            else:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    32,
++                    1,
++                    4,
++                    min(2, heads_per_group),
++                )
++        else:  # fp32 state
++            if total_heads <= 128:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
++            elif total_heads <= 256:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    32,
++                    2,
++                    4,
++                    min(2, heads_per_group),
++                )
++            elif total_heads <= 512:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    64,
++                    2,
++                    2,
++                    min(4, heads_per_group),
++                )
++            else:
++                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
++                    64,
++                    2,
++                    4,
++                    min(2, heads_per_group),
++                )
++    if _block_size_m is not None:
++        BLOCK_SIZE_M = _block_size_m
++    if _num_warps is not None:
++        num_warps = _num_warps
++    if _heads_per_block is not None:
++        heads_per_block = _heads_per_block
++    if _precompute_num_warps is not None:
++        precompute_num_warps = _precompute_num_warps
++
++    HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
++
++    with torch.cuda.device(device.index):
++        # --- Precompute kernel ---
++        assert nheads % heads_per_block == 0, (
++            f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
++        )
++        assert heads_per_block <= heads_per_group, (
++            f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
++        )
++        _replay_precompute_kernel[(batch, nheads // heads_per_block)](
++            dt,
++            dt_bias,
++            A,
++            B,
++            C,
++            cb_scaled,
++            decay_vec,
++            old_B,
++            old_dt,
++            old_dA_cumsum,
++            cache_buf_idx,
++            state_batch_indices,
++            pad_slot_id,
++            T,
++            dstate,
++            nheads // ngroups,
++            # dt strides
++            dt.stride(0),
++            dt.stride(1),
++            dt.stride(2),
++            dt_bias.stride(0) if dt_bias is not None else 0,
++            A.stride(0),
++            # B strides
++            B.stride(0),
++            B.stride(1),
++            B.stride(2),
++            B.stride(3),
++            # C strides
++            C.stride(0),
++            C.stride(1),
++            C.stride(2),
++            C.stride(3),
++            # cb_scaled strides
++            cb_scaled.stride(0),
++            cb_scaled.stride(1),
++            cb_scaled.stride(2),
++            cb_scaled.stride(3),
++            # decay_vec strides
++            decay_vec.stride(0),
++            decay_vec.stride(1),
++            decay_vec.stride(2),
++            # old_B strides
++            old_B.stride(0),
++            old_B.stride(1),
++            old_B.stride(2),
++            old_B.stride(3),
++            old_B.stride(4),
++            # old_dt strides
++            old_dt.stride(0),
++            old_dt.stride(1),
++            old_dt.stride(2),
++            old_dt.stride(3),
++            # old_dA_cumsum strides
++            old_dA_cumsum.stride(0),
++            old_dA_cumsum.stride(1),
++            old_dA_cumsum.stride(2),
++            old_dA_cumsum.stride(3),
++            dt_softplus,
++            HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
++            LAUNCH_WITH_PDL=launch_with_pdl,
++            LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
++            HEADS_PER_BLOCK=heads_per_block,
++            num_warps=precompute_num_warps,
++            **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
++            launch_pdl=launch_with_pdl,
++        )
++
++        # --- Main kernel ---
++        def grid(META):
++            return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
++
++        _replay_state_update_kernel[grid](
++            state,
++            old_x,
++            old_B,
++            old_dt,
++            old_dA_cumsum,
++            prev_num_accepted_tokens,
++            cache_buf_idx,
++            x,
++            C,
++            D,
++            z,
++            out,
++            cb_scaled,
++            decay_vec,
++            state_batch_indices,
++            rand_seed,
++            pad_slot_id,
++            T,
++            dim,
++            dstate,
++            nheads // ngroups,
++            # state strides
++            state.stride(0),
++            state.stride(1),
++            state.stride(2),
++            state.stride(3),
++            # old_x strides (single-buffered: cache, T, nheads, dim)
++            old_x.stride(0),
++            old_x.stride(1),
++            old_x.stride(2),
++            old_x.stride(3),
++            # old_B strides
++            old_B.stride(0),
++            old_B.stride(1),
++            old_B.stride(2),
++            old_B.stride(3),
++            old_B.stride(4),
++            # old_dt strides
++            old_dt.stride(0),
++            old_dt.stride(1),
++            old_dt.stride(2),
++            old_dt.stride(3),
++            # old_dA_cumsum strides
++            old_dA_cumsum.stride(0),
++            old_dA_cumsum.stride(1),
++            old_dA_cumsum.stride(2),
++            old_dA_cumsum.stride(3),
++            # x strides
++            x.stride(0),
++            x.stride(1),
++            x.stride(2),
++            x.stride(3),
++            # C strides
++            C.stride(0),
++            C.stride(1),
++            C.stride(2),
++            C.stride(3),
++            # D strides
++            *(D.stride(0), D.stride(1)) if D is not None else (0, 0),
++            # z strides
++            z_strides[0],
++            z_strides[1],
++            z_strides[2],
++            z_strides[3],
++            # out strides
++            out.stride(0),
++            out.stride(1),
++            out.stride(2),
++            out.stride(3),
++            # cb_scaled strides
++            cb_scaled.stride(0),
++            cb_scaled.stride(1),
++            cb_scaled.stride(2),
++            cb_scaled.stride(3),
++            # decay_vec strides
++            decay_vec.stride(0),
++            decay_vec.stride(1),
++            decay_vec.stride(2),
++            BLOCK_SIZE_M,
++            LAUNCH_WITH_PDL=use_internal_pdl,
++            PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
++            num_warps=num_warps,
++            **({"num_stages": _num_stages} if _num_stages else {}),
++            launch_pdl=use_internal_pdl,
++        )
+diff --git a/tensorrt_llm/_torch/modules/mamba/selective_state_update.py b/tensorrt_llm/_torch/modules/mamba/selective_state_update.py
+index d2d0e12bf54d..52818dcef000 100644
+--- a/tensorrt_llm/_torch/modules/mamba/selective_state_update.py
++++ b/tensorrt_llm/_torch/modules/mamba/selective_state_update.py
+@@ -24,6 +24,7 @@
+ import triton.language as tl
+ 
+ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
++from tensorrt_llm._utils import get_sm_version
+ 
+ from .softplus import softplus
+ 
+@@ -332,7 +333,12 @@ def selective_state_update(
+         launch_with_pdl: If True, launch with Programmatic Dependent Launch.
+             Requires all inputs other than x, B, and C to already be available.
+             Allows addressing math and state loading to overlap with the prior kernel.
++            Ignored on hardware that doesn't support PDL (sm < 90).
+     """
++    # PDL needs sm >= 90.
++    if get_sm_version() < 90:
++        launch_with_pdl = False
++
+     if state.dim() == 3:
+         state = state.unsqueeze(1)
+     if x.dim() == 2:
+diff --git a/tensorrt_llm/_torch/pyexecutor/_util.py b/tensorrt_llm/_torch/pyexecutor/_util.py
+index e0254ee7783b..db99d1ee172b 100644
+--- a/tensorrt_llm/_torch/pyexecutor/_util.py
++++ b/tensorrt_llm/_torch/pyexecutor/_util.py
+@@ -8,7 +8,7 @@
+ from tensorrt_llm._torch.model_config import ModelConfig
+ from tensorrt_llm._torch.models.modeling_utils import \
+     MODEL_CLASS_VISION_ENCODER_MAPPING
+-from tensorrt_llm._utils import (confidential_compute_enabled,
++from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
+                                  str_dtype_to_binding, torch_dtype_to_str)
+ from tensorrt_llm.bindings.executor import DecodingMode
+ 
+@@ -1030,6 +1030,44 @@ def _create_kv_cache_manager(
+                     full_attention_layer_mask.extend([True] * num_spec_layers)
+                     mamba_layer_mask.extend([False] * num_spec_layers)
+                     num_full_attention_layers += num_spec_layers
++        # Replay state update kernel for MTP: default on for sm >= 80; gates
++        # below disable it for incompatible feature combinations.  Cpp cache
++        # manager doesn't expose use_replay_state_update, so the wrapper
++        # property's getattr default keeps replay off there automatically.
++        sm = get_sm_version()
++        ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
++                           if quant_config is not None else None)
++        stochastic_rounding = getattr(
++            quant_config, 'mamba_ssm_stochastic_rounding',
++            False) if quant_config is not None else False
++
++        use_replay = sm >= 80
++
++        # Block reuse (prefix caching): replay leaves SSM state at a
++        # checkpoint after speculation. The next decode step replays forward
++        # to correct it. If block reuse feeds that stale state into a new
++        # prefill, the correction never happens.
++        if kv_cache_config.enable_block_reuse:
++            logger.info("Replay kernel incompatible with block reuse "
++                        "(stale SSM state); using legacy MTP path")
++            use_replay = False
++
++        # Tree attention: replay assumes linear token sequence.
++        if (spec_config is not None
++                and (getattr(spec_config, 'eagle_choices', None) is not None
++                     or getattr(spec_config, 'use_dynamic_tree', False))):
++            logger.info("Replay kernel incompatible with tree attention; "
++                        "using legacy MTP path")
++            use_replay = False
++
++        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
++        # Flashinfer has a SW fallback at any SM.
++        if (stochastic_rounding and ssm_cache_dtype == torch.float16
++                and sm < 100):
++            logger.info("Replay kernel Philox requires sm >= 100; "
++                        "using legacy MTP path for stochastic rounding support")
++            use_replay = False
++
+         kv_cache_manager = kv_cache_manager_cls(
+             # mamba cache parameters
+             config.ssm_state_size,
+@@ -1059,6 +1097,7 @@ def _create_kv_cache_manager(
+             is_estimating_kv_cache=estimating_kv_cache,
+             execution_stream=execution_stream,
+             model_type="nemotron_hybrid",
++            use_replay_state_update=use_replay,
+         )
+     elif is_qwen3_hybrid(config):
+         if max_beam_width > 1:
+diff --git a/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py b/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py
+index b7be1160b505..165315068f64 100644
+--- a/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py
++++ b/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py
+@@ -225,19 +225,49 @@ class PythonMambaCacheManager(BaseResourceManager):
+     class State:
+         """Base state container for Mamba cache."""
+         conv: torch.Tensor
++        # Represents last state, or "two back" if prev_num_accepted_tokens is > 0
+         temporal: torch.Tensor
+ 
++        # Subclasses override to list fields shared across layers (not indexed by layer).
++        _SHARED_FIELDS = frozenset()
++
+         def at_layer_idx(self, layer: int):
+             kwargs = {}
+             for k, v in vars(self).items():
+-                kwargs[k] = v[layer]
++                if v is None:
++                    kwargs[k] = None
++                elif k in self._SHARED_FIELDS:
++                    kwargs[k] = v
++                else:
++                    kwargs[k] = v[layer]
+             return type(self)(**kwargs)
+ 
+     @dataclass(frozen=True, kw_only=True)
+     class SpeculativeState(State):
+-        """Speculative state with intermediate states for draft tokens."""
+-        intermediate_ssm: torch.Tensor
+-        intermediate_conv_window: torch.Tensor
++        """Speculative state with intermediate states for draft tokens.
++
++        Supports two SSM update paths (only one set of tensors is allocated):
++        - Legacy: caches full intermediate SSM states (intermediate_ssm)
++        - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
++        """
++        _SHARED_FIELDS = frozenset(
++            {"prev_num_accepted_tokens", "cache_buf_idx"})
++
++        intermediate_conv_window: torch.Tensor  # always allocated
++
++        # Legacy path: full intermediate SSM states at each step
++        intermediate_ssm: torch.Tensor | None = None
++
++        # Replay path: compact double-buffered cache
++        # prev_num_accepted_tokens: # accepted tokens (always >= 1 if drafting).
++        # 0 means temporal saved state is actually the last state, not two back.
++        prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
++        cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
++        old_x: torch.Tensor | None = None  # (layers, cache, T, nheads, dim)
++        old_B: torch.Tensor | None = None  # (layers, cache, 2, T, ngroups, dstate)
++        # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
++        old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
++        old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
+ 
+     def __init__(
+         self,
+@@ -255,11 +285,13 @@ def __init__(
+         layer_mask: Optional[List[bool]] = None,
+         speculative_num_draft_tokens: Optional[int] = None,
+         model_type: str = "nemotron_hybrid",
++        use_replay_state_update: bool = False,
+     ) -> None:
+ 
+         self.mamba_ssm_cache_dtype = ssm_cache_dtype
+         self.speculative_num_draft_tokens = speculative_num_draft_tokens
+         self.spec_state_size = spec_state_size
++        self._use_replay_state_update = use_replay_state_update
+ 
+         # get tp size
+         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+@@ -278,6 +310,7 @@ def __init__(
+         ng_ds_local = n_groups * d_state // tp_size
+         conv_dim = conv_dim // tp_size
+         nheads = nheads // tp_size
++        d_inner = d_inner // tp_size
+ 
+         # Per-section dims for conv_state.
+         # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
+@@ -321,36 +354,89 @@ def __init__(
+ 
+         # create state container
+         if speculative_num_draft_tokens is not None:
++            T = speculative_num_draft_tokens + 1
+ 
+-            # Cache intermediate SSM states per draft token(include new sampled token) during target model verification phase
+-            intermediate_ssm_states = torch.zeros(
+-                size=(num_local_layers, self.spec_state_size,
+-                      speculative_num_draft_tokens + 1) + ssm_state_shape,
+-                dtype=self.mamba_ssm_cache_dtype,
+-                device=device,
+-            )
+-
+-            # Cache intermediate conv windows per draft token(include new sampled token) during target model verification phase
++            # Conv intermediate cache — same for both paths
+             intermediate_conv_window_cache = torch.zeros(
+-                size=(num_local_layers, self.spec_state_size,
+-                      speculative_num_draft_tokens + 1) + conv_state_shape,
++                size=(num_local_layers, self.spec_state_size, T) +
++                conv_state_shape,
+                 dtype=dtype,
+                 device=device,
+             )
+ 
++            # SSM speculative cache — path-specific tensors
++            spec_kwargs = {}
++            if self._use_replay_state_update:
++                assert n_groups % tp_size == 0, \
++                    "replay state update requires n_groups divisible by tp_size"
++                n_groups_per_rank = n_groups // tp_size
++
++                # Compact replay cache.
++                # old_x is single-buffered (written by main kernel after replay).
++                # old_B, old_dt, old_dA_cumsum are double-buffered (written by
++                # precompute kernel concurrently with main kernel via PDL).
++                spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
++                    max_batch_size, dtype=int, device=device)
++                spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
++                                                           dtype=torch.int32,
++                                                           device=device)
++                spec_kwargs['old_x'] = torch.zeros(num_local_layers,
++                                                   max_batch_size,
++                                                   T,
++                                                   nheads,
++                                                   head_dim,
++                                                   dtype=dtype,
++                                                   device=device)
++                spec_kwargs['old_B'] = torch.zeros(num_local_layers,
++                                                   max_batch_size,
++                                                   2,
++                                                   T,
++                                                   n_groups_per_rank,
++                                                   d_state,
++                                                   dtype=dtype,
++                                                   device=device)
++                spec_kwargs['old_dt'] = torch.zeros(num_local_layers,
++                                                    max_batch_size,
++                                                    2,
++                                                    nheads,
++                                                    T,
++                                                    dtype=torch.float32,
++                                                    device=device)
++                spec_kwargs['old_dA_cumsum'] = torch.zeros(num_local_layers,
++                                                           max_batch_size,
++                                                           2,
++                                                           nheads,
++                                                           T,
++                                                           dtype=torch.float32,
++                                                           device=device)
++                ssm_spec_cache = [
++                    spec_kwargs['old_x'], spec_kwargs['old_B'],
++                    spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']
++                ]
++                spec_path_label = "replay"
++            else:
++                # Legacy: full intermediate SSM states at each step
++                spec_kwargs['intermediate_ssm'] = torch.zeros(
++                    size=(num_local_layers, self.spec_state_size, T) +
++                    ssm_state_shape,
++                    dtype=self.mamba_ssm_cache_dtype,
++                    device=device)
++                ssm_spec_cache = [spec_kwargs['intermediate_ssm']]
++                spec_path_label = "legacy"
++
+             self.mamba_cache = self.SpeculativeState(
+                 conv=conv_states,
+                 temporal=ssm_states,
+-                intermediate_ssm=intermediate_ssm_states,
+                 intermediate_conv_window=intermediate_conv_window_cache,
++                **spec_kwargs,
+             )
+ 
+             logger.info(
+-                f"Mamba Cache is allocated. "
++                f"Mamba Cache ({spec_path_label}) is allocated. "
+                 f"max_mamba_cache_size: {max_batch_size}, "
+                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
+                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
+-                f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_states) / GB:.2f}GB, "
++                f"ssm_spec_cache size: {get_tensor_size_bytes(ssm_spec_cache) / GB:.2f}GB, "
+                 f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
+             )
+         else:
+@@ -397,6 +483,9 @@ def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
+                 raise RuntimeError("run out of mamba cache blocks")
+             block = self.mamba_cache_free_blocks.pop()
+             self.mamba_cache_index[r] = block
++            if (isinstance(self.mamba_cache, self.SpeculativeState)
++                    and self._use_replay_state_update):
++                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+ 
+     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+         context_ids = [
+@@ -475,21 +564,34 @@ def mamba_layer_cache(self,
+     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+         return self.mamba_ssm_cache_dtype
+ 
++    @property
++    def use_replay_state_update(self) -> bool:
++        return self._use_replay_state_update
++
+     def shutdown(self):
+         """Release tensor memory."""
+         # Clear mamba cache states
++        empty = torch.tensor([])
++
++        def _drop(tensor):
++            return empty if tensor is not None else None
++
+         if isinstance(self.mamba_cache, self.SpeculativeState):
+             self.mamba_cache = self.SpeculativeState(
+-                conv=torch.tensor([]),
+-                temporal=torch.tensor([]),
+-                intermediate_ssm=torch.tensor([]),
+-                intermediate_conv_window=torch.tensor([]),
++                conv=empty,
++                temporal=empty,
++                intermediate_conv_window=empty,
++                intermediate_ssm=_drop(self.mamba_cache.intermediate_ssm),
++                prev_num_accepted_tokens=_drop(
++                    self.mamba_cache.prev_num_accepted_tokens),
++                cache_buf_idx=_drop(self.mamba_cache.cache_buf_idx),
++                old_x=_drop(self.mamba_cache.old_x),
++                old_B=_drop(self.mamba_cache.old_B),
++                old_dt=_drop(self.mamba_cache.old_dt),
++                old_dA_cumsum=_drop(self.mamba_cache.old_dA_cumsum),
+             )
+         else:
+-            self.mamba_cache = self.State(
+-                conv=torch.tensor([]),
+-                temporal=torch.tensor([]),
+-            )
++            self.mamba_cache = self.State(conv=empty, temporal=empty)
+ 
+         torch.cuda.empty_cache()
+ 
+@@ -503,19 +605,28 @@ def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+         num_accepted_draft_tokens = num_accepted_tokens[
+             num_contexts:num_contexts + num_gens] - 1
+         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
++        src_state_indices = self.intermediate_state_indices[:num_gens]
+ 
++        if self._use_replay_state_update:
++            # SSM state is handled incrementally by the kernel.  Update the
++            # number of accepted tokens and flip the double-buffer index so the
++            # next step's replay reads from the buffer that was just written by
++            # the precompute kernel.
++            self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
++                num_accepted_tokens[num_contexts:num_contexts + num_gens]
++            self.mamba_cache.cache_buf_idx[state_indices_d] = \
++                1 - self.mamba_cache.cache_buf_idx[state_indices_d]
++        else:
++            # Legacy: copy accepted SSM state from intermediate cache.
++            ssm_states = self.mamba_cache.temporal
++            intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
++            accepted_ssm_state = intermediate_ssm_cache[:, src_state_indices,
++                                                        num_accepted_draft_tokens]
++            ssm_states[:, state_indices_d, :] = accepted_ssm_state
++
++        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
+         conv_states = self.mamba_cache.conv
+-        ssm_states = self.mamba_cache.temporal
+-
+-        intermediate_state_cache = self.mamba_cache.intermediate_ssm
+         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
+-
+-        src_state_indices = self.intermediate_state_indices[:num_gens]
+-
+-        accepted_ssm_state = intermediate_state_cache[:, src_state_indices,
+-                                                      num_accepted_draft_tokens]
+-        ssm_states[:, state_indices_d, :] = accepted_ssm_state
+-
+         accepted_conv_state = intermediate_conv_window_cache[:,
+                                                              src_state_indices,
+                                                              num_accepted_draft_tokens]
+@@ -545,6 +656,7 @@ def __init__(
+         stream: Optional[torch.cuda.Stream] = None,
+         speculative_num_draft_tokens: Optional[int] = None,
+         model_type: str = "nemotron_hybrid",
++        use_replay_state_update: bool = False,
+     ) -> None:
+         max_num_sequences = max_batch_size * mapping.pp_size
+         self._use_cpp = use_cpp_mamba_cache_manager()
+@@ -582,6 +694,7 @@ def __init__(
+                 layer_mask=layer_mask,
+                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+                 model_type=model_type,
++                use_replay_state_update=use_replay_state_update,
+             )
+ 
+     def get_max_resource_count(self) -> int:
+@@ -625,6 +738,10 @@ def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+         return self._impl.get_mamba_ssm_cache_dtype()
+ 
++    @property
++    def use_replay_state_update(self) -> bool:
++        return getattr(self._impl, 'use_replay_state_update', False)
++
+     def get_intermediate_ssm_states(self,
+                                     layer_idx: int) -> Optional[torch.Tensor]:
+         assert not self._use_cpp, "get_intermediate_ssm_states is not supported in CppMambaCacheManager"
+@@ -702,6 +819,7 @@ def __init__(
+         is_estimating_kv_cache: bool = False,
+         execution_stream: Optional[torch.cuda.Stream] = None,
+         model_type: str = "nemotron_hybrid",
++        use_replay_state_update: bool = False,
+     ) -> None:
+ 
+         # mamba hybrid cache requires block reuse to be disabled in KV cache config
+@@ -732,6 +850,7 @@ def __init__(
+             speculative_num_draft_tokens=(spec_config.max_draft_len
+                                           if spec_config is not None else None),
+             model_type=model_type,
++            use_replay_state_update=use_replay_state_update,
+         )
+ 
+         # initialize kv cache manager
+diff --git a/tests/unittest/_torch/modules/mamba/benchmark_replay_selective_state_update.py b/tests/unittest/_torch/modules/mamba/benchmark_replay_selective_state_update.py
+new file mode 100644
+index 000000000000..a755579a8600
+--- /dev/null
++++ b/tests/unittest/_torch/modules/mamba/benchmark_replay_selective_state_update.py
+@@ -0,0 +1,1044 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Standalone benchmark for replay_selective_state_update (Triton kernel).
++
++Suitable for nsight-compute (ncu) and nsight-systems (nsys) capture.
++
++Fixed model config: NVIDIA-Nemotron-3-Super-120B-A12B at TP=8
++  nheads=16, head_dim=64, d_state=128, ngroups=1
++
++mtp_len is the per-request sequence length processed by replay: in MTP it
++equals num_draft_tokens + 1 target token, so --mtp-lengths 6 models 5 drafts
+++ 1 target.
++
++Baseline kernel (--baseline [triton|flashinfer]):
++  Calls selective_state_update with T=mtp_len tokens and disable_state_update=True,
++  matching the MTP scoring pass in mamba2_mixer.py exactly.
++
++Example usage:
++  # Basic sweep
++  python benchmark_replay_selective_state_update.py \\
++      --batch-sizes 1,2,4 --mtp-lengths 1,4,8 --warmup 5 --iters 20
++
++  # With CUDA graph (default) and Triton baseline:
++  python benchmark_replay_selective_state_update.py --baseline \\
++      --batch-sizes 1,2,4 --mtp-lengths 5,10,20
++
++  # nsys capture (NVTX ranges visible in timeline)
++  nsys profile --capture-range=cudaProfilerApi \\
++      python benchmark_replay_selective_state_update.py --profile
++
++  # ncu capture
++  ncu --target-processes all \\
++      python benchmark_replay_selective_state_update.py --profile \\
++          --batch-sizes 1 --mtp-lengths 4 --warmup 5 --iters 5
++"""
++
++import argparse
++import importlib
++import itertools
++import os
++import statistics
++import sys
++from datetime import datetime
++from pathlib import Path
++
++import torch
++from einops import repeat
++
++
++def _import_mamba_kernels_fast():
++    """Load kernel modules directly (~40s faster than a full tensorrt_llm init).
++    Use --full-import as the fallback if module dependencies change.
++
++    Strategy: stub the parent packages (tensorrt_llm, tensorrt_llm._torch,
++    tensorrt_llm._torch.modules) in sys.modules with __path__ set, but do
++    NOT execute their __init__.py.  Then load the leaf kernel modules.
++    When a kernel body imports e.g. tensorrt_llm._utils.get_sm_version,
++    Python's machinery resolves it against our stub's __path__ and loads
++    only _utils.py — skipping the heavy tensorrt_llm package init.
++    """
++    import types
++
++    repo_root = Path(__file__).resolve().parents[5]
++    trtllm_dir = repo_root / "tensorrt_llm"
++    mamba_pkg = "tensorrt_llm._torch.modules.mamba"
++    mamba_dir = trtllm_dir / "_torch" / "modules" / "mamba"
++
++    def _stub_pkg(fqn: str, pkg_dir: Path):
++        """Register a stub package in sys.modules without running its
++        __init__.py.  Sets __path__ so Python can resolve submodule imports
++        against the real directory on disk."""
++        if fqn in sys.modules:
++            return
++        stub = types.ModuleType(fqn)
++        stub.__path__ = [str(pkg_dir)]
++        sys.modules[fqn] = stub
++
++    # Stub the parent chain so `from tensorrt_llm._utils import ...` (and
++    # similar) work without triggering tensorrt_llm/__init__.py.
++    _stub_pkg("tensorrt_llm", trtllm_dir)
++    _stub_pkg("tensorrt_llm._torch", trtllm_dir / "_torch")
++    _stub_pkg("tensorrt_llm._torch.modules", trtllm_dir / "_torch" / "modules")
++
++    def _load(mod_name: str, file_name: str):
++        fqn = f"{mamba_pkg}.{mod_name}" if mod_name else mamba_pkg
++        if fqn in sys.modules:
++            return sys.modules[fqn]
++        spec = importlib.util.spec_from_file_location(
++            fqn,
++            mamba_dir / file_name,
++            submodule_search_locations=[str(mamba_dir)] if file_name == "__init__.py" else [],
++        )
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules[fqn] = mod
++        spec.loader.exec_module(mod)
++        return mod
++
++    # 1. Package __init__ (defines PAD_SLOT_ID = -1)
++    _load("", "__init__.py")
++    # 2. softplus helper (used by both kernel modules)
++    _load("softplus", "softplus.py")
++    # 3. The actual kernels
++    replay_mod = _load("replay_selective_state_update", "replay_selective_state_update.py")
++    base_mod = _load("selective_state_update", "selective_state_update.py")
++    conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
++
++    return (
++        replay_mod.replay_selective_state_update,
++        base_mod.selective_state_update,
++        conv1d_mod.causal_conv1d_update,
++    )
++
++
++def _import_mamba_kernels_full():
++    """Import via the standard tensorrt_llm package (slow but safe)."""
++    from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import causal_conv1d_update
++    from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
++        replay_selective_state_update,
++    )
++    from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
++
++    return replay_selective_state_update, selective_state_update, causal_conv1d_update
++
++
++# Use fast import by default; --full-import parsed later but we need the
++# functions at module level.  Check sys.argv early.
++if "--full-import" in sys.argv:
++    replay_selective_state_update, selective_state_update, causal_conv1d_update = (
++        _import_mamba_kernels_full()
++    )
++else:
++    try:
++        replay_selective_state_update, selective_state_update, causal_conv1d_update = (
++            _import_mamba_kernels_fast()
++        )
++    except Exception as e:  # noqa: BLE001 - exit loudly; don't hide a fast-import regression
++        print(
++            f"ERROR: fast import failed ({type(e).__name__}: {e})\n"
++            "Re-run with --full-import for the slow but stable path, "
++            "then file a bug or fix _import_mamba_kernels_fast.",
++            file=sys.stderr,
++        )
++        sys.exit(1)
++
++# Model config defaults (Nemotron-3-Super-120B full model).
++# --tp-size divides nheads and ngroups to get the per-GPU slice.
++#   TP=1: nheads=128, ngroups=8
++#   TP=4: nheads=32,  ngroups=2
++#   TP=8: nheads=16,  ngroups=1  (default)
++NHEADS = 128
++HEAD_DIM = 64
++D_STATE = 128
++NGROUPS = 8
++TP_SIZE = 8  # default; overridden by --tp-size
++
++# L2 flush buffer: ~128 MB — larger than L2 on A100/H100/B200
++_L2_FLUSH_SIZE = 32 * 1024 * 1024  # float32 elements → 128 MB
++_l2_flush: torch.Tensor | None = None
++
++
++def _init_l2_flush() -> None:
++    global _l2_flush
++    _l2_flush = torch.empty(_L2_FLUSH_SIZE, dtype=torch.float32, device="cuda")
++
++
++def _flush_l2() -> None:
++    """Evict L2 by writing to a large buffer then synchronising."""
++    assert _l2_flush is not None
++    _l2_flush.fill_(0.0)
++    torch.cuda.synchronize()
++
++
++# Tensor construction helpers
++
++
++def _build_tensors(
++    batch: int,
++    mtp_len: int,
++    state_dtype: torch.dtype,
++    act_dtype: torch.dtype,
++    nheads: int,
++    head_dim: int,
++    d_state: int,
++    ngroups: int,
++):
++    """
++    Build all tensors for one benchmark configuration.
++
++    nheads/ngroups are already TP-split (i.e. full_nheads // tp_size).
++
++    Returns:
++      state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
++      x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
++      A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
++      prev_tokens              : (batch,)
++      out_incr                 : pre-allocated output for replay kernel (batch, mtp_len, nheads, head_dim)
++      out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
++      intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
++    """
++    device = "cuda"
++
++    torch.manual_seed(42)
++
++    # --- SSM parameters (float32, tie_hdim strides) ---
++    A_base = -torch.rand(nheads, device=device) - 0.5
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)  # stride(-1)=0, stride(-2)=0
++
++    dt_bias_base = torch.randn(nheads, device=device, dtype=torch.float32)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)  # stride(-1)=0
++
++    D_base = torch.randn(nheads, device=device, dtype=torch.float32)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    # --- SSM state ---
++    state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
++
++    # --- Cache tensors for replay kernel ---
++    # old_x: single-buffered (cache, T, nheads, dim)
++    old_x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
++    # old_B: double-buffered (cache, 2, T, ngroups, dstate)
++    old_B = torch.randn(batch, 2, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
++    # old_dt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
++    old_dt = torch.randn(batch, 2, nheads, mtp_len, device=device, dtype=torch.float32)
++    # old_dA_cumsum: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
++    old_dA_cumsum = torch.randn(batch, 2, nheads, mtp_len, device=device, dtype=torch.float32)
++    # cache_buf_idx: which buffer to read (0 or 1)
++    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
++
++    # --- Token inputs (used by both replay and baseline kernels) ---
++    x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
++    # dt must match D's dtype (fp32) for flashinfer — force it for all paths.
++    dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=torch.float32)
++    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)  # tie_hdim
++    B = torch.randn(batch, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
++    C = torch.randn(batch, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
++
++    # prev_tokens placeholder — overwritten per-run
++    prev_tokens = torch.zeros(batch, device=device, dtype=torch.int32)
++
++    out_incr = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
++    out_base = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
++
++    intermediate_states_buffer = torch.zeros(
++        batch, mtp_len, nheads, head_dim, d_state, device=device, dtype=state_dtype
++    )
++
++    # --- Conv1d tensors (for --with-conv1d mode) ---
++    d_inner = nheads * head_dim
++    conv_dim = d_inner + 2 * ngroups * d_state
++    d_conv = 4  # conv kernel width for Nemotron/Mamba2
++
++    # xbc_input: (batch, conv_dim, mtp_len) — "hot" input from in_proj.
++    # Match production layout: in_proj output is (batch*mtp_len, conv_dim)
++    # contiguous, then .view(batch, mtp_len, conv_dim).transpose(1, 2)
++    # gives strides (mtp_len*conv_dim, 1, conv_dim) — NOT the standard
++    # (conv_dim*mtp_len, mtp_len, 1) of a freshly allocated 3D tensor.
++    # Conv1d preserves input strides in its output, so downstream split
++    # + view inherits the correct layout without needing .contiguous().
++    xbc_input_flat = torch.randn(batch * mtp_len, conv_dim, device=device, dtype=act_dtype)
++    xbc_input = xbc_input_flat.view(batch, mtp_len, conv_dim).transpose(1, 2)
++    # conv_state: (batch, conv_dim, d_conv) — "cold" cache
++    conv_state = torch.randn(batch, conv_dim, d_conv, device=device, dtype=act_dtype)
++    # conv_weight: (conv_dim, d_conv) — parameter
++    conv_weight = torch.randn(conv_dim, d_conv, device=device, dtype=act_dtype)
++    # conv_bias: (conv_dim,) — parameter
++    conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
++
++    return (
++        state0,
++        old_x,
++        old_B,
++        old_dt,
++        old_dA_cumsum,
++        cache_buf_idx,
++        x,
++        dt,
++        B,
++        C,
++        A,
++        dt_bias,
++        D,
++        prev_tokens,
++        out_incr,
++        out_base,
++        intermediate_states_buffer,
++        xbc_input,
++        conv_state,
++        conv_weight,
++        conv_bias,
++        d_inner,
++        conv_dim,
++    )
++
++
++# Timing helpers
++
++
++def _compute_stats(latencies_us: list[float]) -> tuple[float, float, float]:
++    """Return (median_us, p95_us, p99_us) from a list of latencies."""
++    median_us = statistics.median(latencies_us)
++    s = sorted(latencies_us)
++    p95_us = s[int(0.95 * len(s))]
++    p99_us = s[int(0.99 * len(s))]
++    return median_us, p95_us, p99_us
++
++
++def _time_kernel_cuda_graph(
++    args,
++    run_fn,
++    reset_fn,
++    tag: str,
++) -> tuple[float, float, float]:
++    """
++    All-in-one CUDA graph timing.
++
++    Captures a single graph containing warmup iterations followed by timed
++    iterations with per-iteration event pairs recorded inside the graph.
++    One replay, one sync, then all timings are read.
++    """
++    warmup = args.warmup
++    iters = args.iters
++
++    start_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
++    end_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
++
++    # Eager warmup before graph capture (triggers Triton autotune if active)
++    reset_fn()
++    run_fn()
++    torch.cuda.synchronize()
++
++    reset_fn()
++    torch.cuda.synchronize()
++
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        # Warmup iterations (unrolled into the graph)
++        for _ in range(warmup):
++            reset_fn()
++            if args.l2_flush:
++                _l2_flush.fill_(0.0)
++            run_fn()
++
++        # Timed iterations with events inside the graph
++        for i in range(iters):
++            reset_fn()
++            if args.l2_flush:
++                _l2_flush.fill_(0.0)
++            start_events[i].record()
++            run_fn()
++            end_events[i].record()
++
++    torch.cuda.synchronize()
++
++    # Single replay
++    torch.cuda.nvtx.range_push(tag)
++    g.replay()
++    torch.cuda.synchronize()
++    torch.cuda.nvtx.range_pop()
++
++    latencies_us = [start_events[i].elapsed_time(end_events[i]) * 1000.0 for i in range(iters)]
++    return _compute_stats(latencies_us)
++
++
++def _time_kernel_eager(
++    args,
++    run_fn,
++    reset_fn,
++    tag: str,
++) -> tuple[float, float, float]:
++    """Non-CUDA-graph timing path (for debugging, ncu, etc.)."""
++    # Warmup
++    for _ in range(args.warmup):
++        reset_fn()
++        run_fn()
++    torch.cuda.synchronize()
++
++    start_event = torch.cuda.Event(enable_timing=True)
++    end_event = torch.cuda.Event(enable_timing=True)
++
++    latencies_us: list[float] = []
++    torch.cuda.nvtx.range_push(tag)
++    for _ in range(args.iters):
++        reset_fn()
++        if args.l2_flush:
++            _flush_l2()  # includes synchronize
++        start_event.record()
++        run_fn()
++        end_event.record()
++        torch.cuda.synchronize()
++        latencies_us.append(start_event.elapsed_time(end_event) * 1000.0)
++    torch.cuda.nvtx.range_pop()
++
++    return _compute_stats(latencies_us)
++
++
++def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]:
++    """Dispatch to CUDA-graph or eager timing path."""
++    if args.cuda_graph:
++        return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag)
++    return _time_kernel_eager(args, run_fn, reset_fn, tag)
++
++
++# Per-config benchmark (consolidated baseline + replay)
++
++
++def _bench_config(
++    args,
++    batch: int,
++    mtp_len: int,
++    prev_ks: list[int],
++    state_dtype: torch.dtype,
++    act_dtype: torch.dtype,
++    baseline_fn,
++) -> None:
++    """
++    Benchmark one (batch, mtp_len, dtype) configuration.
++
++    Runs the baseline kernel (if baseline_fn is not None) followed by the
++    replay kernel for each prev_k value.  Tensors are built once and
++    shared across all runs in this config.
++    """
++    state_dtype_name = str(state_dtype).split(".")[-1]
++    act_dtype_name = str(act_dtype).split(".")[-1]
++
++    (
++        state0,
++        old_x0,
++        old_B0,
++        old_dt0,
++        old_dA_cumsum0,
++        cache_buf_idx0,
++        x,
++        dt,
++        B,
++        C,
++        A,
++        dt_bias,
++        D,
++        prev_tokens,
++        out_incr,
++        out_base,
++        intermediate_states_buffer,
++        xbc_input0,
++        conv_state0,
++        conv_weight,
++        conv_bias,
++        d_inner,
++        conv_dim,
++    ) = _build_tensors(
++        batch,
++        mtp_len,
++        state_dtype,
++        act_dtype,
++        args.tp_nheads,
++        args.head_dim,
++        args.d_state,
++        args.tp_ngroups,
++    )
++
++    nheads = args.tp_nheads
++    ngroups = args.tp_ngroups
++    head_dim = args.head_dim
++    d_state = args.d_state
++    with_conv1d = getattr(args, "with_conv1d", False)
++    use_philox = getattr(args, "philox_rounding", False)
++
++    # Philox rounding: allocate rand_seed tensor
++    rand_seed = None
++    if use_philox:
++        if state_dtype != torch.float16:
++            raise ValueError(f"--philox-rounding requires --state-dtypes fp16, got {state_dtype}")
++        if args.baseline == "triton":
++            raise ValueError(
++                "--philox-rounding not supported with --baseline triton "
++                "(only flashinfer and replay support it)"
++            )
++        rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
++
++    state_work = state0.clone()
++    old_x_work = old_x0.clone()
++    old_B_work = old_B0.clone()
++    old_dt_work = old_dt0.clone()
++    old_dA_cumsum_work = old_dA_cumsum0.clone()
++    cache_buf_idx_work = cache_buf_idx0.clone()
++    xbc_input_work = xbc_input0.clone()
++    conv_state_work = conv_state0.clone()
++
++    def _reset():
++        state_work.copy_(state0)
++        old_x_work.copy_(old_x0)
++        old_B_work.copy_(old_B0)
++        old_dt_work.copy_(old_dt0)
++        old_dA_cumsum_work.copy_(old_dA_cumsum0)
++        cache_buf_idx_work.copy_(cache_buf_idx0)
++        if with_conv1d:
++            conv_state_work.copy_(conv_state0)
++
++    def _reset_conv1d_realistic():
++        """Realistic reset: cold cache, L2 flush, then hot in_proj output."""
++        # 1. Reset cold state (cache tensors, SSM state)
++        state_work.copy_(state0)
++        old_x_work.copy_(old_x0)
++        old_B_work.copy_(old_B0)
++        old_dt_work.copy_(old_dt0)
++        old_dA_cumsum_work.copy_(old_dA_cumsum0)
++        cache_buf_idx_work.copy_(cache_buf_idx0)
++        conv_state_work.copy_(conv_state0)
++        # 2. L2 flush (evicts cold state from cache)
++        if _l2_flush is not None:
++            _l2_flush.fill_(0.0)
++        # 3. Write hot tensors (simulates in_proj output landing in L2)
++        xbc_input_work.copy_(xbc_input0)
++
++    show_kernel_col = baseline_fn is not None
++
++    def _conv1d_split(xbc_in, conv_st, launch_dependent_kernels=False):
++        """Run conv1d update and split output into (x, B, C) views.
++
++        The input tensor's strides are preserved through conv1d and the
++        transpose+view chain.  With the production-matching layout
++        (contiguous (batch*T, conv_dim) viewed as (batch, conv_dim, T)),
++        the output after transpose+view has stride(-1)==1 and
++        stride(1)==dim, satisfying both our kernel and flashinfer.
++        """
++        xbc_result = causal_conv1d_update(
++            xbc_in,
++            conv_st,
++            conv_weight,
++            conv_bias,
++            activation="silu",
++            launch_dependent_kernels=launch_dependent_kernels,
++        )
++        xbc_flat = xbc_result.transpose(1, 2).view(batch * mtp_len, conv_dim)
++        x_flat, B_flat, C_flat = torch.split(
++            xbc_flat, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1
++        )
++        x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
++        B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
++        C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
++        return x_conv, B_conv, C_conv
++
++    # --- Baseline ---
++    if baseline_fn is not None:
++        tag = f"base_b{batch}_mtp{mtp_len}_s{state_dtype_name}_a{act_dtype_name}"
++
++        philox_kwargs = {}
++        if rand_seed is not None and args.baseline == "flashinfer":
++            philox_kwargs = {"rand_seed": rand_seed, "philox_rounds": 10}
++
++        if with_conv1d:
++
++            def _run_baseline():
++                x_conv, B_conv, C_conv = _conv1d_split(xbc_input_work, conv_state_work)
++                baseline_fn(
++                    state_work,
++                    x=x_conv,
++                    dt=dt,
++                    A=A,
++                    B=B_conv,
++                    C=C_conv,
++                    D=D,
++                    dt_bias=dt_bias,
++                    dt_softplus=True,
++                    out=out_base,
++                    disable_state_update=True,
++                    intermediate_states_buffer=intermediate_states_buffer,
++                    cache_steps=mtp_len,
++                    **philox_kwargs,
++                )
++        else:
++
++            def _run_baseline():
++                baseline_fn(
++                    state_work,
++                    x=x,
++                    dt=dt,
++                    A=A,
++                    B=B,
++                    C=C,
++                    D=D,
++                    dt_bias=dt_bias,
++                    dt_softplus=True,
++                    out=out_base,
++                    disable_state_update=True,
++                    intermediate_states_buffer=intermediate_states_buffer,
++                    cache_steps=mtp_len,
++                    **philox_kwargs,
++                )
++
++        reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
++        median_us, p95_us, p99_us = _time_kernel(args, _run_baseline, reset_fn, tag)
++
++        _print_row(
++            show_kernel_col,
++            args.baseline,
++            batch,
++            mtp_len,
++            "N/A",
++            state_dtype_name,
++            act_dtype_name,
++            median_us,
++            p95_us,
++            p99_us,
++        )
++
++    # --- Sweep parameter parsing (invariant across prev_k) ---
++    def _parse_sweep(val):
++        if val is None:
++            return [None]
++        return [int(v) for v in val.split(",")]
++
++    block_size_m_values = _parse_sweep(args.block_size_m)
++    num_warps_values = _parse_sweep(args.num_warps)
++    num_stages_values = _parse_sweep(args.num_stages)
++    precompute_num_warps_values = _parse_sweep(args.precompute_num_warps)
++    precompute_num_stages_values = _parse_sweep(args.precompute_num_stages)
++    heads_per_block_values = _parse_sweep(args.heads_per_block)
++
++    # --- Replay kernel, one row per prev_k ---
++    for prev_k in prev_ks:
++        prev_tokens.fill_(prev_k)
++        tag = f"incr_b{batch}_mtp{mtp_len}_k{prev_k}_s{state_dtype_name}_a{act_dtype_name}"
++
++        for (
++            block_size_m,
++            num_warps,
++            num_stages,
++            precompute_num_warps,
++            precompute_num_stages,
++            heads_per_block,
++        ) in itertools.product(
++            block_size_m_values,
++            num_warps_values,
++            num_stages_values,
++            precompute_num_warps_values,
++            precompute_num_stages_values,
++            heads_per_block_values,
++        ):
++
++            def _run_incr(
++                prev_k=prev_k,
++                block_size_m=block_size_m,
++                num_warps=num_warps,
++                num_stages=num_stages,
++                precompute_num_warps=precompute_num_warps,
++                precompute_num_stages=precompute_num_stages,
++                heads_per_block=heads_per_block,
++            ):
++                if with_conv1d:
++                    x_call, B_call, C_call = _conv1d_split(
++                        xbc_input_work, conv_state_work, launch_dependent_kernels=args.external_pdl
++                    )
++                    extra_kwargs = {"launch_with_pdl": args.external_pdl}
++                else:
++                    x_call, B_call, C_call = x, B, C
++                    extra_kwargs = {}
++                replay_selective_state_update(
++                    state_work,
++                    old_x_work,
++                    old_B_work,
++                    old_dt_work,
++                    old_dA_cumsum_work,
++                    cache_buf_idx_work,
++                    prev_tokens,
++                    x=x_call,
++                    dt=dt,
++                    A=A,
++                    B=B_call,
++                    C=C_call,
++                    out=out_incr,
++                    D=D,
++                    dt_bias=dt_bias,
++                    dt_softplus=True,
++                    state_batch_indices=None,
++                    rand_seed=rand_seed,
++                    use_internal_pdl=args.internal_pdl,
++                    _block_size_m=block_size_m,
++                    _num_warps=num_warps,
++                    _num_stages=num_stages,
++                    _precompute_num_warps=precompute_num_warps,
++                    _precompute_num_stages=precompute_num_stages,
++                    _heads_per_block=heads_per_block,
++                    **extra_kwargs,
++                )
++
++            parts = []
++            if block_size_m is not None:
++                parts.append(f"M={block_size_m}")
++            if num_warps is not None:
++                parts.append(f"W={num_warps}")
++            if num_stages is not None:
++                parts.append(f"S={num_stages}")
++            if precompute_num_warps is not None:
++                parts.append(f"pW={precompute_num_warps}")
++            if precompute_num_stages is not None:
++                parts.append(f"pS={precompute_num_stages}")
++            if heads_per_block is not None:
++                parts.append(f"H={heads_per_block}")
++            sweep_suffix = (" " + ",".join(parts)) if parts else ""
++            sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
++
++            reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
++            median_us, p95_us, p99_us = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
++
++            _print_row(
++                show_kernel_col,
++                "replay",
++                batch,
++                mtp_len,
++                prev_k,
++                state_dtype_name,
++                act_dtype_name,
++                median_us,
++                p95_us,
++                p99_us,
++                sweep_suffix,
++            )
++
++
++def _print_row(
++    show_kernel_col,
++    kernel_name,
++    batch,
++    mtp_len,
++    prev_k,
++    state_dtype_name,
++    act_dtype_name,
++    median_us,
++    p95_us,
++    p99_us,
++    sweep_suffix="",
++):
++    kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
++    print(
++        f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
++        f"{state_dtype_name:>11} | {act_dtype_name:>9} | "
++        f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
++        f"{sweep_suffix}"
++    )
++
++
++# Main benchmark loop
++
++
++def _run_benchmark(args) -> None:
++    assert args.nheads % args.tp_size == 0, (
++        f"nheads ({args.nheads}) must be divisible by tp_size ({args.tp_size})"
++    )
++    assert args.ngroups % args.tp_size == 0, (
++        f"ngroups ({args.ngroups}) must be divisible by tp_size ({args.tp_size})"
++    )
++    args.tp_nheads = args.nheads // args.tp_size
++    args.tp_ngroups = args.ngroups // args.tp_size
++
++    batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
++    mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
++
++    dtype_map = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}
++    state_dtypes = [dtype_map[s] for s in args.state_dtypes.split(",")]
++    act_dtypes = [dtype_map[s] for s in args.act_dtypes.split(",")]
++
++    # Resolve baseline function
++    if args.baseline == "flashinfer":
++        from flashinfer.mamba import selective_state_update as baseline_fn
++    elif args.baseline == "triton":
++        baseline_fn = selective_state_update
++    else:
++        baseline_fn = None
++
++    # --with-conv1d uses its own realistic L2 flush (cold cache flush then
++    # hot in_proj write).  Override the generic l2_flush to avoid double-flushing.
++    if args.with_conv1d:
++        args.l2_flush = False
++        _init_l2_flush()  # still needed for the realistic reset's flush step
++    elif args.l2_flush:
++        _init_l2_flush()
++
++    if args.profile:
++        torch.cuda.cudart().cudaProfilerStart()
++
++    # Print header
++    if baseline_fn is not None:
++        print(
++            f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
++            f"{'state_dtype':>11} | {'act_dtype':>9} | "
++            f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
++        )
++        print(
++            f"|{'-' * 13}|{'-' * 7}|{'-' * 9}|{'-' * 8}|"
++            f"{'-' * 13}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
++        )
++    else:
++        print(
++            f"| {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
++            f"{'state_dtype':>11} | {'act_dtype':>9} | "
++            f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
++        )
++        print(
++            f"|{'-' * 7}|{'-' * 9}|{'-' * 8}|{'-' * 13}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
++        )
++
++    for batch in batch_sizes:
++        for mtp_len in mtp_lengths:
++            # Resolve prev_k fractions → clamped integers in [0, mtp_len]
++            prev_ks = sorted(
++                set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
++            )
++            for state_dtype in state_dtypes:
++                for act_dtype in act_dtypes:
++                    _bench_config(
++                        args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn
++                    )
++
++    if args.profile:
++        torch.cuda.cudart().cudaProfilerStop()
++
++
++# CLI
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Benchmark replay_selective_state_update Triton kernel",
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++    )
++    parser.add_argument(
++        "--nheads",
++        type=int,
++        default=NHEADS,
++        help="Full-model nheads (divided by --tp-size for per-GPU slice)",
++    )
++    parser.add_argument(
++        "--ngroups",
++        type=int,
++        default=NGROUPS,
++        help="Full-model ngroups (divided by --tp-size for per-GPU slice)",
++    )
++    parser.add_argument(
++        "--head-dim", type=int, default=HEAD_DIM, help="Head dimension (not TP-split)"
++    )
++    parser.add_argument(
++        "--d-state", type=int, default=D_STATE, help="SSM state dimension (not TP-split)"
++    )
++    parser.add_argument(
++        "--tp-size",
++        type=int,
++        default=TP_SIZE,
++        help="Tensor parallel size; divides nheads and ngroups",
++    )
++    parser.add_argument(
++        "--batch-sizes", default="1,2,4,8", help="Comma-separated decode batch sizes"
++    )
++    parser.add_argument(
++        "--mtp-lengths",
++        default="1,2,4,8",
++        help="Comma-separated per-request sequence lengths (num_draft_tokens + 1 target)",
++    )
++    parser.add_argument(
++        "--state-dtypes", default="fp32", help="Comma-separated state dtypes: fp16,bf16,fp32"
++    )
++    parser.add_argument(
++        "--act-dtypes",
++        default="bf16",
++        help="Comma-separated activation dtypes for x/B/C/dt: fp32,bf16",
++    )
++    parser.add_argument("--warmup", type=int, default=20, help="Number of warmup iterations")
++    parser.add_argument("--iters", type=int, default=100, help="Number of timed iterations")
++    parser.add_argument(
++        "--profile",
++        action="store_true",
++        help="Wrap timed region in cudaProfilerStart/Stop (for ncu --target-processes all)",
++    )
++    parser.add_argument(
++        "--l2-flush",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="L2 eviction between iterations",
++    )
++    parser.add_argument(
++        "--cuda-graph",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Capture all warmup + timed iterations in a "
++        "single CUDA graph with per-iteration events "
++        "inside the graph, eliminating all host overhead.",
++    )
++    parser.add_argument(
++        "--prev-tokens-fracs",
++        default="0,0.5,1.0",
++        type=lambda s: [float(x) for x in s.split(",")],
++        help="Fractions of mtp_len to use as prev_num_accepted_tokens "
++        "for the replay kernel sweep. Values are rounded "
++        "and clamped to [0, mtp_len].",
++    )
++    parser.add_argument(
++        "--baseline",
++        default=None,
++        nargs="?",
++        const="triton",
++        choices=[None, "triton", "flashinfer"],
++        help="Baseline to benchmark alongside the replay kernel. "
++        "'triton': native Triton selective_state_update. "
++        "'flashinfer': flashinfer selective_state_update (same signature). "
++        "Pass --baseline alone for 'triton'. Default: no baseline.",
++    )
++    parser.add_argument(
++        "--output",
++        default=None,
++        help="Path to save results (file or directory). "
++        "If a directory, writes benchmark_replay_<timestamp>.txt inside it.",
++    )
++    parser.add_argument(
++        "--block-size-m",
++        type=str,
++        default=None,
++        help="Override BLOCK_SIZE_M: single value or comma-separated sweep (e.g. '4,8,16,32').",
++    )
++    parser.add_argument(
++        "--num-warps",
++        type=str,
++        default=None,
++        help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').",
++    )
++    parser.add_argument(
++        "--internal-pdl",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Internal PDL between precompute and main kernels (default: on).",
++    )
++    parser.add_argument(
++        "--num-stages",
++        type=str,
++        default=None,
++        help="Override num_stages for the main kernel (comma-separated sweep).",
++    )
++    parser.add_argument(
++        "--precompute-num-warps",
++        type=str,
++        default=None,
++        help="Override num_warps for precompute kernel (comma-separated sweep).",
++    )
++    parser.add_argument(
++        "--precompute-num-stages",
++        type=str,
++        default=None,
++        help="Override num_stages for precompute kernel (comma-separated sweep).",
++    )
++    parser.add_argument(
++        "--with-conv1d",
++        action="store_true",
++        help="Include conv1d kernel before replay SSM. "
++        "Uses realistic L2 flush: cold caches flushed, hot in_proj output "
++        "kept warm. Measures conv1d → precompute → main span.",
++    )
++    parser.add_argument(
++        "--external-pdl",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="External PDL: conv1d launches dependents, precompute waits. "
++        "Only relevant with --with-conv1d. --no-external-pdl disables.",
++    )
++    parser.add_argument(
++        "--heads-per-block",
++        type=str,
++        default=None,
++        help="Override HEADS_PER_BLOCK for precompute kernel (comma-separated sweep).",
++    )
++    parser.add_argument(
++        "--philox-rounding",
++        action="store_true",
++        help="Enable Philox stochastic rounding for fp16 state "
++        "(rand_seed generated per iteration, philox_rounds=10).",
++    )
++    parser.add_argument(
++        "--full-import",
++        action="store_true",
++        help="Use standard tensorrt_llm import path instead of fast direct "
++        "module loading. Slower (~40s startup) but guaranteed correct "
++        "if the fast path breaks due to package changes.",
++    )
++    return parser.parse_args()
++
++
++class _Tee:
++    """Write to both stdout and a file simultaneously."""
++
++    def __init__(self, path: str):
++        parent = os.path.dirname(path)
++        if parent:
++            os.makedirs(parent, exist_ok=True)
++        self._file = open(path, "w")  # noqa: SIM115
++        self._stdout = sys.stdout
++
++    def write(self, data):
++        self._stdout.write(data)
++        self._file.write(data)
++
++    def flush(self):
++        self._stdout.flush()
++        self._file.flush()
++
++    def close(self):
++        self._file.close()
++
++
++if __name__ == "__main__":
++    _args = _parse_args()
++
++    _out_path = None
++    if _args.output != "-":
++        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
++        _fname = f"benchmark_replay_{_ts}.txt"
++        if _args.output is None:
++            _out_path = os.path.expanduser(f"~/nemo_logs/{_fname}")
++        elif os.path.isdir(_args.output) or _args.output.endswith("/"):
++            _out_path = os.path.join(_args.output, _fname)
++        else:
++            _out_path = _args.output
++
++    if _out_path:
++        _tee = _Tee(_out_path)
++        sys.stdout = _tee
++        print(f"# benchmark_replay_selective_state_update  {datetime.now().isoformat()}")
++        print(f"# cmd: {' '.join(sys.argv)}")
++
++    try:
++        _run_benchmark(_args)
++    finally:
++        if _out_path:
++            sys.stdout = _tee._stdout
++            _tee.close()
++            print(f"\nResults saved to: {_out_path}")
+diff --git a/tests/unittest/_torch/modules/mamba/test_replay_selective_state_update.py b/tests/unittest/_torch/modules/mamba/test_replay_selective_state_update.py
+new file mode 100644
+index 000000000000..7757f83ab2ad
+--- /dev/null
++++ b/tests/unittest/_torch/modules/mamba/test_replay_selective_state_update.py
+@@ -0,0 +1,764 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import pytest
++import torch
++import torch.nn.functional as F
++from einops import repeat
++
++from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
++    replay_selective_state_update,
++)
++from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
++from tensorrt_llm._utils import get_sm_version
++
++# Philox stochastic rounding uses PTX cvt.rs.f16x2.f32 which requires sm >= 100.
++_skip_pre_sm100 = pytest.mark.skipif(
++    get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
++)
++
++# Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
++# (nheads=128, headdim=64, d_state=128, ngroups=8) with TP split applied:
++#   TP=8: nheads=16, ngroups=1   — primary production config
++#   TP=4: nheads=32, ngroups=2   — exercises ngroups>1 (grouped B/C path)
++_CONFIGS = [
++    # (nheads, head_dim, d_state, ngroups)
++    (16, 64, 128, 1),  # TP=8 production config
++    (32, 64, 128, 2),  # TP=4, ngroups>1 (more heads than B/C groups)
++]
++
++
++@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
++@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
++@pytest.mark.parametrize(
++    "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
++)
++def test_replay_selective_state_update(
++    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T
++):
++    """
++    Verify that:
++      replay_selective_state_update(state0, old_caches, k, new_x, ...)
++    produces the same output as:
++      selective_state_update(state_after_k_old_tokens, new_x, ...)
++    and writes state_after_k_old_tokens back to the state tensor.
++    """
++    batch = 2
++    device = "cuda"
++    dtype = torch.bfloat16  # input activations are bf16
++    assert nheads % ngroups == 0
++
++    if paged_cache:
++        cache_size = 4
++        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
++    else:
++        cache_size = batch
++        state_batch_indices = None
++
++    torch.manual_seed(42)
++
++    # A: (nheads, head_dim, d_state) with stride(-2)=0, stride(-1)=0  [tie_hdim]
++    A_base = -torch.rand(nheads, device=device) - 0.5  # float32, negative
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
++
++    # dt_bias: (nheads, head_dim) with stride(-1)=0  [tie_hdim]
++    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
++
++    # D: (nheads, head_dim)
++    D_base = torch.randn(nheads, device=device, dtype=dtype)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    # Initial SSM state (cache_size slots)
++    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
++
++    # Old inputs: T tokens per batch request
++    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++    dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)  # stride(-1)=0
++    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++    # Capture intermediate SSM states using selective_state_update.
++    states_buffer_f32 = torch.zeros(
++        cache_size, T, nheads, head_dim, d_state, device=device, dtype=torch.float32
++    )
++    cache_idx_for_capture = (
++        state_batch_indices
++        if paged_cache
++        else torch.arange(batch, device=device, dtype=torch.int32)
++    )
++    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    selective_state_update(
++        state0.clone(),
++        x1,
++        dt1,
++        A,
++        B1,
++        C1,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        state_batch_indices=cache_idx_for_capture,
++        intermediate_states_buffer=states_buffer_f32,
++        cache_steps=T,
++        out=out1,
++        disable_state_update=True,
++    )
++
++    # Build cache tensors for the replay kernel.
++    # old_x: (cache, T, nheads, dim) bf16 — single-buffered
++    # old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered
++    # old_dt: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
++    # old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
++    # cache_buf_idx: random 0s and 1s to verify indexing correctness
++    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
++    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
++    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
++
++    # Fill each slot's READ buffer (indexed by cache_buf_idx) with step 1's data.
++    # The OTHER buffer has random garbage to catch indexing bugs.
++    slots = state_batch_indices if paged_cache else slice(None)
++    old_x[slots] = x1
++
++    # Compute processed dt and dA_cumsum for step 1
++    dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
++    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
++
++    # Write to each slot's read buffer based on its cache_buf_idx
++    slot_indices = state_batch_indices.tolist() if paged_cache else list(range(cache_size))
++    for i, slot in enumerate(slot_indices):
++        buf = cache_buf_idx[slot].item()
++        batch_idx = i  # maps slot back to the batch index
++        old_B[slot, buf] = B1[batch_idx]
++        old_dt[slot, buf] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
++        old_dA_cumsum[slot, buf] = dA_cumsum1[batch_idx].T  # (T, nheads) → (nheads, T)
++
++    # Main loop: test each k (number of old tokens replayed)
++    for k in range(T + 1):
++        torch.manual_seed(k + 100)
++
++        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++        dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++        dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
++        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++        # Reference
++        ref_state_f32 = state0.float().clone()
++        if k > 0:
++            ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
++
++        ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++        selective_state_update(
++            ref_state_f32,
++            x2,
++            dt2,
++            A,
++            B2,
++            C2,
++            D=D,
++            dt_bias=dt_bias,
++            dt_softplus=True,
++            state_batch_indices=(state_batch_indices if paged_cache else None),
++            out=ref_out,
++        )
++
++        # Replay kernel
++        test_state = state0.clone()
++        prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
++        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++        # cache_buf_idx stays at its random values — each slot reads from its own buffer
++
++        replay_selective_state_update(
++            test_state,
++            old_x.clone(),
++            old_B.clone(),
++            old_dt.clone(),
++            old_dA_cumsum.clone(),
++            cache_buf_idx.clone(),
++            prev_tokens,
++            x=x2,
++            dt=dt2,
++            A=A,
++            B=B2,
++            C=C2,
++            out=test_out,
++            D=D,
++            dt_bias=dt_bias,
++            dt_softplus=True,
++            state_batch_indices=state_batch_indices,
++        )
++
++        # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
++        # matmuls (dB_scaled @ old_x, C @ state, CB_scaled @ x, and C @ B in
++        # precompute).  The reference (selective_state_update) and flashinfer
++        # baseline use fp32 element-wise MACs.  The bf16 input casts lose the
++        # dt_bias/A-derived bits that the baselines keep — per-element rounding,
++        # not accumulating.  Prefill (ssd_chunk_scan) does identical bf16 tl.dot
++        # casts, so we match prefill precision exactly.  Empirical: max ~1.0 at
++        # T<=16, ~2.0 at T=32-55; mean ~0.014; <0.02% of elements exceed 0.5.
++        # State dtype (fp16/bf16/fp32) doesn't shift the error — bf16 dot
++        # inputs dominate, not state storage.
++        torch.testing.assert_close(
++            test_out, ref_out, rtol=2e-2, atol=1.0, msg=f"Output mismatch at k={k}"
++        )
++
++        expected_state = (
++            state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
++        )
++        torch.testing.assert_close(
++            test_state[slots], expected_state, rtol=2e-2, atol=1.0, msg=f"State mismatch at k={k}"
++        )
++
++
++@_skip_pre_sm100
++@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
++@pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
++@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
++def test_replay_selective_state_update_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
++    """
++    Verify that Philox stochastic rounding produces correct results.
++
++    Runs our kernel twice with identical inputs: once without rounding
++    (fp16 state, deterministic), once with rounding (fp16 state, Philox).
++    The outputs should be nearly identical — stochastic rounding only
++    perturbs the state by ±1 fp16 ULP, which barely affects output.
++    Also verifies the state dtype remains fp16.
++    """
++    batch = 2
++    device = "cuda"
++    dtype = torch.bfloat16
++    state_dtype = torch.float16
++    assert nheads % ngroups == 0
++
++    if paged_cache:
++        cache_size = 4
++        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
++    else:
++        cache_size = batch
++        state_batch_indices = None
++
++    torch.manual_seed(42)
++
++    A_base = -torch.rand(nheads, device=device) - 0.5
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
++    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
++    D_base = torch.randn(nheads, device=device, dtype=dtype)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
++
++    # Cache tensors
++    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
++    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
++    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
++
++    # New token inputs
++    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
++    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
++
++    common_kwargs = dict(
++        x=x,
++        dt=dt,
++        A=A,
++        B=B,
++        C=C,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        state_batch_indices=state_batch_indices,
++    )
++
++    # --- Run without rounding (deterministic fp16 state store) ---
++    state_no_round = state0.clone()
++    out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    replay_selective_state_update(
++        state_no_round,
++        old_x.clone(),
++        old_B.clone(),
++        old_dt.clone(),
++        old_dA_cumsum.clone(),
++        cache_buf_idx.clone(),
++        prev_tokens,
++        out=out_no_round,
++        **common_kwargs,
++    )
++
++    # --- Run with Philox rounding ---
++    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
++    state_rounded = state0.clone()
++    out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    replay_selective_state_update(
++        state_rounded,
++        old_x.clone(),
++        old_B.clone(),
++        old_dt.clone(),
++        old_dA_cumsum.clone(),
++        cache_buf_idx.clone(),
++        prev_tokens,
++        out=out_rounded,
++        rand_seed=rand_seed,
++        philox_rounds=10,
++        **common_kwargs,
++    )
++
++    # Outputs should be nearly identical — rounding only perturbs the
++    # post-replay state by ±1 ULP before the output phase reads it.
++    torch.testing.assert_close(
++        out_rounded, out_no_round, rtol=2e-2, atol=1.0, msg="Output diverged with Philox rounding"
++    )
++
++    # State should remain fp16
++    assert state_rounded.dtype == torch.float16
++
++    # States should differ by at most 1 fp16 ULP per element.
++    # fp16 ULP depends on magnitude: up to 0.5 for values near 512.
++    # Use rtol to account for magnitude-dependent ULP.
++    slots = state_batch_indices if paged_cache else slice(None)
++    torch.testing.assert_close(
++        state_rounded[slots],
++        state_no_round[slots],
++        rtol=2e-3,
++        atol=0.2,
++        msg="State diverged with Philox rounding",
++    )
++
++
++@_skip_pre_sm100
++def test_philox_rounding_unbiased():
++    """
++    Verify that Philox stochastic rounding is unbiased.
++
++    Runs the replay kernel with fp32 state (capturing the true fp32
++    post-replay state) and with fp16 state + Philox rounding.  Compares the
++    rounding residual (fp16_state.float() - fp32_state) against deterministic
++    rounding (fp32_state.to(fp16).float() - fp32_state).
++
++    Deterministic round-to-nearest-even has a systematic positive bias on
++    the residual.  Philox stochastic rounding should be unbiased: the mean
++    residual should be near zero.
++
++    Uses a large batch (16) for ~2M state elements — plenty of statistics.
++    """
++    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
++    batch, T = 16, 6
++    device = "cuda"
++    dtype = torch.bfloat16
++
++    torch.manual_seed(42)
++    A_base = -torch.rand(nheads, device=device) - 0.5
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
++    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
++    D_base = torch.randn(nheads, device=device, dtype=dtype)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    # Use fp32 initial state so replay produces non-fp16-representable values
++    state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=torch.float32)
++
++    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
++    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
++    old_dA_cumsum = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
++    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
++
++    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++    dt_val = repeat(dt_base, "b t h -> b t h p", p=head_dim)
++    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++    prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
++
++    common_kwargs = dict(
++        x=x,
++        dt=dt_val,
++        A=A,
++        B=B,
++        C=C,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++    )
++
++    # 1. fp32 state — captures true post-replay state
++    state_fp32 = state0.clone()
++    out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    replay_selective_state_update(
++        state_fp32,
++        old_x.clone(),
++        old_B.clone(),
++        old_dt.clone(),
++        old_dA_cumsum.clone(),
++        cache_buf_idx.clone(),
++        prev_tokens,
++        out=out_fp32,
++        **common_kwargs,
++    )
++
++    # 2. fp16 state with Philox rounding
++    rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
++    state_rounded = state0.to(torch.float16).clone()
++    out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    replay_selective_state_update(
++        state_rounded,
++        old_x.clone(),
++        old_B.clone(),
++        old_dt.clone(),
++        old_dA_cumsum.clone(),
++        cache_buf_idx.clone(),
++        prev_tokens,
++        out=out_rounded,
++        rand_seed=rand_seed,
++        philox_rounds=10,
++        **common_kwargs,
++    )
++
++    # Compute rounding residuals where fp32 state has non-zero values
++    fp32_vals = state_fp32.flatten()
++    stochastic_residual = state_rounded.float().flatten() - fp32_vals
++    deterministic_residual = fp32_vals.to(torch.float16).float() - fp32_vals
++
++    # Only consider elements where rounding matters (non-zero residual possible)
++    nonzero_mask = deterministic_residual.abs() > 0
++    num_nonzero = nonzero_mask.sum().item()
++    assert num_nonzero > 1000, f"Too few roundable elements: {num_nonzero}"
++
++    stochastic_mean = stochastic_residual[nonzero_mask].mean().item()
++    deterministic_mean = deterministic_residual[nonzero_mask].mean().item()
++
++    # Stochastic rounding should be less biased than deterministic.
++    # With ~millions of elements, the stochastic mean should be very close to 0.
++    # Deterministic round-to-nearest-even has a small but systematic bias.
++    assert abs(stochastic_mean) < abs(deterministic_mean) or abs(stochastic_mean) < 1e-5, (
++        f"Stochastic rounding appears biased: stochastic_mean={stochastic_mean:.6f}, "
++        f"deterministic_mean={deterministic_mean:.6f}, n_elements={num_nonzero}"
++    )
++
++
++# HEADS_PER_BLOCK > 1 test.  The default heuristic only picks HPB > 1 at large
++# total_heads (>= 256-512), which the main test with batch=2 never reaches.
++# This test overrides _heads_per_block to exercise the two-loop structure in
++# the precompute kernel (store-then-reload of per-head dt/dA_cumsum).
++# Configs: (nheads=16, ngroups=1) and (nheads=32, ngroups=2) both have
++# heads_per_group=16.  The heuristic caps HPB at min(2|4, hpg), so HPB=2, 4.
++@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
++@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
++@pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
++@pytest.mark.parametrize("launch_with_pdl", [False, True], ids=["no_ext_pdl", "ext_pdl"])
++@pytest.mark.parametrize("use_internal_pdl", [False, True], ids=["no_int_pdl", "int_pdl"])
++@pytest.mark.parametrize("batch", [1, 2, 8, 16], ids=["B1", "B2", "B8", "B16"])
++def test_replay_heads_per_block(
++    nheads,
++    head_dim,
++    d_state,
++    ngroups,
++    state_dtype,
++    T,
++    heads_per_block,
++    launch_with_pdl,
++    use_internal_pdl,
++    batch,
++):
++    """
++    Verify replay_selective_state_update produces correct results when
++    _heads_per_block > 1, exercising the precompute kernel's two-loop
++    structure (store per-head dt/dA_cumsum in loop 1, reload in loop 2).
++    """
++    device = "cuda"
++    dtype = torch.bfloat16
++
++    if nheads % heads_per_block != 0:
++        pytest.skip(f"nheads ({nheads}) not divisible by heads_per_block ({heads_per_block})")
++    if heads_per_block > nheads // ngroups:
++        pytest.skip(
++            f"heads_per_block ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})"
++        )
++
++    torch.manual_seed(42)
++
++    A_base = -torch.rand(nheads, device=device) - 0.5
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
++    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
++    D_base = torch.randn(nheads, device=device, dtype=dtype)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    cache_size = batch
++    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
++
++    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++    dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
++    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++    states_buffer_f32 = torch.zeros(
++        cache_size, T, nheads, head_dim, d_state, device=device, dtype=torch.float32
++    )
++    cache_idx_for_capture = torch.arange(batch, device=device, dtype=torch.int32)
++    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    selective_state_update(
++        state0.clone(),
++        x1,
++        dt1,
++        A,
++        B1,
++        C1,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        state_batch_indices=cache_idx_for_capture,
++        intermediate_states_buffer=states_buffer_f32,
++        cache_steps=T,
++        out=out1,
++        disable_state_update=True,
++    )
++
++    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
++    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
++    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
++
++    old_x[:] = x1
++    dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
++    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
++
++    for slot in range(cache_size):
++        buf = cache_buf_idx[slot].item()
++        old_B[slot, buf] = B1[slot]
++        old_dt[slot, buf] = dt1[slot].T
++        old_dA_cumsum[slot, buf] = dA_cumsum1[slot].T
++
++    k = T
++    torch.manual_seed(123)
++
++    x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
++    B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++    C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
++
++    ref_state_f32 = state0.float().clone()
++    ref_state_f32[:] = states_buffer_f32[:, k - 1]
++    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++    selective_state_update(
++        ref_state_f32,
++        x2,
++        dt2,
++        A,
++        B2,
++        C2,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        state_batch_indices=None,
++        out=ref_out,
++    )
++
++    test_state = state0.clone()
++    prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
++    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++
++    replay_selective_state_update(
++        test_state,
++        old_x.clone(),
++        old_B.clone(),
++        old_dt.clone(),
++        old_dA_cumsum.clone(),
++        cache_buf_idx.clone(),
++        prev_tokens,
++        x=x2,
++        dt=dt2,
++        A=A,
++        B=B2,
++        C=C2,
++        out=test_out,
++        D=D,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        state_batch_indices=None,
++        _heads_per_block=heads_per_block,
++        launch_with_pdl=launch_with_pdl,
++        use_internal_pdl=use_internal_pdl,
++    )
++
++    torch.testing.assert_close(
++        test_out,
++        ref_out,
++        rtol=2e-2,
++        atol=1.0,
++        msg=f"Output mismatch with HPB={heads_per_block}, T={T}, "
++        f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}",
++    )
++
++    expected_state = states_buffer_f32[:, k - 1].to(state_dtype)
++    torch.testing.assert_close(
++        test_state,
++        expected_state,
++        rtol=2e-2,
++        atol=1.0,
++        msg=f"State mismatch with HPB={heads_per_block}, T={T}, "
++        f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}",
++    )
++
++
++# HPB > 1 multi-step test.  Production chains decode steps; bugs in
++# buffer ordering or stale cache values accumulate across steps and can
++# be invisible in a single-step test.
++@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
++@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
++@pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
++@pytest.mark.parametrize("paged_cache", [False, True], ids=["contig", "paged"])
++def test_replay_heads_per_block_multistep(
++    nheads, head_dim, d_state, ngroups, state_dtype, T, heads_per_block, paged_cache
++):
++    """
++    Chain N decode steps with HPB > 1 and verify each step's output matches
++    a fresh reference.  A bug that mixes up WRITE/READ buffers, writes wrong
++    data to cache, or races in the two-loop structure would accumulate
++    across steps.
++    """
++    batch = 2
++    device = "cuda"
++    dtype = torch.bfloat16
++    n_steps = 8
++
++    if nheads % heads_per_block != 0:
++        pytest.skip(f"nheads ({nheads}) not divisible by HPB ({heads_per_block})")
++    if heads_per_block > nheads // ngroups:
++        pytest.skip(f"HPB ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})")
++
++    torch.manual_seed(42)
++
++    A_base = -torch.rand(nheads, device=device) - 0.5
++    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
++    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
++    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
++    D_base = torch.randn(nheads, device=device, dtype=dtype)
++    D = repeat(D_base, "h -> h p", p=head_dim)
++
++    if paged_cache:
++        cache_size = 4
++        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
++        slots = state_batch_indices
++    else:
++        cache_size = batch
++        state_batch_indices = None
++        slots = slice(None)
++
++    all_x = []
++    all_dt = []
++    all_B = []
++    all_C = []
++    for step in range(n_steps):
++        torch.manual_seed(1000 + step)
++        all_x.append(torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype))
++        dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
++        all_dt.append(repeat(dt_base, "b t h -> b t h p", p=head_dim))
++        all_B.append(torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype))
++        all_C.append(torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype))
++
++    torch.manual_seed(999)
++    state_init = torch.randn(
++        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
++    )
++
++    ref_state = state_init.float().clone()
++    ref_outs = []
++    ref_slots = (
++        state_batch_indices
++        if paged_cache
++        else torch.arange(batch, device=device, dtype=torch.int32)
++    )
++    for step in range(n_steps):
++        out_step = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++        selective_state_update(
++            ref_state,
++            all_x[step],
++            all_dt[step],
++            A,
++            all_B[step],
++            all_C[step],
++            D=D,
++            dt_bias=dt_bias,
++            dt_softplus=True,
++            state_batch_indices=ref_slots,
++            out=out_step,
++        )
++        ref_outs.append(out_step)
++
++    test_state = state_init.clone()
++    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
++    old_B = torch.zeros(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
++    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    old_dA_cumsum = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
++    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
++
++    for step in range(n_steps):
++        k = T if step > 0 else 0
++        prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
++        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
++
++        replay_selective_state_update(
++            test_state,
++            old_x,
++            old_B,
++            old_dt,
++            old_dA_cumsum,
++            cache_buf_idx,
++            prev_tokens,
++            x=all_x[step],
++            dt=all_dt[step],
++            A=A,
++            B=all_B[step],
++            C=all_C[step],
++            out=test_out,
++            D=D,
++            dt_bias=dt_bias,
++            dt_softplus=True,
++            state_batch_indices=state_batch_indices,
++            _heads_per_block=heads_per_block,
++        )
++
++        if paged_cache:
++            cache_buf_idx[slots] = 1 - cache_buf_idx[slots]
++        else:
++            cache_buf_idx[:] = 1 - cache_buf_idx
++
++        torch.testing.assert_close(
++            test_out,
++            ref_outs[step],
++            rtol=2e-2,
++            atol=2.0,
++            msg=f"Output mismatch at step {step} with HPB={heads_per_block}, "
++            f"T={T}, nheads={nheads}, ngroups={ngroups}, "
++            f"state_dtype={state_dtype}, paged_cache={paged_cache}",
++        )
+diff --git a/tests/unittest/disaggregated/test_mamba_transfer.py b/tests/unittest/disaggregated/test_mamba_transfer.py
+index 5be3e43e7d4f..414d9b310e3f 100644
+--- a/tests/unittest/disaggregated/test_mamba_transfer.py
++++ b/tests/unittest/disaggregated/test_mamba_transfer.py
+@@ -38,7 +38,7 @@
+ MAMBA_D_STATE = 16
+ MAMBA_D_CONV = 4
+ MAMBA_NUM_HEADS = 4
+-MAMBA_N_GROUPS = 1
++MAMBA_N_GROUPS = 4  # divisible by all tested TP sizes; satisfies nheads % ngroups == 0
+ MAMBA_HEAD_DIM = 64
+ MAX_BATCH_SIZE = 4
+ REQUEST_LENGTHS = [16, 32]

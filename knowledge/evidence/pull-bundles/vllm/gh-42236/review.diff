@@ -1,0 +1,854 @@
+diff --git a/tests/kernels/test_compressor_kv_cache.py b/tests/kernels/test_compressor_kv_cache.py
+index 122254bc3c41..ef9fda050830 100644
+--- a/tests/kernels/test_compressor_kv_cache.py
++++ b/tests/kernels/test_compressor_kv_cache.py
+@@ -3,11 +3,12 @@
+ """
+ Round-trip tests for compressor → FP8 quant + KV cache insert → gather + dequant.
+ 
+-Four test functions cover five paths:
++These tests cover:
+   A) DeepseekV4 Attention: head_dim=512 (448 FP8 nope + 64 bf16 rope), quant_block=64
+-  B) Indexer:       head_dim=128 (all FP8), quant_block=128
+-  C) DeepseekV4 Attention magnitude range: correctness across small/large values
+-  D) Indexer fused Triton kernel: compress+norm+rope+quant+insert
++  B) Fused dequant+gather K cache
++  C) Indexer:       head_dim=128 (all FP8), quant_block=128
++  D) DeepseekV4 Attention magnitude range: correctness across small/large values
++  E) Indexer fused Triton kernel: compress+norm+rope+quant+insert
+ """
+ 
+ import math
+@@ -134,7 +135,140 @@ def test_deepseek_v4_attention_quant_cache_roundtrip(num_tokens: int, block_size
+     )
+ 
+ 
+-# ── Test B: Indexer path ────────────────────────────────────────────────────
++# ── Test B: Fused dequant+gather K cache ────────────────────────────────────
++
++
++def _dequantize_and_gather_k_cache_reference(
++    out: torch.Tensor,
++    k_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    gather_lens: torch.Tensor | None,
++    block_table: torch.Tensor,
++    block_size: int,
++    offset: int,
++) -> None:
++    fp8_dim = 448
++    bf16_dim = 64
++    scale_dim = 8
++    quant_block = 64
++    token_data_size = fp8_dim + bf16_dim * 2
++
++    for req_id in range(seq_lens.shape[0]):
++        seq_len = seq_lens[req_id].item()
++        gather_len = gather_lens[req_id].item() if gather_lens is not None else seq_len
++        start_pos = seq_len - gather_len
++
++        for i in range(gather_len):
++            pos = start_pos + i
++            pos_in_block = pos % block_size
++            block_idx = block_table[req_id, pos // block_size].item()
++            cache_block = k_cache[block_idx].view(-1)
++
++            token_data_start = pos_in_block * token_data_size
++            fp8_bytes = cache_block[token_data_start : token_data_start + fp8_dim]
++            fp8_vals = fp8_bytes.view(torch.float8_e4m3fn).float()
++
++            scale_start = block_size * token_data_size + pos_in_block * scale_dim
++            encoded_scales = cache_block[scale_start : scale_start + scale_dim]
++            scales = torch.exp2(encoded_scales[:7].float() - 127.0)
++            dequant = fp8_vals * scales.repeat_interleave(quant_block)
++
++            bf16_start = token_data_start + fp8_dim
++            bf16_bytes = cache_block[bf16_start : bf16_start + bf16_dim * 2]
++            bf16_tail = bf16_bytes.view(torch.bfloat16)
++
++            out[req_id, offset + i, :fp8_dim] = dequant
++            out[req_id, offset + i, fp8_dim:] = bf16_tail
++
++
++@pytest.mark.parametrize(
++    ("seq_lens_host", "gather_lens_host", "offset"),
++    [
++        ([9, 23, 7], None, 0),
++        ([19, 8, 257], [6, 8, 129], 5),
++    ],
++)
++def test_dequantize_and_gather_k_cache(
++    seq_lens_host: list[int],
++    gather_lens_host: list[int] | None,
++    offset: int,
++):
++    block_size = 64
++    head_dim = 512
++    nope_dim = 448
++    scale_dim = 8
++    head_bytes = nope_dim + (head_dim - nope_dim) * 2 + scale_dim
++    device = "cuda"
++    num_reqs = len(seq_lens_host)
++    num_tokens = sum(seq_lens_host)
++    max_gather_len = max(gather_lens_host or seq_lens_host)
++    max_blocks_per_seq = math.ceil(max(seq_lens_host) / block_size)
++    num_blocks = sum(math.ceil(seq_len / block_size) for seq_len in seq_lens_host)
++
++    compressed_kv = torch.randn(
++        num_tokens, head_dim, dtype=torch.bfloat16, device=device
++    )
++
++    # Randomize physical pages so the test covers block-table translation.
++    # Keep padded block-table entries invalid to catch accidental reads.
++    physical_blocks = torch.randperm(num_blocks, device=device)
++    block_table = torch.full(
++        (num_reqs, max_blocks_per_seq), int(-1e6), dtype=torch.int32, device=device
++    )
++    start = 0
++    for req_id, seq_len in enumerate(seq_lens_host):
++        num_req_blocks = math.ceil(seq_len / block_size)
++        req_blocks = physical_blocks[start : start + num_req_blocks]
++        block_table[req_id, :num_req_blocks] = req_blocks
++        start += num_req_blocks
++
++    # Build slot_mapping for quantize_and_insert_k_cache.
++    slot_mapping = torch.empty(num_tokens, dtype=torch.int64, device=device)
++    start = 0
++    for req_id, seq_len in enumerate(seq_lens_host):
++        logical_pos = torch.arange(seq_len, dtype=torch.int64, device=device)
++        block_idx = block_table[req_id, logical_pos // block_size].to(torch.int64)
++        token_slots = block_idx * block_size + logical_pos % block_size
++        slot_mapping[start : start + seq_len] = token_slots
++        start += seq_len
++
++    # Insert compressed K into the paged cache layout used by the gather op.
++    k_cache = torch.empty(
++        num_blocks, block_size, head_bytes, dtype=torch.uint8, device=device
++    )
++    k_cache_2d = k_cache.view(num_blocks, -1)
++    quantize_and_insert_k_cache(compressed_kv, k_cache_2d, slot_mapping, block_size)
++
++    out_shape = (num_reqs, offset + max_gather_len + 3, head_dim)
++    ref_out = torch.empty(out_shape, dtype=torch.bfloat16, device=device)
++    actual_out = torch.empty_like(ref_out)
++    seq_lens = torch.tensor(seq_lens_host, dtype=torch.int32, device=device)
++    gather_lens = (
++        torch.tensor(gather_lens_host, dtype=torch.int32, device=device)
++        if gather_lens_host is not None
++        else None
++    )
++
++    # Compare production gather against a PyTorch reference for valid output rows.
++    _dequantize_and_gather_k_cache_reference(
++        ref_out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
++    )
++    dequantize_and_gather_k_cache(
++        actual_out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
++    )
++    torch.accelerator.synchronize()
++
++    # only check non-padded content
++    for req_id, seq_len in enumerate(seq_lens_host):
++        gather_len = (
++            gather_lens_host[req_id] if gather_lens_host is not None else seq_len
++        )
++        actual = actual_out[req_id, offset : offset + gather_len]
++        expected = ref_out[req_id, offset : offset + gather_len]
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++
++# ── Test C: Indexer path ────────────────────────────────────────────────────
+ 
+ 
+ @pytest.mark.parametrize("num_tokens", [1, 4, 8, 17])
+@@ -254,7 +388,7 @@ def test_indexer_gather_accepts_upper_bound_output():
+     assert torch.all(dst_scale[valid_tokens:] == sentinel)
+ 
+ 
+-# ── Test C: DeepseekV4 attention with values at different magnitudes ───────────
++# ── Test D: DeepseekV4 attention with values at different magnitudes ───────────
+ 
+ 
+ def test_deepseek_v4_quant_magnitude_range():
+@@ -316,7 +450,7 @@ def test_deepseek_v4_quant_magnitude_range():
+             )
+ 
+ 
+-# ── Test D: Indexer fused K-cache insert (Triton kernels) ────────────────────
++# ── Test E: Indexer fused K-cache insert (Triton kernels) ────────────────────
+ #
+ # Both kernels share the same Triton signature; use_fp4 selects between them.
+ # Full pipeline: state-cache gather → softmax-weighted compress → RMSNorm →
+diff --git a/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py b/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
+index 69d20c107e11..dfb107b515eb 100644
+--- a/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
++++ b/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
+@@ -17,6 +17,7 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.utils.import_utils import has_cutedsl
+ 
+ 
+ @triton.jit
+@@ -303,7 +304,7 @@ def _dequantize_and_gather_k_kernel(
+             tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+ 
+ 
+-def dequantize_and_gather_k_cache(
++def dequantize_and_gather_k_cache_triton(
+     # [num_reqs, max_num_tokens, head_size]
+     out: torch.Tensor,
+     # [num_blocks, block_size, head_bytes]
+@@ -349,6 +350,34 @@ def dequantize_and_gather_k_cache(
+     )
+ 
+ 
++def dequantize_and_gather_k_cache(
++    # [num_reqs, max_num_tokens, head_size]
++    out: torch.Tensor,
++    # [num_blocks, block_size, head_bytes]
++    k_cache: torch.Tensor,
++    # [num_reqs]
++    seq_lens: torch.Tensor,
++    # [num_reqs]
++    gather_lens: torch.Tensor | None,
++    # [num_reqs, max_blocks_per_seq]
++    block_table: torch.Tensor,
++    block_size: int,
++    offset: int,
++) -> None:
++    if has_cutedsl():
++        # lazily import, otherwise some tests fail due to CUDA driver init failure.
++        from .dequant_gather_k_cutedsl import dequantize_and_gather_k_cache_cutedsl
++
++        dequantize_and_gather_k_cache_cutedsl(
++            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
++        )
++        return
++
++    dequantize_and_gather_k_cache_triton(
++        out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
++    )
++
++
+ def compute_global_topk_indices_and_lens(
+     topk_indices: torch.Tensor,
+     token_to_req_indices: torch.Tensor,
+diff --git a/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py b/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py
+new file mode 100644
+index 000000000000..dddd3f544f8e
+--- /dev/null
++++ b/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py
+@@ -0,0 +1,145 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import cutlass
++import cutlass.cute as cute
++from cutlass import Float32, Uint32
++from cutlass._mlir import ir
++from cutlass._mlir.dialects import llvm, vector
++from cutlass.cutlass_dsl import T, dsl_user_op
++
++
++@dsl_user_op
++def _recast_val(x, dtype, *, loc=None, ip=None):
++    return dtype(llvm.bitcast(dtype.mlir_type, x.ir_value(loc=loc, ip=ip)))
++
++
++@dsl_user_op
++def _fp32x2_to_bf16x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
++    out = llvm.inline_asm(
++        T.i32(),
++        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
++        "cvt.rn.bf16x2.f32 $0, $2, $1;",
++        "=r,f,f",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return Uint32(out)
++
++
++@dsl_user_op
++def _bf16x2_to_fp32(data: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
++    out = llvm.inline_asm(
++        llvm.StructType.get_literal([T.f32(), T.f32()]),
++        [data.ir_value(loc=loc, ip=ip)],
++        "shl.b32 $0, $2, 16;\n\tand.b32 $1, $2, 0xFFFF0000;\n",
++        "=f,=f,r",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return (
++        Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
++        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
++    )
++
++
++@dsl_user_op
++def _bf16x2_abs(a: Uint32, *, loc=None, ip=None) -> Uint32:
++    out = llvm.inline_asm(
++        T.i32(),
++        [a.ir_value(loc=loc, ip=ip)],
++        "abs.bf16x2 $0, $1;",
++        "=r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return Uint32(out)
++
++
++@dsl_user_op
++def _bf16x2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
++    out = llvm.inline_asm(
++        T.i32(),
++        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
++        "max.bf16x2 $0, $1, $2;",
++        "=r,r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return Uint32(out)
++
++
++@dsl_user_op
++def _bf16x2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
++    out = llvm.inline_asm(
++        T.i32(),
++        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
++        "mul.rn.bf16x2 $0, $1, $2;",
++        "=r,r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return Uint32(out)
++
++
++@dsl_user_op
++def _fp8x4_to_bf16x4(x: Uint32, *, loc=None, ip=None) -> cute.TensorSSA:
++    # there is only fp8->fp16 conversion, hence we need to go
++    # round trip through fp16.
++    out = llvm.inline_asm(
++        llvm.StructType.get_literal([T.i32()] * 2),
++        [x.ir_value(loc=loc, ip=ip)],
++        "{\n\t"
++        ".reg .b16 x0, x1;\n\t"
++        ".reg .b16 t00, t01, t10, t11;\n\t"
++        "mov.b32 {x0, x1}, $2;\n\t"
++        "cvt.rn.f16x2.e4m3x2 $0, x0;\n\t"
++        "cvt.rn.f16x2.e4m3x2 $1, x1;\n\t"
++        "mov.b32 {t00, t01}, $0;\n\t"
++        "mov.b32 {t10, t11}, $1;\n\t"
++        "cvt.rn.bf16.f16 t00, t00;\n\t"
++        "cvt.rn.bf16.f16 t01, t01;\n\t"
++        "cvt.rn.bf16.f16 t10, t10;\n\t"
++        "cvt.rn.bf16.f16 t11, t11;\n\t"
++        "mov.b32 $0, {t00, t01};\n\t"
++        "mov.b32 $1, {t10, t11};\n\t"
++        "}\n",
++        "=r,=r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    vec = vector.from_elements(
++        ir.VectorType.get([2], T.i32(), loc=loc),
++        [llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip) for i in range(2)],
++        loc=loc,
++        ip=ip,
++    )
++    return cute.TensorSSA(vec, 2, Uint32)
++
++
++@dsl_user_op
++def _fp32x8_to_fp4x8(
++    vals: cute.Tensor,
++    offset: cutlass.Constexpr[int],
++    *,
++    loc=None,
++    ip=None,
++) -> Uint32:
++    # Pack eight scaled FP32 values into four E2M1x2 bytes, returned as one b32.
++    assert vals.element_type is Float32
++    out = llvm.inline_asm(
++        T.i32(),
++        [vals[offset + i].ir_value(loc=loc, ip=ip) for i in range(8)],
++        "{\n\t"
++        ".reg .b8 x0, x1, x2, x3;\n\t"
++        "cvt.rn.satfinite.e2m1x2.f32 x0, $2, $1;\n\t"
++        "cvt.rn.satfinite.e2m1x2.f32 x1, $4, $3;\n\t"
++        "cvt.rn.satfinite.e2m1x2.f32 x2, $6, $5;\n\t"
++        "cvt.rn.satfinite.e2m1x2.f32 x3, $8, $7;\n\t"
++        "mov.b32 $0, {x0, x1, x2, x3};\n\t"
++        "}\n",
++        "=r,f,f,f,f,f,f,f,f",
++        has_side_effects=False,
++        is_align_stack=False,
++    )
++    return Uint32(out)
+diff --git a/vllm/v1/attention/ops/deepseek_v4_ops/dequant_gather_k_cutedsl.py b/vllm/v1/attention/ops/deepseek_v4_ops/dequant_gather_k_cutedsl.py
+new file mode 100644
+index 000000000000..bb0818ada39f
+--- /dev/null
++++ b/vllm/v1/attention/ops/deepseek_v4_ops/dequant_gather_k_cutedsl.py
+@@ -0,0 +1,334 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from functools import cache
++
++import cutlass
++import cutlass.cute as cute
++import torch
++from cuda.bindings.driver import CUstream
++from cutlass import BFloat16, Int32, Uint8, Uint32
++from cutlass.cute.nvgpu import cpasync
++from quack.compile_utils import make_fake_tensor
++
++from vllm.v1.attention.ops.deepseek_v4_ops.cutedsl_utils import (
++    _bf16x2_mul,
++    _fp8x4_to_bf16x4,
++)
++
++
++def dequantize_and_gather_k_cache_cutedsl(
++    out: torch.Tensor,
++    k_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    gather_lens: torch.Tensor | None,
++    block_table: torch.Tensor,
++    block_size: int,
++    offset: int,
++) -> None:
++    DequantGatherKCacheKernel.compile(
++        block_size=block_size,
++        has_gather_lens=gather_lens is not None,
++    )(out, k_cache, seq_lens, gather_lens, block_table, offset)
++
++
++class DequantGatherKCacheKernel:
++    # Hard-coded for DSv4.
++    head_dim = 512
++    group_size = 64  # 1 scale per 64 elems
++
++    def __init__(self, fp8_dim: int = 448, block_size: int = 64):
++        self.fp8_dim = fp8_dim
++        self.bf16_dim = self.head_dim - fp8_dim
++        self.data_dim = fp8_dim + self.bf16_dim * 2
++        self.block_size = block_size
++
++        self.num_warps = 4
++        self.tb_size = self.num_warps * 32
++        self.num_stages = 4
++
++    @cute.jit
++    def __call__(
++        self,
++        out: cute.Tensor,
++        k_cache: cute.Tensor,
++        seq_lens: cute.Tensor,
++        gather_lens: cute.Tensor | None,
++        block_table: cute.Tensor,
++        offset: Int32,
++        stream: CUstream,
++    ):
++        # Split k_cache into k_data and k_scale. Each [block_size, head_bytes]
++        # block is actually a concat of
++        # [block_size, fp8_dim + bf16_dim * 2] and [block_size, 8].
++        k_data = cute.make_tensor(
++            k_cache.iterator,
++            layout=cute.make_layout(
++                (k_cache.shape[0], self.block_size, self.data_dim),
++                stride=(k_cache.stride[0], self.data_dim, 1),
++            ),
++        )
++        k_scale = cute.make_tensor(
++            k_cache.iterator + (self.block_size * self.data_dim),
++            layout=cute.make_layout(
++                (k_cache.shape[0], self.block_size, 8),
++                stride=(k_cache.stride[0], 8, 1),
++            ),
++        )
++
++        grid = (out.shape[0], 1024, 1)
++        self.kernel(
++            out,
++            k_data,
++            k_scale,
++            seq_lens,
++            gather_lens,
++            block_table,
++            offset,
++        ).launch(grid=grid, block=(self.tb_size, 1, 1), stream=stream)
++
++    @cute.jit
++    def load_g2s(
++        self,
++        k_data_slice: cute.Tensor,
++        k_scale: cute.Tensor,
++        block_table: cute.Tensor,
++        s_kdata_slice: cute.Tensor,
++        s_kscale: cute.Tensor,
++        req_id,
++        pos,
++        lane_id,
++        stage_id,
++    ):
++        # k_data_slice: [num_blocks, block_size, (16, data_dim/16)]
++        # s_kdata_slice: [(4, data_dim/16), num_stages]
++
++        op = cpasync.CopyG2SOp(cute.nvgpu.LoadCacheMode.GLOBAL)
++        cp16_atom = cute.make_copy_atom(op, Uint32, num_bits_per_copy=128)
++        cp8_atom = cute.make_copy_atom(cpasync.CopyG2SOp(), Uint8, num_bits_per_copy=64)
++        page_id = block_table[req_id, pos // self.block_size]
++        block_offset = pos % self.block_size
++
++        # Load the first 512 bytes (32x16B).
++        idx = lane_id
++        src = k_data_slice[page_id, block_offset, (None, idx)]
++        cute.copy(
++            cp16_atom,
++            cute.recast_tensor(src, Uint32),
++            s_kdata_slice[(None, idx), stage_id],
++        )
++
++        # Load the tail 64 bytes.
++        idx += 32
++        if idx < cutlass.const_expr(self.data_dim // 16):
++            src = k_data_slice[page_id, block_offset, (None, idx)]
++            cute.copy(
++                cp16_atom,
++                cute.recast_tensor(src, Uint32),
++                s_kdata_slice[(None, idx), stage_id],
++            )
++        elif idx == cutlass.const_expr(self.data_dim // 16):
++            cute.copy(
++                cp8_atom,
++                k_scale[page_id, block_offset, None],
++                s_kscale[None, stage_id],
++            )
++
++    @cute.kernel
++    def kernel(
++        self,
++        out: cute.Tensor,
++        k_data: cute.Tensor,
++        k_scale: cute.Tensor,
++        seq_lens: cute.Tensor,
++        gather_lens: cute.Tensor | None,
++        block_table: cute.Tensor,
++        offset: Int32,
++    ):
++        req_id, worker_id, _ = cute.arch.block_idx()
++        tid, _, _ = cute.arch.thread_idx()
++        warp_id = cute.arch.make_warp_uniform(tid // 32)
++        lane_id = tid % 32
++
++        _, num_workers, _ = cute.arch.grid_dim()
++
++        # Prepare smem.
++        smem = cutlass.utils.SmemAllocator()
++        s_kdata = smem.allocate_tensor(
++            Uint32,
++            cute.make_layout((self.data_dim // 4, self.num_warps, self.num_stages)),
++            byte_alignment=16,
++        )[None, warp_id, None]
++        s_kscale = smem.allocate_tensor(
++            Uint8,
++            cute.make_layout((8, self.num_warps, self.num_stages)),
++            byte_alignment=8,
++        )[None, warp_id, None]
++
++        # Prepare for 16B cp.async, also for BF16 smem loads later.
++        k_data_slice = cute.logical_divide(k_data, (None, None, 16))
++        s_kdata_16B_slice = cute.logical_divide(s_kdata, (4, None))
++
++        # Load FP8 elems in 8B units, so once dequantized, they are 16B units.
++        s_kdata_8B_slice = cute.logical_divide(s_kdata, (2, None))
++
++        # 16B st.global.
++        out_slice = cute.logical_divide(out, (None, None, 8))
++
++        cp_op = cute.nvgpu.CopyUniversalOp()
++        cp8_atom = cute.make_copy_atom(cp_op, Uint32, num_bits_per_copy=64)
++        cp16_atom = cute.make_copy_atom(cp_op, Uint32, num_bits_per_copy=128)
++
++        seq_len = seq_lens[req_id]
++        gather_len = seq_len
++        if cutlass.const_expr(gather_lens is not None):
++            gather_len = gather_lens[req_id]  # type: ignore[index]
++        start_pos = seq_len - gather_len
++
++        # Start prefetch.
++        for i in cutlass.range_constexpr(self.num_stages - 1):
++            next_pos = (
++                start_pos
++                + worker_id * self.num_warps
++                + warp_id
++                + i * num_workers * self.num_warps
++            )
++            if next_pos < seq_len:
++                self.load_g2s(
++                    k_data_slice,
++                    k_scale,
++                    block_table,
++                    s_kdata_16B_slice,
++                    s_kscale,
++                    req_id,
++                    next_pos,
++                    lane_id,
++                    i,
++                )
++            cute.arch.cp_async_commit_group()
++        prefetch_stage = self.num_stages - 1
++        compute_stage = 0
++
++        # Main loop.
++        for i in range(
++            worker_id * self.num_warps + warp_id,
++            gather_len,
++            num_workers * self.num_warps,
++        ):
++            pos = start_pos + i
++
++            # Prefetch next stage.
++            next_pos = pos + num_workers * self.num_warps * (self.num_stages - 1)
++            if next_pos < seq_len:
++                self.load_g2s(
++                    k_data_slice,
++                    k_scale,
++                    block_table,
++                    s_kdata_16B_slice,
++                    s_kscale,
++                    req_id,
++                    next_pos,
++                    lane_id,
++                    prefetch_stage,
++                )
++                prefetch_stage = (prefetch_stage + 1) % self.num_stages
++            cute.arch.cp_async_commit_group()
++
++            # Wait for gmem->smem to finish.
++            cute.arch.cp_async_wait_group(self.num_stages - 1)
++            cute.arch.sync_warp()
++
++            # There are 512 elems per token. As a warp, data0 holds the first
++            # 256 elems and data1 holds the second 256 elems, i.e. each thread
++            # holds 8 FP8 elems. This keeps the dequantized 8 BF16 elems as
++            # contiguous 16B global stores. On Blackwell, this might not be
++            # necessary as we have 32B global stores, but doing it this way
++            # does not seem to be slower.
++            data0 = cute.make_rmem_tensor((2,), Uint32)
++            data1 = cute.make_rmem_tensor((2,), Uint32)
++            cute.copy(cp8_atom, s_kdata_8B_slice[(None, lane_id), compute_stage], data0)
++            cute.copy(
++                cp8_atom,
++                s_kdata_8B_slice[(None, lane_id + 32), compute_stage],
++                data1,
++            )
++
++            # Convert to bf16x2 via bit manipulation. FP8 scales are per 64
++            # elements. An 8-element chunk advances the scale index by
++            # chunk_id * 8 // group_size.
++            scale0_u32 = Uint32(s_kscale[lane_id * 8 // self.group_size, compute_stage])
++            scale0_bf16x2 = (scale0_u32 << Uint32(23)) | (scale0_u32 << Uint32(7))
++            scale1_u32 = Uint32(
++                s_kscale[(lane_id + 32) * 8 // self.group_size, compute_stage]
++            )
++            scale1_bf16x2 = (scale1_u32 << Uint32(23)) | (scale1_u32 << Uint32(7))
++
++            # cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 requires PTX 9.2
++            # (CUDA 13.2).
++            dequant0 = cute.make_rmem_tensor(4, Uint32)
++            dequant1 = cute.make_rmem_tensor(4, Uint32)
++            for j in cutlass.range_constexpr(2):
++                tmp0 = _fp8x4_to_bf16x4(data0[j])
++                tmp1 = _fp8x4_to_bf16x4(data1[j])
++
++                # BF16 multiply is safe because the scales are exact powers of 2.
++                dequant0[j * 2] = _bf16x2_mul(tmp0[0], scale0_bf16x2)
++                dequant1[j * 2] = _bf16x2_mul(tmp1[0], scale1_bf16x2)
++                dequant0[j * 2 + 1] = _bf16x2_mul(tmp0[1], scale0_bf16x2)
++                dequant1[j * 2 + 1] = _bf16x2_mul(tmp1[1], scale1_bf16x2)
++
++            # Last 64 elems are BF16 tail, corresponds to dequant1 of last
++            # 8 threads. We have 448 FP8 + 64 BF16 -> 28x 16B for FP8 +
++            # 8x 16B for BF16.
++            if lane_id + 32 >= self.fp8_dim // 8:
++                idx = self.fp8_dim // 16 + (lane_id + 32) - self.fp8_dim // 8
++                cute.copy(
++                    cp16_atom,
++                    s_kdata_16B_slice[(None, idx), compute_stage],
++                    dequant1,
++                )
++
++            # Store two 16B BF16 chunks per lane: first half, then second half.
++            dst = out_slice[req_id, offset + i, (None, lane_id)]
++            cute.copy(cp16_atom, dequant0, cute.recast_tensor(dst, Uint32))
++
++            dst = out_slice[req_id, offset + i, (None, lane_id + 32)]
++            cute.copy(cp16_atom, dequant1, cute.recast_tensor(dst, Uint32))
++
++            compute_stage = (compute_stage + 1) % self.num_stages
++
++    @cache
++    @staticmethod
++    def compile(
++        fp8_dim: int = 448,
++        block_size: int = 64,
++        has_gather_lens: bool = True,
++    ):
++        num_reqs = cute.sym_int()
++        head_dim = DequantGatherKCacheKernel.head_dim
++        head_bytes = fp8_dim + (head_dim - fp8_dim) * 2 + 8
++
++        out = make_fake_tensor(BFloat16, (num_reqs, cute.sym_int(), head_dim), 16)
++        k_cache = cute.runtime.make_fake_tensor(
++            Uint8,
++            (cute.sym_int(), block_size, head_bytes),
++            stride=(cute.sym_int64(divisibility=32), head_bytes, 1),
++            assumed_align=32,
++        )
++        seq_lens = make_fake_tensor(Int32, (num_reqs,))
++        gather_lens = make_fake_tensor(Int32, (num_reqs,)) if has_gather_lens else None
++        block_table = make_fake_tensor(Int32, (num_reqs, cute.sym_int()))
++
++        kernel = DequantGatherKCacheKernel(fp8_dim, block_size)
++        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
++        return cute.compile(
++            kernel,
++            out,
++            k_cache,
++            seq_lens,
++            gather_lens,
++            block_table,
++            Int32(0),
++            stream,
++            options="--enable-tvm-ffi",
++        )
+diff --git a/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py b/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py
+index 3ba60bb33102..4468a95651bf 100644
+--- a/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py
++++ b/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py
+@@ -1,7 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-# once we have more CuteDSL kernels in vLLM, we can refactor small helper functions
+-# to a separate file
+ from functools import cache
+ 
+ import cutlass
+@@ -9,10 +7,16 @@
+ import torch
+ from cuda.bindings.driver import CUstream
+ from cutlass import BFloat16, Float32, Int64, Uint8, Uint32, const_expr
+-from cutlass._mlir.dialects import llvm
+-from cutlass.cutlass_dsl import T, dsl_user_op
+ from quack.compile_utils import make_fake_tensor
+ 
++from vllm.v1.attention.ops.deepseek_v4_ops.cutedsl_utils import (
++    _bf16x2_abs,
++    _bf16x2_max,
++    _bf16x2_to_fp32,
++    _fp32x2_to_bf16x2,
++    _fp32x8_to_fp4x8,
++    _recast_val,
++)
+ from vllm.vllm_flash_attn.cute import utils as cute_utils
+ 
+ # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
+@@ -61,94 +65,6 @@ def fused_indexer_q_rope_quant_mxfp4_cutedsl(
+     )
+ 
+ 
+-@dsl_user_op
+-def _recast_val(x, dtype, *, loc=None, ip=None):
+-    return dtype(llvm.bitcast(dtype.mlir_type, x.ir_value(loc=loc, ip=ip)))
+-
+-
+-@dsl_user_op
+-def _fp32x2_to_bf16x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+-    out = llvm.inline_asm(
+-        T.i32(),
+-        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+-        "cvt.rn.bf16x2.f32 $0, $2, $1;",
+-        "=r,f,f",
+-        has_side_effects=False,
+-        is_align_stack=False,
+-    )
+-    return Uint32(out)
+-
+-
+-@dsl_user_op
+-def _bf16x2_to_fp32(data: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+-    out = llvm.inline_asm(
+-        llvm.StructType.get_literal([T.f32(), T.f32()]),
+-        [data.ir_value(loc=loc, ip=ip)],
+-        "shl.b32 $0, $2, 16;\n\tand.b32 $1, $2, 0xFFFF0000;\n",
+-        "=f,=f,r",
+-        has_side_effects=False,
+-        is_align_stack=False,
+-    )
+-    return (
+-        Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
+-        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+-    )
+-
+-
+-@dsl_user_op
+-def _bf16x2_abs(a: Uint32, *, loc=None, ip=None) -> Uint32:
+-    out = llvm.inline_asm(
+-        T.i32(),
+-        [a.ir_value(loc=loc, ip=ip)],
+-        "abs.bf16x2 $0, $1;",
+-        "=r,r",
+-        has_side_effects=False,
+-        is_align_stack=False,
+-    )
+-    return Uint32(out)
+-
+-
+-@dsl_user_op
+-def _bf16x2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+-    out = llvm.inline_asm(
+-        T.i32(),
+-        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+-        "max.bf16x2 $0, $1, $2;",
+-        "=r,r,r",
+-        has_side_effects=False,
+-        is_align_stack=False,
+-    )
+-    return Uint32(out)
+-
+-
+-@dsl_user_op
+-def _fp32x8_to_fp4x8(
+-    vals: cute.Tensor,
+-    offset: cutlass.Constexpr[int],
+-    *,
+-    loc=None,
+-    ip=None,
+-) -> Uint32:
+-    # Pack eight scaled FP32 values into four E2M1x2 bytes, returned as one b32.
+-    assert vals.element_type is Float32
+-    out = llvm.inline_asm(
+-        T.i32(),
+-        [vals[offset + i].ir_value(loc=loc, ip=ip) for i in range(8)],
+-        "{\n\t"
+-        ".reg .b8 x0, x1, x2, x3;\n\t"
+-        "cvt.rn.satfinite.e2m1x2.f32 x0, $2, $1;\n\t"
+-        "cvt.rn.satfinite.e2m1x2.f32 x1, $4, $3;\n\t"
+-        "cvt.rn.satfinite.e2m1x2.f32 x2, $6, $5;\n\t"
+-        "cvt.rn.satfinite.e2m1x2.f32 x3, $8, $7;\n\t"
+-        "mov.b32 $0, {x0, x1, x2, x3};\n\t"
+-        "}\n",
+-        "=r,f,f,f,f,f,f,f,f",
+-        has_side_effects=False,
+-        is_align_stack=False,
+-    )
+-    return Uint32(out)
+-
+-
+ class IndexerQMxFp4Kernel:
+     """Eight-thread subwarps process one ``(token, head)`` row."""
+ 

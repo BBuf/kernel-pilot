@@ -1,0 +1,1589 @@
+diff --git a/examples/dsa_hisa/README.md b/examples/dsa_hisa/README.md
+new file mode 100644
+index 0000000000..5eb0f72a8a
+--- /dev/null
++++ b/examples/dsa_hisa/README.md
+@@ -0,0 +1,200 @@
++# tilelang_kernels — hisa prefill pipeline
++
++Tilelang prefill implementation of **hisa** (HIerarchical Sparse Attention).
++Paper: <https://arxiv.org/pdf/2603.28458>.
++
++## What is HISA?
++
++HISA optimizes DeepSeek sparse attention by a plug-and-play replacement
++for the indexer that rewrites the search path from a flat token scan into
++a two-stage hierarchical procedure.
++
++**Stage 1 — coarse block-level selection.** Group K tokens into pool blocks
++of `k_block_size` tokens, mean-pool each block, then score each query
++against all pool blocks and pick the top `block_topk` blocks per query.
++
++**Stage 2 — fine-grained token-level scoring.** For each query, run a
++full-resolution MQA over the raw tokens inside its selected blocks, then
++pick the top `topk_tokens` tokens per query.
++
++## Files
++
++| file | step | role |
++|---|---|---|
++| `fp8_block_mean_pooling.py` | 1.1 | Mean-pool raw K into pool blocks (fp8 + per-block f32 scale) |
++| `pool_mqa_fp8.py`           | 1.2 | fp8×fp8 score `Q · pooled_K` → one logit per (query, pool block) |
++| `clean_and_maintain_logits.py` | 1.3 | In-place mask on stage-1 logits: -inf outside per-query range, +inf at first/last valid block |
++| `block_sparse_mqa_fp8.py`   | 2.1 | fp8×fp8 fine-grained score over the raw tokens of the `block_topk` selected blocks |
++| `hisa.py`                   | —   | End-to-end orchestration: all four kernels + the two `torch.topk` steps + the index-translation post-processing |
++
++Each per-kernel file has one `test_*` entry that (a) runs the kernel +
++torch ref, (b) asserts via `torch.testing.assert_close`, (c) prints the
++latency of the kernel. `hisa.py` has `test_hisa` that runs the full
++pipeline, checks the output-index mask invariant, and prints end-to-end
++latency.
++
++## Per-kernel reference
++
++### 1.1 `fp8_block_mean_pooling.py`
++
++**Function**: `fp8_native_block_mean_pooling`
++
++**Meaning**: flat per-block mean of the chunk's K tokens, re-quantized to
++fp8 with a per-block f32 scale. Groups `N` K tokens into
++`ceildiv(N, k_block_size)` pool blocks.
++
++**Interface**:
++```python
++blocked_k, blocked_k_scale = fp8_native_block_mean_pooling_interface(
++    k,           # [N, D] fp8
++    k_scale,     # [N] f32  — per-token scale from indexer_k_quant_and_cache
++    k_block_size,
++)
++# blocked_k:       [num_blocks, D] fp8
++# blocked_k_scale: [num_blocks]    f32
++```
++
++**What it does**: per pool block `b` of size `kb = k_block_size`,
++1. dequantize each of the `kb` tokens: `k_f[i] = k_fp8[i] * k_scale[i]`
++2. average across the block in f32: `mean = sum_i k_f[i] / kb` (or the
++   actual valid count for the ragged tail block)
++3. re-quantize the f32 mean to fp8 with a per-block scale
++   `block_scale = max(max_abs(mean) / 448, 1e-10)`, writing
++   `blocked_k[b] = fp8(mean / block_scale)` and `blocked_k_scale[b] = block_scale`.
++
++### 1.2 `pool_mqa_fp8.py`
++
++**Function**: `pool_mqa_attn_return_logits_fp8`
++
++**Meaning**: coarse-grained fp8 multi-query attention over the **pooled** K
++(one vector per pool block). Produces one logit per (query, pool-block).
++
++**Interface**:
++```python
++block_k_score = pool_mqa_attn_return_logits_fp8_interface(
++    q_fp8,                    # [M, H, D] fp8
++    blocked_kv_fp8,           # [Nb, D]   fp8     (from step 1.1)
++    blocked_kv_scale,         # [Nb]      f32     (from step 1.1)
++    weights_f32,              # [M, H]    f32
++    cu_seqlen_blocked_ks,     # [M] int32 — per-query start in pool-block coords
++    cu_seqlen_blocked_ke,     # [M] int32 — per-query end   in pool-block coords
++)
++# block_k_score: [M, Nb] f32
++```
++
++**What it does**: for each query `m` and each pool block `n` in
++`[cu_seqlen_blocked_ks[m], cu_seqlen_blocked_ke[m])`,
++```
++block_k_score[m, n] = sum_h ReLU(q[m, h] · blocked_k[n]) * blocked_k_scale[n] * weights[m, h]
++```
++Uses tile-level fp8×fp8→f32 Tensor Core GEMM; the per-block scale is
++applied post-GEMM. The kernel processes queries in tiles of size
++`block_Q × block_N` and **writes the union of the tile's queries' visible
++K ranges** — entries outside an individual query's range inside that
++union still carry raw dot-product values (they will be masked by
++step 1.3 next). Entries outside the tile union are left at their
++zero-init value.
++
++### 1.3 `clean_and_maintain_logits.py`
++
++**Function**: `clean_and_maintain_logits_`
++
++**Meaning**: in-place post-kernel mask on the stage-1 logits.
++
++**Interface**:
++```python
++clean_and_maintain_logits_interface(
++    logits,        # [M, Nb] f32 — stage-1 output; modified in place
++    cu_seqlen_ks,  # [M] int32 — per-row start (inclusive)
++    cu_seqlen_ke,  # [M] int32 — per-row end   (exclusive)
++)
++```
++
++**What it does**: for each row `m`,
++- positions outside `[cu_seqlen_ks[m], cu_seqlen_ke[m])` → set to `-inf`
++  (so `torch.topk` ignores them),
++- positions `cu_seqlen_ks[m]` and `cu_seqlen_ke[m] - 1`      → set to `+inf`
++  (force-maintain the boundary blocks: they are always picked by the
++  subsequent top-block selection — a standard hisa trick to preserve
++  sink and local blocks).
++
++### 2.1 `block_sparse_mqa_fp8.py`
++
++**Function**: `fp8_native_block_sparse_mqa_attn_return_logits`
++
++**Meaning**: fine-grained fp8 MQA over only the **raw K tokens** inside the
++top-`block_topk` pool blocks selected per query. Two kernel variants are
++auto-dispatched by the factory:
++- general (`kv_block_size > block_N`): pipelined sub-block inner loop
++- small-pooling-size (`kv_block_size == block_N`): single pass, no pipeline
++
++**Interface**:
++```python
++block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
++    q,                  # [M, H, D] fp8
++    k,                  # [N, D]    fp8
++    k_scale,            # [N]       f32
++    topk_block_index,   # [M, block_topk] int64 — from torch.topk over stage-1 scores
++    kv_block_size,      # == k_block_size
++    weights,            # [M, H] f32
++    cu_seqlen_ks,       # [M] int32 — per-query K start (absolute, in raw tokens)
++    cu_seqlen_ke,       # [M] int32 — per-query K end
++)
++# block_sparse_logits: [M, block_topk * kv_block_size] f32
++```
++
++**What it does**: for each query `m`, for each selected block
++`t ∈ [0, block_topk)` with `blk = topk_block_index[m, t]`, for each
++in-block offset `i ∈ [0, kv_block_size)`,
++```
++k_abs = blk * kv_block_size + i
++if k_abs ∉ [cu_seqlen_ks[m], cu_seqlen_ke[m]) or k_abs >= N:
++    block_sparse_logits[m, t * kv_block_size + i] = -inf
++else:
++    block_sparse_logits[m, t * kv_block_size + i] =
++        sum_h ReLU(q[m, h] · k[k_abs]) * k_scale[k_abs] * weights[m, h]
++```
++The out-of-range mask is written directly by this kernel — no separate
++mask pass is needed here (unlike stage 1).
++
++### End-to-end `hisa.py`
++
++**Function**: `hisa_indexer`
++
++**Meaning**: single entry point that runs the full pipeline below.
++
++**Interface**:
++```python
++topk_indices = hisa_indexer(
++    q,                # [M, H, D] fp8
++    k,                # [N, D]    fp8
++    k_scale,          # [N]       f32
++    weights,          # [M, H]    f32
++    cu_seqlen_ks,     # [M]       int32 — per-query K start
++    cu_seqlen_ke,     # [M]       int32 — per-query K end
++    *,
++    k_block_size,     # pool block size (=128 in DeepSeek-V3.2)
++    block_topk,       # number of top pool blocks kept per query
++    topk_tokens,      # final top-k size handed to the sparse attention
++)
++# topk_indices: [M, topk_tokens] int32 — each row is the query's top-k K
++# positions expressed as offsets within its own [cu_ks, cu_ke) window.
++# Out-of-range slots are -1.
++```
++
++**Pipeline**:
++
++```
++(1.1) fp8_native_block_mean_pooling            K, k_scale → blocked_k, blocked_k_scale
++(1.2) pool_mqa_attn_return_logits_fp8          Q × blocked_k → block_k_score[M, Nb]
++(1.3) clean_and_maintain_logits                in-place mask (-inf/+inf) on block_k_score
++(1.4) torch.topk(block_k_score.bfloat16(),     → topk_block_indices[M, block_topk] int64
++                 k=block_topk, sorted=False)
++(2.1) fp8_native_block_sparse_mqa_…            Q × K[selected] → block_sparse_logits
++                                                  [M, block_topk * k_block_size]
++(2.2) torch.topk(block_sparse_logits,          → relevant_topk_indices[M, topk_tokens] int64
++                 k=topk_tokens)
++(2.3) (Python) gather topk_block_indices +     → absolute K positions, then subtract
++      arith + subtract cu_seqlen_ks + mask        cu_seqlen_ks for per-query-relative offsets
++                                                  → topk_indices[M, topk_tokens] int32
++```
+diff --git a/examples/dsa_hisa/block_sparse_mqa_fp8.py b/examples/dsa_hisa/block_sparse_mqa_fp8.py
+new file mode 100644
+index 0000000000..10f95bb204
+--- /dev/null
++++ b/examples/dsa_hisa/block_sparse_mqa_fp8.py
+@@ -0,0 +1,269 @@
++import tilelang
++from tilelang import language as T
++from tilelang.profiler import do_bench
++import torch
++
++from tilelang_utils import prepare_ks_ke_from_cu_seqlens
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    },
++)
++def fp8_native_block_sparse_mqa_attn_return_logits(
++    IndexQ,
++    IndexK,
++    IndexKScale,
++    TopKBlockIndex,
++    Weights,
++    CuSeqLenKS,
++    CuSeqLenKE,
++    heads: int = 64,
++    index_dim: int = 128,
++    kv_block_size: int = 128,
++    topk: int = 64,
++    block_N: int = 128,
++    num_stages: int = 1,
++    threads: int = 256,
++):
++    fp8_dtype = T.float8_e4m3fn
++    accum_dtype = T.float32
++    index_dtype = T.int32
++    topk_index_dtype = T.int64
++
++    seq_len, seq_len_kv = T.const("seq_len, seq_len_kv")
++
++    H_per_block = heads
++    block_N = min(block_N, kv_block_size // 2)
++    assert kv_block_size % block_N == 0, "block_N must divide kv_block_size"
++
++    IndexQ: T.Tensor[[seq_len * heads, index_dim], fp8_dtype]
++    IndexK: T.Tensor[[seq_len_kv, index_dim], fp8_dtype]
++    IndexKScale: T.Tensor[[seq_len_kv], accum_dtype]
++    TopKBlockIndex: T.Tensor[[seq_len, topk], topk_index_dtype]
++    Weights: T.Tensor[[seq_len, heads], accum_dtype]
++    CuSeqLenKS: T.Tensor[[seq_len], index_dtype]
++    CuSeqLenKE: T.Tensor[[seq_len], index_dtype]
++
++    Logits = T.empty((seq_len, topk * kv_block_size), accum_dtype)
++
++    with T.Kernel(seq_len, threads=threads) as bx:
++        index_q_shared = T.alloc_shared([H_per_block, index_dim], fp8_dtype)
++        index_k_shared = T.alloc_shared([block_N, index_dim], fp8_dtype)
++        # Shared (zero-init'd) — see note in the hisa source about serial-topk
++        # loop making shared slightly faster than fragment here.
++        scale_shared = T.alloc_shared([block_N], accum_dtype)
++
++        s = T.alloc_fragment([block_N, H_per_block], accum_dtype)
++        s_reshaped = T.reshape(s, (block_N, H_per_block // heads, heads))
++        logits = T.alloc_fragment([block_N, H_per_block // heads], accum_dtype)
++        weights = T.alloc_fragment([H_per_block // heads, heads], accum_dtype)
++
++        seq_len_i = bx
++
++        cu_k_s_min = CuSeqLenKS[seq_len_i]
++        cu_k_e_max = CuSeqLenKE[seq_len_i]
++
++        T.copy(IndexQ[seq_len_i * heads : seq_len_i * heads + H_per_block, :], index_q_shared)
++        T.copy(Weights[seq_len_i, :], weights)
++
++        for n_i in T.serial(topk):
++            topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i], index_dtype)
++            block_s = topk_block_id * kv_block_size
++            for b_i in T.Pipelined(kv_block_size // block_N, num_stages=num_stages):
++                block_s_i = block_s + b_i * block_N
++
++                T.copy(IndexK[block_s_i : block_s_i + block_N, :], index_k_shared)
++                for bn_i in T.Parallel(block_N):
++                    scale_shared[bn_i] = IndexKScale[block_s_i + bn_i]
++
++                T.gemm(
++                    index_k_shared,
++                    index_q_shared,
++                    s,
++                    transpose_B=True,
++                    clear_accum=True,
++                    policy=T.GemmWarpPolicy.FullRow,
++                )
++
++                for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
++                    s_reshaped[bn_i, bq_i, h_i] = T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0) * weights[bq_i, h_i]
++
++                T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
++
++                for i_i in T.Parallel(block_N):
++                    k_i = block_s_i + i_i
++                    if k_i < cu_k_s_min or k_i >= cu_k_e_max:
++                        logits[i_i, 0] = -T.infinity(accum_dtype)
++
++                for bn_i in T.Parallel(block_N):
++                    Logits[seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i] = logits[bn_i, 0]
++
++    return Logits
++
++
++def fp8_native_block_sparse_mqa_attn_return_logits_interface(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    k_scale: torch.Tensor,
++    topk_block_index: torch.Tensor,
++    kv_block_size: int,
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++):
++    seq_len, heads, index_dim = q.shape
++    topk = topk_block_index.shape[1]
++    logits = fp8_native_block_sparse_mqa_attn_return_logits(
++        q.view(seq_len * heads, index_dim),
++        k,
++        k_scale,
++        topk_block_index,
++        weights,
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++        heads=heads,
++        index_dim=index_dim,
++        kv_block_size=kv_block_size,
++        topk=topk,
++    )
++    return logits
++
++
++def ref_fp8_block_sparse_mqa(
++    q_fp8: torch.Tensor,
++    k_fp8: torch.Tensor,
++    k_scale: torch.Tensor,
++    topk_block_index: torch.Tensor,
++    kv_block_size: int,
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++) -> torch.Tensor:
++    M, H, D = q_fp8.shape
++    N = k_fp8.shape[0]
++    topk = topk_block_index.shape[1]
++
++    block_starts = topk_block_index.long() * kv_block_size  # [M, topk]
++    pos_in_block = torch.arange(kv_block_size, device=q_fp8.device)
++    k_abs = block_starts[..., None] + pos_in_block[None, None, :]  # [M, topk, B]
++    k_safe = k_abs.clamp(0, N - 1)
++
++    q_f = q_fp8.float()
++    k_f = k_fp8.float() * k_scale[:, None]
++    gathered_k = k_f[k_safe.flatten()].reshape(M, topk, kv_block_size, D)
++
++    s = torch.einsum("mhd,mtid->mtih", q_f, gathered_k)  # [M, topk, B, H]
++    logits = (s.clamp(min=0) * weights[:, None, None, :]).sum(dim=-1)  # [M, topk, B]
++
++    in_range = (k_abs >= cu_seqlen_ks.long()[:, None, None]) & (k_abs < cu_seqlen_ke.long()[:, None, None]) & (k_abs < N)
++    logits = logits.masked_fill(~in_range, float("-inf"))
++    return logits.reshape(M, topk * kv_block_size)
++
++
++def test_fp8_block_sparse_mqa(
++    M: int = 1024,
++    H: int = 64,
++    D: int = 128,
++    kv_block_size: int = 128,
++    topk: int = 64,
++    num_seqs: int = 1,
++):
++    """Correctness + speed test packing `num_seqs` equal-length causal
++    sequences into the [M, H, D] Q and [M, D] K tensors. Each query sees
++    only the prefix of its own sequence (``cu_ks = start_of_seq``,
++    ``cu_ke = start_of_seq + position_in_seq + 1``).
++
++    ``topk_block_index`` is drawn at random from [0, num_k_blocks) — some
++    picks will point to blocks outside the query's own sequence; those
++    positions get -inf via the kernel's built-in mask, and the torch ref
++    produces the same -inf. Comparison checks both the +/-inf mask
++    pattern (exact) and the finite values (fp8 tolerance)."""
++    torch.manual_seed(0)
++    assert M % num_seqs == 0, f"M ({M}) must be divisible by num_seqs ({num_seqs})"
++    N = M  # causal self-attention prefill, packed
++
++    per_seq = M // num_seqs
++    cu_seqlens = torch.arange(num_seqs + 1, device="cuda", dtype=torch.long) * per_seq
++    ks_long, ke_long = prepare_ks_ke_from_cu_seqlens(cu_seqlens)
++    cu_ks = ks_long.to(torch.int32).contiguous()
++    cu_ke = ke_long.to(torch.int32).contiguous()
++
++    q_bf16 = torch.randn(M, H, D, device="cuda", dtype=torch.bfloat16)
++    q = q_bf16.to(torch.float8_e4m3fn)
++    k_bf16 = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
++    k = k_bf16.to(torch.float8_e4m3fn)
++    k_scale = (0.1 + 0.01 * torch.rand(N, device="cuda", dtype=torch.float32)).contiguous()
++    weights = torch.randn(M, H, device="cuda", dtype=torch.float32)
++
++    # Random per-query top-k blocks (distinct indices drawn from [0, num_blocks)).
++    num_k_blocks = (N + kv_block_size - 1) // kv_block_size
++    topk = min(topk, num_k_blocks)
++    g = torch.Generator(device="cuda").manual_seed(42)
++    topk_block_index = torch.stack([torch.randperm(num_k_blocks, generator=g, device="cuda")[:topk] for _ in range(M)]).to(torch.int64)
++
++    # Correctness.
++    got = fp8_native_block_sparse_mqa_attn_return_logits_interface(
++        q,
++        k,
++        k_scale,
++        topk_block_index,
++        kv_block_size,
++        weights,
++        cu_ks,
++        cu_ke,
++    )
++    ref = ref_fp8_block_sparse_mqa(
++        q,
++        k,
++        k_scale,
++        topk_block_index,
++        kv_block_size,
++        weights,
++        cu_ks,
++        cu_ke,
++    )
++    # The kernel marks out-of-range as -inf. Compare finite positions only —
++    # the -inf mask pattern must agree exactly, so we also check that.
++    finite = torch.isfinite(got) & torch.isfinite(ref)
++    assert torch.equal(torch.isposinf(got), torch.isposinf(ref)), "pos-inf mask differs"
++    assert torch.equal(torch.isneginf(got), torch.isneginf(ref)), "neg-inf mask differs"
++    torch.testing.assert_close(got[finite], ref[finite], rtol=1e-1, atol=2e-1)
++    print(f"  correctness: PASS  (M={M}, H={H}, D={D}, kv_block_size={kv_block_size}, topk={topk}, num_seqs={num_seqs}, per_seq={per_seq})")
++
++    # Speed.
++    def fn():
++        return fp8_native_block_sparse_mqa_attn_return_logits_interface(
++            q,
++            k,
++            k_scale,
++            topk_block_index,
++            kv_block_size,
++            weights,
++            cu_ks,
++            cu_ke,
++        )
++
++    ms = do_bench(fn, warmup=50, rep=200)
++    # FLOPs: M × topk × kv_block_size × H × D (fp8×fp8) × 2 (mul+add).
++    total_flops = 2 * M * topk * kv_block_size * H * D
++    tflops = total_flops / (ms * 1e-3) / 1e12
++    print(f"  latency: {ms:.4f} ms  ({tflops:.2f} fp8 TFLOPS)")
++
++
++if __name__ == "__main__":
++    # Ref path materialises [M, topk, B, D] fp32 gathered_k which is ~M GB at
++    # topk=64, kv_block_size=128, D=128. Keep M modest to avoid OOM.
++    # (M, H, D, kv_block_size, topk, num_seqs)
++    for cfg in [
++        (1024, 64, 128, 128, 64, 1),
++        (4096, 64, 128, 128, 64, 1),
++        (4096, 64, 128, 128, 64, 4),
++        (8192, 64, 128, 128, 64, 1),
++        (8192, 64, 128, 128, 64, 8),
++        (8192, 64, 128, 64, 128, 8),
++        (8192, 64, 128, 256, 32, 8),
++    ]:
++        test_fp8_block_sparse_mqa(*cfg)
++        torch.cuda.empty_cache()
+diff --git a/examples/dsa_hisa/clean_and_maintain_logits.py b/examples/dsa_hisa/clean_and_maintain_logits.py
+new file mode 100644
+index 0000000000..12ff8a4c10
+--- /dev/null
++++ b/examples/dsa_hisa/clean_and_maintain_logits.py
+@@ -0,0 +1,121 @@
++import tilelang
++from tilelang import language as T
++from tilelang.profiler import do_bench
++import torch
++
++from tilelang_utils import prepare_ks_ke_from_cu_seqlens
++
++
++@tilelang.jit
++def clean_and_maintain_logits_(
++    Logits,
++    CuSeqLenKS,
++    CuSeqLenKE,
++    threads: int = 512,
++    block_K: int = 4096,
++):
++    seq_len, seq_len_kv = T.const("seq_len, seq_len_kv")
++
++    dtype = T.float
++    indices_dtype = T.int32
++
++    Logits: T.Tensor[[seq_len, seq_len_kv], dtype]
++    CuSeqLenKS: T.Tensor[[seq_len], indices_dtype]
++    CuSeqLenKE: T.Tensor[[seq_len], indices_dtype]
++
++    with T.Kernel(seq_len, threads=threads) as bx:
++        tx = T.thread_binding(0, threads, thread="threadIdx.x")
++        cu_k_s = CuSeqLenKS[bx]
++        cu_k_e = CuSeqLenKE[bx]
++
++        for n_i in T.Pipelined(T.ceildiv(seq_len_kv, block_K)):
++            for k_i in T.serial(block_K // threads):
++                idx = n_i * block_K + k_i * threads + tx
++                if idx == cu_k_s or idx == cu_k_e - 1:
++                    Logits[bx, idx] = T.infinity(dtype)
++                if idx < cu_k_s or idx >= cu_k_e:
++                    Logits[bx, idx] = -T.infinity(dtype)
++
++
++def clean_and_maintain_logits_interface(
++    logits: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++):
++    """In-place: applies +inf/-inf mask based on per-row [ks, ke)."""
++    clean_and_maintain_logits_(logits, cu_seqlen_ks, cu_seqlen_ke)
++    return logits
++
++
++def ref_clean_and_maintain_logits(
++    logits: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++) -> torch.Tensor:
++    """Pure torch equivalent. Returns a new tensor (doesn't mutate the input)."""
++    M, N = logits.shape
++    out = logits.clone()
++    n = torch.arange(N, device=logits.device)[None, :]
++    mask_out = (n < cu_seqlen_ks.long()[:, None]) | (n >= cu_seqlen_ke.long()[:, None])
++    out = out.masked_fill(mask_out, float("-inf"))
++    m_idx = torch.arange(M, device=logits.device)
++    out[m_idx, cu_seqlen_ks.long()] = float("inf")
++    out[m_idx, (cu_seqlen_ke - 1).clamp(min=0).long()] = float("inf")
++    return out
++
++
++def test_clean_and_maintain_logits(M: int = 4096, N: int = 4096, num_seqs: int = 1):
++    """Correctness + speed test where `M` query rows are packed from
++    `num_seqs` equal-length causal sequences. Per-row ``cu_ks / cu_ke``
++    is derived from ``prepare_ks_ke_from_cu_seqlens`` so each row sees
++    only the prefix of its own sequence (causal self-attention)."""
++    torch.manual_seed(0)
++    assert M % num_seqs == 0, f"M ({M}) must be divisible by num_seqs ({num_seqs})"
++    assert (M // num_seqs) <= N, "N must accommodate the longest sequence"
++
++    per_seq = M // num_seqs
++    cu_seqlens = torch.arange(num_seqs + 1, device="cuda", dtype=torch.long) * per_seq
++    ks_long, ke_long = prepare_ks_ke_from_cu_seqlens(cu_seqlens)
++    cu_ks = ks_long.to(torch.int32).contiguous()
++    cu_ke = ke_long.to(torch.int32).clamp(max=N).contiguous()
++
++    logits_init = torch.randn(M, N, device="cuda", dtype=torch.float32)
++
++    # Run kernel in place on a copy.
++    got = logits_init.clone()
++    clean_and_maintain_logits_interface(got, cu_ks, cu_ke)
++
++    # Ref.
++    ref = ref_clean_and_maintain_logits(logits_init, cu_ks, cu_ke)
++
++    # Exact equality: this kernel only writes +/-inf, other positions untouched
++    # (ref clones the input and does the same). Compare directly.
++    assert torch.equal(torch.isposinf(got), torch.isposinf(ref)), "pos-inf mask differs"
++    assert torch.equal(torch.isneginf(got), torch.isneginf(ref)), "neg-inf mask differs"
++    finite = torch.isfinite(got) & torch.isfinite(ref)
++    torch.testing.assert_close(got[finite], ref[finite], rtol=0.0, atol=0.0)
++    print(f"  correctness: PASS  (M={M}, N={N}, num_seqs={num_seqs}, per_seq={per_seq})")
++
++    # Speed.
++    def fn():
++        logits = torch.randn(M, N, device="cuda", dtype=torch.float32)  # fresh copy each iter
++        clean_and_maintain_logits_interface(logits, cu_ks, cu_ke)
++        return logits
++
++    ms = do_bench(fn, warmup=50, rep=200)
++    # ~2 reads + 1 write of [M, N] f32, but mostly no-op except at mask boundaries.
++    bytes_moved = 2 * M * N * 4
++    gbps = bytes_moved / (ms * 1e-3) / 1e9
++    print(f"  latency: {ms:.4f} ms  ({gbps:.1f} GB/s)")
++
++
++if __name__ == "__main__":
++    # (M, N, num_seqs)
++    for cfg in [
++        (4096, 4096, 1),
++        (4096, 4096, 4),
++        (16384, 16384, 1),
++        (16384, 16384, 8),
++        (65536, 65536, 16),
++    ]:
++        test_clean_and_maintain_logits(*cfg)
+diff --git a/examples/dsa_hisa/fp8_block_mean_pooling.py b/examples/dsa_hisa/fp8_block_mean_pooling.py
+new file mode 100644
+index 0000000000..1c9f90cc4c
+--- /dev/null
++++ b/examples/dsa_hisa/fp8_block_mean_pooling.py
+@@ -0,0 +1,146 @@
++import tilelang
++from tilelang import language as T
++from tilelang.profiler import do_bench
++import torch
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    },
++)
++def fp8_native_block_mean_pooling(
++    K,
++    KScale,
++    dim: int = 128,
++    pooling_block_size: int = 128,
++    block_N: int = 64,
++    num_stages: int = 1,
++    threads: int = 256,
++):
++    dtype = T.float8_e4m3fn
++    accum_dtype = T.float32
++    FP8_MAX_INV = 1.0 / 448.0
++
++    seq_len_k = T.const("seq_len_k")
++
++    K: T.Tensor[[seq_len_k, dim], dtype]
++    KScale: T.Tensor[[seq_len_k], accum_dtype]
++
++    num_blocks = T.ceildiv(seq_len_k, pooling_block_size)
++    BlockedK = T.empty((num_blocks, dim), dtype)
++    BlockedKScale = T.empty((num_blocks,), accum_dtype)
++
++    with T.Kernel(num_blocks, threads=threads) as bx:
++        index_k = T.alloc_fragment([block_N, dim], dtype)
++        scale = T.alloc_fragment([block_N], accum_dtype)
++        acc = T.alloc_fragment([dim], accum_dtype)
++        max_abs = T.alloc_fragment([1], accum_dtype)
++        T.fill(acc, 0.0)
++
++        k_start = bx * pooling_block_size
++        k_end = T.min(k_start + pooling_block_size, seq_len_k)
++        cur_pooling_block_size = k_end - k_start
++
++        for b_i in T.serial(T.ceildiv(cur_pooling_block_size, block_N)):
++            T.fill(index_k, 0.0)
++
++            tl_block_s = k_start + b_i * block_N
++            tl_block_e = T.min(k_start + (b_i + 1) * block_N, k_end)
++            T.copy(K[tl_block_s : tl_block_s + block_N, :], index_k)
++            for bn_i in T.Parallel(block_N):
++                scale[bn_i] = KScale[tl_block_s + bn_i]
++
++            for bn_i, d_i in T.Parallel(block_N, dim):
++                index_k[bn_i, d_i] = index_k[bn_i, d_i] * scale[bn_i]
++
++            cur_tl_block_size = tl_block_e - tl_block_s
++            for n_i in T.parallel(block_N):
++                for d_i in T.parallel(dim):
++                    if n_i >= cur_tl_block_size:
++                        index_k[n_i, d_i] = T.cast(0, accum_dtype)
++
++            T.reduce_sum(index_k, acc, dim=0, clear=False)
++
++        inv_count = T.cast(1.0, accum_dtype) / T.cast(cur_pooling_block_size, accum_dtype)
++        for d_i in T.Parallel(dim):
++            acc[d_i] = acc[d_i] * inv_count
++
++        # Re-quantize f32 mean to fp8 with a per-block scale.
++        T.reduce_absmax(acc, max_abs, dim=0, clear=True)
++        block_scale = T.max(max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype), T.cast(1e-10, accum_dtype))
++        inv_block_scale = T.cast(1.0, accum_dtype) / block_scale
++
++        for d_i in T.Parallel(dim):
++            BlockedK[bx, d_i] = T.cast(acc[d_i] * inv_block_scale, dtype)
++        BlockedKScale[bx] = block_scale
++
++    return BlockedK, BlockedKScale
++
++
++def fp8_native_block_mean_pooling_interface(k: torch.Tensor, k_scale: torch.Tensor, k_block_size: int):
++    return fp8_native_block_mean_pooling(k, k_scale, dim=k.shape[1], pooling_block_size=k_block_size)
++
++
++def ref_fp8_block_mean_pooling(k_fp8: torch.Tensor, k_scale: torch.Tensor, k_block_size: int) -> torch.Tensor:
++    """Spec: per-token dequant + per-block mean (dividing by actual valid count).
++    Returns the f32 mean (caller can compare against fp8*scale re-quant of the kernel)."""
++    N, D = k_fp8.shape
++    dequant = k_fp8.float() * k_scale[:, None]
++    num_blocks = (N + k_block_size - 1) // k_block_size
++    out = torch.empty(num_blocks, D, device=k_fp8.device, dtype=torch.float32)
++    for b in range(num_blocks):
++        s = b * k_block_size
++        e = min(s + k_block_size, N)
++        out[b] = dequant[s:e].sum(dim=0) / (e - s)
++    return out
++
++
++def test_fp8_block_mean_pooling(N: int = 16384, D: int = 128, k_block_size: int = 128, num_seqs: int = 1):
++    """Correctness + speed test with `num_seqs` sequences of equal length
++    packed into the flat K buffer.
++
++    NOTE: the flat mean-pool kernel is sequence-agnostic — it pools every
++    `k_block_size` consecutive tokens regardless of sequence boundaries.
++    `num_seqs` is accepted here for API consistency with the other kernels'
++    tests; it affects how `cu_seqlens` is laid out (shown for illustration)
++    but not the kernel's inputs / outputs.
++    """
++    torch.manual_seed(0)
++    assert N % num_seqs == 0, f"N ({N}) must be divisible by num_seqs ({num_seqs})"
++    per_seq = N // num_seqs
++
++    k_bf16 = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
++    k = k_bf16.to(torch.float8_e4m3fn)
++    k_scale = (0.1 + 0.01 * torch.rand(N, device="cuda", dtype=torch.float32)).contiguous()
++
++    # Correctness.
++    blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size)
++    got = blocked_k_fp8.float() * blocked_k_scale[:, None]
++    ref = ref_fp8_block_mean_pooling(k, k_scale, k_block_size)
++    # fp8 re-quant: ~1/256 rel error on top of bf16-level precision.
++    torch.testing.assert_close(got, ref, rtol=5e-2, atol=5e-3)
++    print(f"  correctness: PASS  (N={N}, D={D}, k_block_size={k_block_size}, num_seqs={num_seqs}, per_seq={per_seq})")
++
++    # Speed.
++    def fn():
++        return fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size)
++
++    ms = do_bench(fn, warmup=50, rep=200)
++    num_blocks = (N + k_block_size - 1) // k_block_size
++    # Bytes moved: read N * D fp8 (K) + N * 4 f32 (scale) + write num_blocks * D fp8 + num_blocks * 4 f32.
++    bytes_moved = N * D + N * 4 + num_blocks * D + num_blocks * 4
++    gbps = bytes_moved / (ms * 1e-3) / 1e9
++    print(f"  latency: {ms:.4f} ms  ({gbps:.1f} GB/s)")
++
++
++if __name__ == "__main__":
++    # (N, D, k_block_size, num_seqs)
++    for cfg in [
++        (16384, 128, 128, 1),
++        (16384, 128, 128, 4),
++        (65536, 128, 128, 1),
++        (65536, 128, 128, 8),
++        (131072, 128, 128, 16),
++    ]:
++        test_fp8_block_mean_pooling(*cfg)
+diff --git a/examples/dsa_hisa/hisa.py b/examples/dsa_hisa/hisa.py
+new file mode 100644
+index 0000000000..e9863874e1
+--- /dev/null
++++ b/examples/dsa_hisa/hisa.py
+@@ -0,0 +1,240 @@
++import torch
++from tilelang.profiler import do_bench
++
++from fp8_block_mean_pooling import fp8_native_block_mean_pooling_interface
++from pool_mqa_fp8 import pool_mqa_attn_return_logits_fp8_interface
++from block_sparse_mqa_fp8 import fp8_native_block_sparse_mqa_attn_return_logits_interface
++from clean_and_maintain_logits import clean_and_maintain_logits_interface
++from tilelang_utils import prepare_ks_ke_from_cu_seqlens
++
++
++def hisa_indexer(
++    q: torch.Tensor,  # [M, H, D] fp8_e4m3fn
++    k: torch.Tensor,  # [N, D] fp8_e4m3fn
++    k_scale: torch.Tensor,  # [N] f32
++    weights: torch.Tensor,  # [M, H] f32
++    cu_seqlen_ks: torch.Tensor,  # [M] int32 — per-query K start (inclusive)
++    cu_seqlen_ke: torch.Tensor,  # [M] int32 — per-query K end   (exclusive)
++    *,
++    k_block_size: int,
++    block_topk: int,
++    topk_tokens: int,
++) -> torch.Tensor:
++    """Run the full hisa prefill pipeline.
++
++    Returns: ``[M, topk_tokens]`` int32 — each row is this query's top
++    ``topk_tokens`` K positions, expressed as offsets relative to
++    ``cu_seqlen_ks[m]`` (so ``0`` means the query's own K start). Slots
++    that fell outside ``[cu_seqlen_ks[m], cu_seqlen_ke[m])`` get ``-1``.
++    """
++    # ------------------------------------------------------------------
++    # Stage 0: fp8 mean-pool over K. Groups K into pool blocks of
++    # k_block_size tokens each; outputs one fp8 vector + f32 scale per
++    # pool block. Grid = (ceil(N/k_block_size),).
++    # ------------------------------------------------------------------
++    blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_interface(
++        k,
++        k_scale,
++        k_block_size,
++    )  # [Nb, D] fp8, [Nb] f32
++
++    # Translate the per-query K range from flat-token coords to
++    # pool-block coords (floor for start, ceil for end).
++    cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
++    cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
++
++    # ------------------------------------------------------------------
++    # Stage 1: block-level Q·BlockedK score with ReLU + per-head weight
++    # reduction. Output is dense (kernel doesn't mask out-of-range).
++    # ------------------------------------------------------------------
++    block_k_score = pool_mqa_attn_return_logits_fp8_interface(
++        q,
++        blocked_k_fp8,
++        blocked_k_scale,
++        weights,
++        cu_seqlen_blocked_ks,
++        cu_seqlen_blocked_ke,
++    )  # [M, Nb] f32
++
++    # Mask out-of-range entries to -inf and force +inf on first / last
++    # valid block so torch.topk picks the boundary blocks.
++    clean_and_maintain_logits_interface(
++        block_k_score,
++        cu_seqlen_blocked_ks,
++        cu_seqlen_blocked_ke,
++    )
++
++    # ------------------------------------------------------------------
++    # Stage 1.5: top-block_topk selection. bfloat16 + sorted=False is
++    # ~40% faster than f32 and the downstream sparse_mqa doesn't rely
++    # on order.
++    # ------------------------------------------------------------------
++    block_topk_eff = min(block_topk, block_k_score.shape[-1])
++    topk_block_indices = torch.topk(
++        block_k_score.bfloat16(),
++        k=block_topk_eff,
++        dim=-1,
++        sorted=False,
++    ).indices  # [M, block_topk_eff] int64
++
++    # ------------------------------------------------------------------
++    # Stage 2: fp8 fine-grained Q·K MQA over only the selected
++    # blocks' raw tokens (block_topk_eff blocks × k_block_size tokens
++    # per query). The kernel writes -inf for positions outside
++    # [cu_seqlen_ks[m], cu_seqlen_ke[m]).
++    # ------------------------------------------------------------------
++    block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
++        q,
++        k,
++        k_scale,
++        topk_block_indices,
++        k_block_size,
++        weights,
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++    )  # [M, block_topk_eff * k_block_size] f32
++
++    # ------------------------------------------------------------------
++    # Stage 2.5: top-topk_tokens selection over the block_topk_eff
++    # × k_block_size candidate tokens. Gives per-query slot ids.
++    # ------------------------------------------------------------------
++    topk_tokens_eff = min(topk_tokens, block_sparse_logits.shape[-1])
++    relevant_topk_indices = torch.topk(
++        block_sparse_logits,
++        k=topk_tokens_eff,
++        dim=-1,
++    ).indices  # [M, topk_tokens_eff] int64
++
++    # ------------------------------------------------------------------
++    # Stage 3 (post, Python): translate slot ids → absolute K token
++    # position → per-query relative offset (matches vLLM indexer
++    # output buffer). Slots whose relative offset falls outside the
++    # query's visible range are set to -1.
++    # ------------------------------------------------------------------
++    # slot = block_id_in_topk × k_block_size + offset_in_block
++    #      where block_id_in_topk ∈ [0, block_topk_eff)
++    # absolute_k = topk_block_indices[m, block_id_in_topk] × k_block_size + offset_in_block
++    absolute_topk_block_indices = torch.gather(
++        topk_block_indices,
++        dim=-1,
++        index=(relevant_topk_indices // k_block_size),
++    )
++    topk_indices = absolute_topk_block_indices * k_block_size + (relevant_topk_indices % k_block_size)
++    topk_indices = topk_indices.to(torch.int32)
++
++    # Relative to this query's K start.
++    topk_indices -= cu_seqlen_ks[:, None]
++    mask_lo = topk_indices >= 0
++    mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
++    mask = mask_lo & mask_hi
++    topk_indices = topk_indices.masked_fill(~mask, -1)
++
++    return topk_indices
++
++
++def test_hisa(
++    M: int = 1024,
++    H: int = 64,
++    D: int = 128,
++    k_block_size: int = 128,
++    block_topk: int = 8,
++    topk_tokens: int = 256,
++    num_seqs: int = 1,
++):
++    """End-to-end smoke + speed test packing `num_seqs` equal-length causal
++    sequences into the flat [M, H, D] Q and [N=M, D] K tensors.
++
++    Per-token ``cu_ks / cu_ke`` are produced by
++    ``prepare_ks_ke_from_cu_seqlens`` so each query sees only the prefix
++    of its own sequence. Validity checks are done per-query (so each
++    sequence's tail queries have fewer valid candidate slots).
++    """
++    torch.manual_seed(0)
++    assert M % num_seqs == 0, f"M ({M}) must be divisible by num_seqs ({num_seqs})"
++    per_seq = M // num_seqs
++    N = M  # causal self-attention, packed
++
++    cu_seqlens = torch.arange(num_seqs + 1, device="cuda", dtype=torch.long) * per_seq
++    ks_long, ke_long = prepare_ks_ke_from_cu_seqlens(cu_seqlens)
++    cu_ks = ks_long.to(torch.int32).contiguous()
++    cu_ke = ke_long.to(torch.int32).contiguous()
++
++    q_bf16 = torch.randn(M, H, D, device="cuda", dtype=torch.bfloat16)
++    q = q_bf16.to(torch.float8_e4m3fn)
++    k_bf16 = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
++    k = k_bf16.to(torch.float8_e4m3fn)
++    k_scale = (0.1 + 0.01 * torch.rand(N, device="cuda", dtype=torch.float32)).contiguous()
++    weights = torch.randn(M, H, device="cuda", dtype=torch.float32)
++
++    topk_indices = hisa_indexer(
++        q,
++        k,
++        k_scale,
++        weights,
++        cu_ks,
++        cu_ke,
++        k_block_size=k_block_size,
++        block_topk=block_topk,
++        topk_tokens=topk_tokens,
++    )
++
++    # Sanity checks.
++    assert topk_indices.shape == (M, topk_tokens), f"unexpected output shape {tuple(topk_indices.shape)}"
++    assert topk_indices.dtype == torch.int32
++
++    # Every non-(-1) offset must be within [0, cu_ke[m] - cu_ks[m]).
++    valid = topk_indices >= 0
++    spans = (cu_ke - cu_ks)[:, None].expand_as(topk_indices)
++    in_range = topk_indices < spans
++    assert (valid == (valid & in_range)).all(), "some valid offset falls outside its query's K window"
++
++    # Per-query expected number of valid slots = min(cu_ke[m] - cu_ks[m],
++    # topk_tokens) (clipped by K range and by block_topk × k_block_size).
++    expected_valid = torch.minimum(
++        (cu_ke - cu_ks).clamp(min=0),
++        torch.tensor(min(topk_tokens, block_topk * k_block_size), device=cu_ke.device),
++    )
++    got_valid = valid.sum(dim=-1).to(torch.int32)
++    frac_match = (got_valid == expected_valid).float().mean().item()
++    print(
++        f"  shape: {tuple(topk_indices.shape)}  "
++        f"valid_frac: {valid.float().mean().item():.4f}  "
++        f"per-query valid count match: {frac_match:.4f}  "
++        f"(num_seqs={num_seqs}, per_seq={per_seq})"
++    )
++
++    # Speed.
++    def fn():
++        return hisa_indexer(
++            q,
++            k,
++            k_scale,
++            weights,
++            cu_ks,
++            cu_ke,
++            k_block_size=k_block_size,
++            block_topk=block_topk,
++            topk_tokens=topk_tokens,
++        )
++
++    ms = do_bench(fn, warmup=20, rep=50)
++    print(
++        f"  latency: {ms:.3f} ms  "
++        f"(M={M}, H={H}, D={D}, k_block_size={k_block_size}, "
++        f"block_topk={block_topk}, topk_tokens={topk_tokens}, num_seqs={num_seqs})"
++    )
++
++
++if __name__ == "__main__":
++    # Ref path in block_sparse_mqa materialises [M, topk, kvB, D] fp32 so
++    # stay modest on M (reuse the sparse_mqa module's sizing intuition).
++    for cfg in [
++        dict(M=1024, H=64, D=128, k_block_size=128, block_topk=16, topk_tokens=256, num_seqs=1),
++        dict(M=1024, H=64, D=128, k_block_size=128, block_topk=16, topk_tokens=256, num_seqs=4),
++        dict(M=4096, H=64, D=128, k_block_size=128, block_topk=32, topk_tokens=1024, num_seqs=1),
++        dict(M=4096, H=64, D=128, k_block_size=128, block_topk=32, topk_tokens=1024, num_seqs=4),
++        dict(M=8192, H=64, D=128, k_block_size=128, block_topk=64, topk_tokens=2048, num_seqs=1),
++        dict(M=8192, H=64, D=128, k_block_size=128, block_topk=64, topk_tokens=2048, num_seqs=8),
++    ]:
++        test_hisa(**cfg)
++        torch.cuda.empty_cache()
+diff --git a/examples/dsa_hisa/pool_mqa_fp8.py b/examples/dsa_hisa/pool_mqa_fp8.py
+new file mode 100644
+index 0000000000..515b311ac4
+--- /dev/null
++++ b/examples/dsa_hisa/pool_mqa_fp8.py
+@@ -0,0 +1,257 @@
++"""Stage-1 kernel: prefill pool-MQA over pooled (blocked) K.
++
++Input: fp8 Q ``[M, H, D]`` + fp8 BlockedK ``[Nb, D]`` + per-block f32 scale
++``[Nb]`` + f32 Weights ``[M, H]`` + per-query ``cu_seqlen_blocked_ks/ke [M]``.
++
++For each query ``m`` and pool block ``n`` in ``[cu_seqlen_blocked_ks[m],
++cu_seqlen_blocked_ke[m])``:
++  ``logits[m, n] = sum_h ReLU(Q[m, h] . BlockedK[n]) * BlockedKScale[n] * Weights[m, h]``
++
++Out-of-range entries in the raw kernel output are undefined — caller should
++zero-init the buffer or apply a separate mask kernel.
++"""
++
++import tilelang
++from tilelang import language as T
++from tilelang.profiler import do_bench
++import torch
++
++from tilelang_utils import prepare_ks_ke_from_cu_seqlens
++from clean_and_maintain_logits import (
++    clean_and_maintain_logits_interface,
++    ref_clean_and_maintain_logits,
++)
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    },
++)
++def pool_mqa_attn_return_logits_fp8(
++    IndexQ,
++    IndexBlockedK,
++    IndexBlockedKScale,
++    Logits,
++    Weights,
++    CuSeqLenBlockedKS,
++    CuSeqLenBlockedKE,
++    heads: int = 64,
++    index_dim: int = 128,
++    block_N: int = 256,
++    num_stages: int = 3,
++    threads: int = 512,
++    block_Q: int = 0,
++):
++    # block_Q is the tile size for queries; `0` means "derive from heads".
++    if block_Q == 0:
++        block_Q = 128 // heads
++    fp8_dtype = T.float8_e4m3fn
++    accum_dtype = T.float32
++    index_dtype = T.int32
++
++    seq_len, seq_len_blocked_kv = T.const("seq_len, seq_len_blocked_kv")
++
++    IndexQ: T.Tensor[[seq_len * heads, index_dim], fp8_dtype]
++    IndexBlockedK: T.Tensor[[seq_len_blocked_kv, index_dim], fp8_dtype]
++    IndexBlockedKScale: T.Tensor[[seq_len_blocked_kv], accum_dtype]
++    Logits: T.Tensor[[seq_len, seq_len_blocked_kv], accum_dtype]
++    Weights: T.Tensor[[seq_len, heads], accum_dtype]
++    CuSeqLenBlockedKS: T.Tensor[[seq_len], index_dtype]
++    CuSeqLenBlockedKE: T.Tensor[[seq_len], index_dtype]
++
++    with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
++        index_q_shared = T.alloc_shared([block_Q * heads, index_dim], fp8_dtype)
++        index_k_shared = T.alloc_shared([block_N, index_dim], fp8_dtype)
++        index_k_scale_fragment = T.alloc_fragment([block_N], accum_dtype)
++        s = T.alloc_fragment([block_N, block_Q * heads], accum_dtype)
++        s_reshaped = T.reshape(s, (block_N, block_Q, heads))
++        logits = T.alloc_fragment([block_N, block_Q], accum_dtype)
++        weights = T.alloc_fragment([block_Q, heads], accum_dtype)
++
++        seq_len_i = bx * block_Q
++
++        cu_k_s_min = T.alloc_var(index_dtype)
++        cu_k_e_max = T.alloc_var(index_dtype)
++        cu_k_s_min = 2147483647
++        cu_k_e_max = -2147483648
++
++        for bq_i in T.serial(block_Q):
++            cu_k_s_min = T.min(cu_k_s_min, T.min(CuSeqLenBlockedKS[seq_len_i + bq_i], seq_len_blocked_kv))
++        for bq_i in T.serial(block_Q):
++            cu_k_e_max = T.max(cu_k_e_max, T.min(CuSeqLenBlockedKE[seq_len_i + bq_i], seq_len_blocked_kv))
++
++        T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
++        T.copy(Weights[seq_len_i, 0], weights)
++
++        for nbn_i in T.Pipelined(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages):
++            T.copy(IndexBlockedK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
++            T.copy(IndexBlockedKScale[cu_k_s_min + nbn_i * block_N], index_k_scale_fragment)
++
++            T.gemm(
++                index_k_shared,
++                index_q_shared,
++                s,
++                transpose_B=True,
++                clear_accum=True,
++                policy=T.GemmWarpPolicy.FullCol,
++            )
++
++            for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
++                s_reshaped[bn_i, bq_i, h_i] = T.max(s_reshaped[bn_i, bq_i, h_i] * index_k_scale_fragment[bn_i], 0) * weights[bq_i, h_i]
++
++            T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
++
++            for bq_i, bn_i in T.Parallel(block_Q, block_N):
++                Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
++
++
++def pool_mqa_attn_return_logits_fp8_interface(
++    q_fp8: torch.Tensor,
++    blocked_kv_fp8: torch.Tensor,
++    blocked_kv_scale: torch.Tensor,
++    weights_f32: torch.Tensor,
++    cu_seqlen_blocked_ks: torch.Tensor,
++    cu_seqlen_blocked_ke: torch.Tensor,
++    block_N: int = 256,
++):
++    """Raw kernel invocation; zero-inits logits so positions the kernel
++    doesn't touch are 0 (matches the ref)."""
++    seq_len, heads, index_dim = q_fp8.shape
++    seq_len_blocked_kv = blocked_kv_fp8.shape[0]
++
++    logits = torch.zeros([seq_len, seq_len_blocked_kv], device=q_fp8.device, dtype=torch.float32)
++    pool_mqa_attn_return_logits_fp8(
++        q_fp8.view(seq_len * heads, index_dim),
++        blocked_kv_fp8,
++        blocked_kv_scale,
++        logits,
++        weights_f32,
++        cu_seqlen_blocked_ks,
++        cu_seqlen_blocked_ke,
++        heads=heads,
++        index_dim=index_dim,
++        block_N=block_N,
++    )
++    return logits
++
++
++def ref_pool_mqa_fp8(
++    q_fp8: torch.Tensor,
++    blocked_kv_fp8: torch.Tensor,
++    blocked_kv_scale: torch.Tensor,
++    weights_f32: torch.Tensor,
++) -> torch.Tensor:
++    """Spec: for each (m, n), logits[m, n] = sum_h ReLU(q[m,h] . k[n] * k_scale[n]) * w[m,h].
++    Computes the full dense [M, Nb] grid — caller is responsible for any masking."""
++    q_f = q_fp8.float()
++    k_f = blocked_kv_fp8.float() * blocked_kv_scale[:, None]
++    # score[m, n, h] = q[m, h] . k[n]
++    s = torch.einsum("mhd,nd->mnh", q_f, k_f)  # [M, Nb, H]
++    logits = (s.clamp(min=0) * weights_f32[:, None, :]).sum(dim=-1)  # [M, Nb]
++    return logits
++
++
++def test_pool_mqa_fp8(
++    M: int = 32768,
++    H: int = 64,
++    D: int = 128,
++    k_block_size: int = 128,
++    block_N: int = 256,
++    num_seqs: int = 1,
++):
++    """Correctness + speed test packing `num_seqs` equal-length causal
++    sequences into the [M, H, D] Q tensor.
++
++    Per-query ``cu_seqlen_blocked_ks/ke`` is derived from the raw-token
++    packed ``cu_ks / cu_ke`` produced by ``prepare_ks_ke_from_cu_seqlens``
++    (floor-divide / ceil-divide by ``k_block_size`` respectively).
++
++    The kernel writes the per-tile ``[cu_k_s_min, cu_k_e_max)`` union of
++    visible K ranges — entries inside this union but outside an
++    individual query's visible range carry raw (unmasked) dot-product
++    values. To make correctness well-defined, we apply the
++    ``clean_and_maintain_logits`` mask (-inf for out-of-range, +inf for
++    the first/last valid block) to both the kernel output and the torch
++    reference before comparing — this mirrors what the hisa pipeline
++    does right after this kernel.
++    """
++    torch.manual_seed(0)
++    assert M % num_seqs == 0, f"M ({M}) must be divisible by num_seqs ({num_seqs})"
++    per_seq = M // num_seqs
++    N_blocked = (M + k_block_size - 1) // k_block_size
++    assert N_blocked % block_N == 0, (
++        f"N_blocked ({N_blocked}) must be a multiple of block_N ({block_N}). Pick M such that ceildiv(M, k_block_size) % block_N == 0."
++    )
++
++    # Per-token packed ks/ke (causal within each sequence), then translate
++    # to pool-block coords.
++    cu_seqlens = torch.arange(num_seqs + 1, device="cuda", dtype=torch.long) * per_seq
++    ks_long, ke_long = prepare_ks_ke_from_cu_seqlens(cu_seqlens)
++    cu_ks_token = ks_long.to(torch.int32).contiguous()
++    cu_ke_token = ke_long.to(torch.int32).contiguous()
++    cu_blocked_ks = (cu_ks_token // k_block_size).contiguous()
++    cu_blocked_ke = ((cu_ke_token + k_block_size - 1) // k_block_size).contiguous()
++
++    q_bf16 = torch.randn(M, H, D, device="cuda", dtype=torch.bfloat16)
++    q = q_bf16.to(torch.float8_e4m3fn)
++    blocked_k_bf16 = torch.randn(N_blocked, D, device="cuda", dtype=torch.bfloat16)
++    blocked_k = blocked_k_bf16.to(torch.float8_e4m3fn)
++    blocked_k_scale = (0.1 + 0.01 * torch.rand(N_blocked, device="cuda", dtype=torch.float32)).contiguous()
++    weights = torch.randn(M, H, device="cuda", dtype=torch.float32)
++
++    # Correctness — kernel + post-mask.
++    got = pool_mqa_attn_return_logits_fp8_interface(
++        q,
++        blocked_k,
++        blocked_k_scale,
++        weights,
++        cu_blocked_ks,
++        cu_blocked_ke,
++        block_N=block_N,
++    )
++    clean_and_maintain_logits_interface(got, cu_blocked_ks, cu_blocked_ke)
++
++    ref = ref_pool_mqa_fp8(q, blocked_k, blocked_k_scale, weights)
++    ref = ref_clean_and_maintain_logits(ref, cu_blocked_ks, cu_blocked_ke)
++
++    # After the mask, +/-inf positions must agree exactly. Compare the
++    # remaining finite values under an fp8×fp8 GEMM tolerance.
++    assert torch.equal(torch.isposinf(got), torch.isposinf(ref)), "pos-inf mask differs"
++    assert torch.equal(torch.isneginf(got), torch.isneginf(ref)), "neg-inf mask differs"
++    finite = torch.isfinite(got) & torch.isfinite(ref)
++    torch.testing.assert_close(got[finite], ref[finite], rtol=5e-2, atol=5e-2)
++    print(f"  correctness: PASS  (M={M}, H={H}, D={D}, N_blocked={N_blocked}, block_N={block_N}, num_seqs={num_seqs}, per_seq={per_seq})")
++
++    # Speed (kernel only — excludes the post mask).
++    def fn():
++        return pool_mqa_attn_return_logits_fp8_interface(
++            q,
++            blocked_k,
++            blocked_k_scale,
++            weights,
++            cu_blocked_ks,
++            cu_blocked_ke,
++            block_N=block_N,
++        )
++
++    ms = do_bench(fn, warmup=50, rep=200)
++    # FLOPs: fp8×fp8 GEMM dominates = 2 * M * H * Nb * D (mul+add).
++    total_flops = 2 * M * H * N_blocked * D
++    tflops = total_flops / (ms * 1e-3) / 1e12
++    print(f"  latency: {ms:.4f} ms  ({tflops:.2f} fp8 TFLOPS)")
++
++
++if __name__ == "__main__":
++    # M × k_block_size^-1 must be a multiple of block_N=256.
++    # With k_block_size=128 → N_blocked = M/128; need N_blocked % 256 == 0
++    # → M % 32768 == 0.
++    # (M, H, D, k_block_size, block_N, num_seqs)
++    for cfg in [
++        (32768, 64, 128, 128, 256, 1),
++        (32768, 64, 128, 128, 256, 4),
++        (65536, 64, 128, 128, 256, 1),
++        (65536, 64, 128, 128, 256, 8),
++        (131072, 64, 128, 128, 256, 16),
++    ]:
++        test_pool_mqa_fp8(*cfg)
+diff --git a/examples/dsa_hisa/tilelang_utils.py b/examples/dsa_hisa/tilelang_utils.py
+new file mode 100644
+index 0000000000..80a1441c5b
+--- /dev/null
++++ b/examples/dsa_hisa/tilelang_utils.py
+@@ -0,0 +1,314 @@
++import torch
++import torch.nn.functional as F
++import functools
++from typing import Callable, Any, Tuple
++
++
++def tensor_cache(
++    fn: Callable[..., torch.Tensor],
++) -> Callable[..., torch.Tensor]:
++    """
++    A decorator that caches the most recent result of a function with tensor inputs.
++
++    This decorator will store the output of the decorated function for the most recent set of input tensors.
++    If the function is called again with the same input tensors, it will return the cached result.
++
++
++    Args:
++        fn (Callable[..., torch.Tensor]):
++            The function to be decorated. It should take tensor inputs and return tensor outputs.
++
++    Returns:
++        Callable[..., torch.Tensor]:
++            A wrapped version of the input function with single-entry caching.
++    """
++    last_args: tuple | None = None
++    last_kwargs: dict | None = None
++    last_result: Any = None
++
++    @functools.wraps(fn)
++    def wrapper(*args: Any, **kwargs: Any) -> Any:
++        nonlocal last_args, last_kwargs, last_result
++
++        if (
++            (last_args is not None and last_kwargs is not None)
++            and (len(args) == len(last_args) and len(kwargs) == len(last_kwargs))
++            and all(a is b for a, b in zip(args, last_args, strict=False))
++            and all(k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items())
++        ):
++            return last_result
++
++        result = fn(*args, **kwargs)
++        last_args, last_kwargs, last_result = args, kwargs, result
++        return result
++
++    return wrapper
++
++
++@tensor_cache
++def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
++    return torch.diff(cu_seqlens)
++
++
++@tensor_cache
++def prepare_cu_seqlens_from_lens(
++    lens: torch.LongTensor,
++    dtype: torch.dtype | None = torch.int32,
++) -> torch.LongTensor:
++    return F.pad(lens.cumsum(dim=0, dtype=dtype), (1, 0))
++
++
++@tensor_cache
++def prepare_lens_from_cu_seqlens(
++    cu_seqlens: torch.LongTensor,
++) -> torch.LongTensor:
++    return torch.diff(cu_seqlens)
++
++
++@tensor_cache
++def prepare_position_ids(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
++    return torch.cat([torch.arange(n, dtype=cu_seqlens.dtype, device=cu_seqlens.device) for n in prepare_lens(cu_seqlens).unbind()])
++
++
++@tensor_cache
++def prepare_sequence_ids(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
++    return prepare_position_ids(cu_seqlens).eq(0).cumsum(0) - 1
++
++
++@tensor_cache
++def prepare_token_indices(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
++    position_ids = prepare_position_ids(cu_seqlens)
++    return torch.stack([prepare_sequence_ids(cu_seqlens), position_ids], 1).to(cu_seqlens)
++
++
++@tensor_cache
++def prepare_cu_seqlens_from_position_ids(
++    position_ids: torch.LongTensor,
++    dtype: torch.dtype | None = torch.int32,
++) -> torch.LongTensor:
++    starts = (position_ids == 0).nonzero(as_tuple=True)[0]
++    total_len = position_ids.new_tensor([position_ids.numel()])
++    boundaries = torch.cat([starts, total_len])
++    lens = torch.diff(boundaries)
++    cu_seqlens = prepare_cu_seqlens_from_lens(lens, dtype=dtype)
++    return cu_seqlens
++
++
++@tensor_cache
++def prepare_ks_ke_from_cu_seqlens(
++    cu_seqlens: torch.LongTensor,
++) -> tuple[torch.LongTensor, torch.LongTensor]:
++    position_ids = prepare_position_ids(cu_seqlens)
++    sequence_ids = position_ids.eq(0).cumsum(0) - 1
++
++    ks = cu_seqlens[sequence_ids]
++    ke = ks + position_ids + 1
++
++    return ks, ke
++
++
++@tensor_cache
++def prepare_ks_ke_from_cu_seqlens_qk(
++    cu_seqlens_q: torch.LongTensor,
++    cu_seqlens_k: torch.LongTensor,
++) -> tuple[torch.LongTensor, torch.LongTensor]:
++    position_ids_q = prepare_position_ids(cu_seqlens_q)
++    sequence_ids_q = position_ids_q.eq(0).cumsum(0) - 1
++
++    seqlens_q = prepare_lens(cu_seqlens_q)
++    seqlens_k = prepare_lens(cu_seqlens_k)
++    offset = seqlens_k - seqlens_q
++
++    ks = cu_seqlens_k[sequence_ids_q]
++    ke = ks + position_ids_q + offset[sequence_ids_q] + 1
++
++    return ks, ke
++
++
++def ceil_to_ue8m0(x: torch.Tensor):
++    assert x.view(-1).amax().item() > 0
++    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
++
++
++def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple[int], use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
++    excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
++    x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
++    sf = x_amax / 448.0
++    sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
++    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
++    return x_scaled, sf.squeeze()
++
++
++def get_abs_err(y, x):
++    x = x.to(torch.float32)
++    y = y.to(torch.float32)
++    return (x - y).flatten().abs().max().item()
++
++
++def get_err_ratio(y, x):
++    x = x.to(torch.float32)
++    y = y.to(torch.float32)
++    err = (x - y).flatten().square().mean().sqrt().item()
++    base = (x).flatten().square().mean().sqrt().item()
++    return err / base
++
++
++def calculate_tensor_similarity(x, y, name="tensor"):
++    """
++    Calculate similarity between two tensors using a normalized dot product metric.
++
++    Unlike torch.testing.assert_close which uses absolute/relative tolerance based on
++    element-wise differences, this function computes a global similarity score:
++        sim = 2 * <x, y> / (||x||^2 + ||y||^2)
++
++    This metric is scale-invariant and measures the cosine-like similarity normalized
++    by the magnitude of both tensors. It returns 1 for identical tensors and values
++    closer to 0 for dissimilar ones. This is particularly useful for comparing tensors
++    with varying magnitudes where relative errors matter more than absolute differences.
++
++    Args:
++        x: First tensor to compare
++        y: Second tensor to compare
++        name: Name of the tensor for logging purposes
++
++    Returns:
++        Similarity score in range [0, 1] where 1 means identical
++    """
++    x, y = x.data.double(), y.data.double()
++    denominator = (x * x + y * y).sum()
++    if denominator == 0:
++        print(f"\033[33mWARNING: {name} all zero\033[0m")
++        return 1
++    sim = 2 * (x * y).sum() / denominator
++    return sim
++
++
++def assert_tensors_similar(x, y, eps=1e-8, name="tensor", raise_assert=True):
++    """
++    Assert that two tensors are similar using a global similarity metric.
++
++    Key differences from torch.testing.assert_close:
++    - torch.testing.assert_close: Uses element-wise comparison with rtol/atol, checking
++      that |x - y| <= atol + rtol * |y| for each element. It's sensitive to outliers
++      and requires all elements to satisfy the tolerance.
++    - assert_tensors_similar: Uses a single global similarity score (1 - sim) where sim is the
++      normalized dot product. It's more robust to outliers and focuses on overall
++      tensor similarity rather than element-wise precision. This is better suited for
++      comparing large tensors where a few outlier elements shouldn't fail the test.
++
++    Args:
++        x: First tensor to compare
++        y: Second tensor to compare
++        eps: Maximum allowed difference (1 - similarity), default 1e-8
++        name: Name of the tensor for error messages
++        raise_assert: Whether to raise assertion error on failure
++    """
++    sim = calculate_tensor_similarity(x, y, name)
++    diff = 1.0 - sim
++    if not (0 <= diff <= eps):
++        print(f"\033[31mERROR: {name} similarity check failed, diff={diff:.2e} (threshold={eps:.2e})\033[0m")
++        if raise_assert:
++            assert False  # noqa: B011
++
++
++@tensor_cache
++def cal_seq_idx_for_q(cu_seqlens_qs: torch.LongTensor, cu_seqlens_qe: torch.LongTensor, seq_len: int) -> torch.IntTensor:
++    seq_idx_for_q = torch.full((seq_len,), len(cu_seqlens_qs), dtype=torch.int32, device=cu_seqlens_qs.device)
++    for i in range(len(cu_seqlens_qs)):
++        seq_idx_for_q[cu_seqlens_qs[i] : cu_seqlens_qe[i]] = i
++    return seq_idx_for_q
++
++
++@tensor_cache
++def cal_cu_seqlen_ks_for_q(
++    cu_seqlens_qs: torch.LongTensor, cu_seqlens_qe: torch.LongTensor, cu_seqlens_ks: torch.LongTensor, seq_len: int
++) -> torch.IntTensor:
++    cu_seqlen_ks_for_each_q = torch.gather(
++        input=torch.cat([cu_seqlens_ks, torch.full((1,), torch.iinfo(torch.int32).max, dtype=torch.int32, device=cu_seqlens_qs.device)]),
++        dim=0,
++        index=cal_seq_idx_for_q(cu_seqlens_qs=cu_seqlens_qs, cu_seqlens_qe=cu_seqlens_qe, seq_len=seq_len).long(),
++    )
++    return cu_seqlen_ks_for_each_q.int()
++
++
++@tensor_cache
++def cal_cu_seqlen_ke_for_q(
++    cu_seqlens_qs: torch.LongTensor,
++    cu_seqlens_qe: torch.LongTensor,
++    cu_seqlens_ks: torch.LongTensor,
++    cu_seqlens_ke: torch.LongTensor,
++    q_start_idxs: torch.LongTensor,
++    seq_len: int,
++    kv_stride: int,
++) -> torch.IntTensor:
++    cu_seqlen_ke_for_each_q = torch.gather(
++        input=torch.cat([cu_seqlens_ke, torch.zeros(1, dtype=torch.int32, device=cu_seqlens_qs.device)]),
++        dim=0,
++        index=cal_seq_idx_for_q(cu_seqlens_qs=cu_seqlens_qs, cu_seqlens_qe=cu_seqlens_qe, seq_len=seq_len).long(),
++    )
++    casual_cu_seqlen_ke_for_each_q = torch.zeros((seq_len,), dtype=torch.int32, device=cu_seqlens_qs.device)
++    for i in range(len(cu_seqlens_qs)):
++        casual_cu_seqlen_ke_for_each_q[cu_seqlens_qs[i] : cu_seqlens_qe[i]] = (
++            torch.arange(
++                q_start_idxs[i], q_start_idxs[i] + cu_seqlens_qe[i] - cu_seqlens_qs[i], dtype=torch.int32, device=cu_seqlens_qs.device
++            )
++            + 1
++        ) // kv_stride + cu_seqlens_ks[i]
++    cu_seqlen_ke_for_each_q = torch.minimum(casual_cu_seqlen_ke_for_each_q, cu_seqlen_ke_for_each_q)
++    return cu_seqlen_ke_for_each_q.int()
++
++
++def generate_random_cu_seqlens(per_cp_seqlen, cp_size=4, cp_rank=3, kv_stride=1, average_q_len=512):
++    total_seqlen = per_cp_seqlen * cp_size
++
++    cu_seqlens = torch.randint(0, average_q_len * 2, (total_seqlen // average_q_len * 2,)).cuda()
++    last_seq_id = torch.where(cu_seqlens.cumsum(0) >= total_seqlen)[0][0]
++    cu_seqlens = cu_seqlens[:last_seq_id]
++
++    if cu_seqlens.sum() < total_seqlen:
++        cu_seqlens = torch.cat([cu_seqlens, torch.tensor([total_seqlen - cu_seqlens.sum()]).cuda()])
++
++    cu_seqlens_cumsum = torch.cumsum(cu_seqlens, dim=0)
++    cu_seqlens_k_cumsum = torch.cumsum(cu_seqlens // kv_stride, dim=0)
++    cu_seqlens_qs = torch.cat([torch.tensor([0]).cuda(), cu_seqlens_cumsum[:-1]])
++    cu_seqlens_ks = torch.cat([torch.tensor([0]).cuda(), cu_seqlens_k_cumsum[:-1]])
++    cu_seqlens_qe = cu_seqlens_cumsum.clone()
++    cu_seqlens_ke = cu_seqlens_k_cumsum.clone()
++
++    cu_seqlens_ks_for_each_q = cal_cu_seqlen_ks_for_q(
++        cu_seqlens_qs=cu_seqlens_qs,
++        cu_seqlens_qe=cu_seqlens_qe,
++        cu_seqlens_ks=cu_seqlens_ks,
++        seq_len=total_seqlen,
++    )
++    cu_seqlens_ke_for_each_q = cal_cu_seqlen_ke_for_q(
++        cu_seqlens_qs=cu_seqlens_qs,
++        cu_seqlens_qe=cu_seqlens_qe,
++        cu_seqlens_ks=cu_seqlens_ks,
++        cu_seqlens_ke=cu_seqlens_ke,
++        q_start_idxs=torch.zeros_like(cu_seqlens_qs),
++        seq_len=total_seqlen,
++        kv_stride=kv_stride,
++    )
++
++    assert per_cp_seqlen % 2 == 0
++    per_chunk_seqlen = per_cp_seqlen // 2
++    slice_short = slice(cp_rank * per_chunk_seqlen, (cp_rank + 1) * per_chunk_seqlen)
++    slice_long = slice(
++        total_seqlen - (cp_rank + 1) * per_chunk_seqlen,
++        total_seqlen - cp_rank * per_chunk_seqlen,
++    )
++    ks = torch.cat(
++        [
++            cu_seqlens_ks_for_each_q[slice_short],
++            cu_seqlens_ks_for_each_q[slice_long],
++        ]
++    )
++    ke = torch.cat(
++        [
++            cu_seqlens_ke_for_each_q[slice_short],
++            cu_seqlens_ke_for_each_q[slice_long],
++        ]
++    )
++    assert len(ks) == len(ke) == per_cp_seqlen
++    return ks, ke

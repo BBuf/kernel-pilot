@@ -1,0 +1,3188 @@
+diff --git a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+index c08305a82b24..823397e962e8 100644
+--- a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
++++ b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+@@ -50,6 +50,24 @@
+     hadamard_transform = None
+     HAS_FAST_HADAMARD = False
+ 
++# `block_kv` arg passed to DeepGEMM's `get_paged_mqa_logits_metadata`. This is
++# a SCHEDULE-granularity parameter, not the cache page size. The DG metadata
++# kernel computes `SPLIT_KV = block_kv * 4` (the multiplier 4 is hardcoded;
++# DeepGEMM commit 7f2a703 dropped the SM100-aware `arch == 10 ? 2 : 4` from
++# nv_dev #fc97232 during the Public release 26/04 sync, leaving the formula
++# uniform across SM90/SM100). Both the DG compute kernel (which hardcodes
++# `split_kv = 256` at csrc/apis/attention.hpp:353) and our DSL paged-MQA-logits
++# kernel (compute tile = 128 × kNumMathWarpGroups = 2 = 256) require
++# `SPLIT_KV = 256`. So we must pass `block_kv = 256 / 4 = 64` here. Independent
++# of the indexer K cache's physical page size (`tokens_per_block`), which only
++# affects cache reads inside the compute kernel — the metadata wrapper does
++# not read the cache. Passing the cache page size directly (the previous
++# behavior) only works by accident when `tokens_per_block == 64`; for
++# `tokens_per_block == 32` it produces a SPLIT_KV=128 schedule that the
++# compute kernels misinterpret. TODO(remove once DeepGEMM restores the
++# SM100-aware num_math_warpgroups in the metadata JIT impl).
++_DG_SCHEDULE_BLOCK_KV = 64
++
+ 
+ def _compute_slot_mappings(
+     global_positions: torch.Tensor,
+@@ -937,13 +955,15 @@ def prepare(self):
+         # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 (i.e., max_draft_tokens == 0/1/3) on sm100, and
+         # seq_len == 1/2 (i.e., max_draft_tokens == 0/1) on sm90, for other cases, we need to flatten the q tensor and
+         # expand the kv_lens and block_table for MTP support.
++        # The CuTe DSL kernel supports arbitrary next_n natively, so it never needs expansion.
+         # TODO:
+         # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
+         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+-        self.use_expanded_buffers_for_mtp = (
+-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
+-            or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+-                and get_sm_version() >= 100))
++        _use_dsl = self.sparse_attention_config.use_cute_dsl_paged_mqa_logits
++        self.use_expanded_buffers_for_mtp = (not _use_dsl and (
++            (self.max_draft_tokens > 1 and get_sm_version() == 90) or
++            ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
++             and get_sm_version() >= 100)))
+         if self.use_expanded_buffers_for_mtp:
+             # Expand kv_lens_cuda (only generation)
+             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
+@@ -1055,9 +1075,10 @@ def on_update_kv_lens(self):
+             # column would be non-contiguous and would fail the metadata
+             # kernel's is_contiguous assertion.
+             context_lens_next_n1 = gen_kv_lens.view(-1, 1)
++            # `_DG_SCHEDULE_BLOCK_KV` (= 64) instead of cache `tokens_per_block`:
++            # see module-level constant comment for the SPLIT_KV=256 alignment.
+             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+-                context_lens_next_n1, self.kv_cache_manager.tokens_per_block,
+-                self.num_sms)
++                context_lens_next_n1, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
+                                                  non_blocking=True)
+             # When MTP is on without the expanded-tokens path, also populate
+@@ -1070,8 +1091,8 @@ def on_update_kv_lens(self):
+                                                                 num_generations, :
+                                                                 next_n_cap]
+                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+-                    context_lens_full_next_n,
+-                    self.kv_cache_manager.tokens_per_block, self.num_sms)
++                    context_lens_full_next_n, _DG_SCHEDULE_BLOCK_KV,
++                    self.num_sms)
+                 self.scheduler_metadata_buffer_full_next_n.copy_(
+                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
+             if self.use_expanded_buffers_for_mtp:
+@@ -1086,8 +1107,7 @@ def on_update_kv_lens(self):
+                                                                  num_tokens].view(
+                                                                      -1, 1)
+                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+-                    kv_lens_expanded_2d, self.kv_cache_manager.tokens_per_block,
+-                    self.num_sms)
++                    kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+                 self.scheduler_metadata_buffer_expanded.copy_(
+                     scheduler_metadata_buffer_expanded, non_blocking=True)
+         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+@@ -1206,19 +1226,24 @@ def __init__(self,
+         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
+                                   and IS_CUTLASS_DSL_AVAILABLE)
++        self.use_cute_dsl_paged_mqa_logits = (
++            sparse_attention_config.use_cute_dsl_paged_mqa_logits
++            and IS_CUTLASS_DSL_AVAILABLE)
+         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+ 
+         self._enable_heuristic_topk = (
+             sparse_attention_config.enable_heuristic_topk
+             and get_sm_version() >= 100)
+ 
+-        if self.use_cute_dsl_topk and layer_idx == 0:
++        if (self.use_cute_dsl_topk
++                or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
+             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+ 
+-            # the dtype of topk input tensor, which is float32 now.
+-            # Note, need to update it if the dtype of topk input tensor is changed.
+-            cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
+-                dtype=torch.float32, top_k=self.index_topk)
++            if self.use_cute_dsl_topk:
++                # the dtype of topk input tensor, which is float32 now.
++                # Note, need to update it if the dtype of topk input tensor is changed.
++                cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
++                    dtype=torch.float32, top_k=self.index_topk)
+ 
+         if self._enable_heuristic_topk and layer_idx == 0:
+             # Populate static caches (sm_count, L2 cache size) inside the C++
+@@ -1485,8 +1510,11 @@ def prepare(metadata: DSAtrtllmAttentionMetadata):
+                 # slicing kv_lens_cuda_2d's first column would be a strided
+                 # view that fails the metadata kernel's contiguous assertion.
+                 context_lens_next_n1 = gen_seq_lens.view(-1, 1)
++                # `_DG_SCHEDULE_BLOCK_KV` (= 64) instead of cache `tokens_per_block`:
++                # see module-level constant comment for the SPLIT_KV=256 alignment.
+                 scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+-                    context_lens_next_n1, tokens_per_block, metadata.num_sms)
++                    context_lens_next_n1, _DG_SCHEDULE_BLOCK_KV,
++                    metadata.num_sms)
+                 metadata.scheduler_metadata_buffer.copy_(
+                     scheduler_metadata_buffer, non_blocking=True)
+                 # MTP main forward uses next_n = 1 + max_draft_tokens; build
+@@ -1497,7 +1525,7 @@ def prepare(metadata: DSAtrtllmAttentionMetadata):
+                                                                         num_generations, :
+                                                                         next_n_cap]
+                     scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+-                        context_lens_full_next_n, tokens_per_block,
++                        context_lens_full_next_n, _DG_SCHEDULE_BLOCK_KV,
+                         metadata.num_sms)
+                     metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                         scheduler_metadata_buffer_full_next_n,
+@@ -1512,7 +1540,8 @@ def prepare(metadata: DSAtrtllmAttentionMetadata):
+                                                                      num_tokens].view(
+                                                                          -1, 1)
+                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+-                    kv_lens_expanded_2d, tokens_per_block, metadata.num_sms)
++                    kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV,
++                    metadata.num_sms)
+                 metadata.scheduler_metadata_buffer_expanded.copy_(
+                     scheduler_metadata_buffer_expanded, non_blocking=True)
+ 
+@@ -1841,7 +1870,9 @@ def sparse_attn_indexer(
+                 # schedule (via num_next_n_atoms). MTP forwards alternate
+                 # between the full-window call (next_n == 1+max_draft_tokens)
+                 # and per-token draft calls (next_n == 1), so we must select
+-                # the buffer that was populated for this next_n.
++                # the buffer that was populated for this next_n. The DSL path
++                # uses its own schedule buffer (built with num_next_n_atoms=1
++                # via a (num_gen, 1) input shape) and overrides this below.
+                 if next_n == 1:
+                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                 else:
+@@ -1864,19 +1895,37 @@ def sparse_attn_indexer(
+             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
+                 self.layer_idx)
+ 
+-            decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+-                                     num_gen_tokens,
+-                                     ...] if self.use_fp4 else None
+-            if self.use_fp4:
+-                # q_decode shape is either (num_generations, next_n, n_heads,
+-                # head_dim/2) [non-expanded] or (batch*next_n, 1, n_heads,
+-                # head_dim/2) [expanded]. Match q_scale's batch/next_n dims.
+-                decode_q_scale = decode_q_scale.view(q_decode.shape[0],
+-                                                     q_decode.shape[1],
+-                                                     self.n_heads)
+-            logits_decode = self._call_paged_mqa_logits(
+-                q_decode, k_cache, weights_decode, context_lens, block_table,
+-                scheduler_metadata_buffer, max_seq_len, decode_q_scale)
++            if self.use_cute_dsl_paged_mqa_logits:
++                # DSL kernel design: 1 atom per q (atom = real next_n positions),
++                # kNumNextNAtoms = 1 for any real next_n. The matching schedule
++                # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
++                # with a (num_gen, 1) input shape, which makes DeepGEMM's wrapper
++                # compute `num_next_n_atoms = 1`. (DeepGEMM uses the same buffer
++                # for its own next_n=1 kernel; DSL piggy-backs on it for all
++                # real next_n values.) All next_n positions of a batch share
++                # the same KV length on this path (kv_lens_cuda_2d broadcasts),
++                # so passing the 1D contiguous kv_lens slice for context_lens
++                # avoids materializing a 2D contiguous tensor per call.
++                dsl_context_lens = metadata.kv_lens_cuda_runtime[
++                    num_contexts:num_contexts + num_generations]
++                logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++                    q_decode, k_cache, weights_decode, dsl_context_lens,
++                    block_table, metadata.scheduler_metadata_buffer,
++                    max_seq_len)
++            else:
++                decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
++                                         num_gen_tokens,
++                                         ...] if self.use_fp4 else None
++                if self.use_fp4:
++                    # q_decode shape is either (num_generations, next_n, n_heads,
++                    # head_dim/2) [non-expanded] or (batch*next_n, 1, n_heads,
++                    # head_dim/2) [expanded]. Match q_scale's batch/next_n dims.
++                    decode_q_scale = decode_q_scale.view(
++                        q_decode.shape[0], q_decode.shape[1], self.n_heads)
++                logits_decode = self._call_paged_mqa_logits(
++                    q_decode, k_cache, weights_decode, context_lens,
++                    block_table, scheduler_metadata_buffer, max_seq_len,
++                    decode_q_scale)
+ 
+             if use_custom_topk:
+                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
+diff --git a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+index 1ed47a8ed30d..d0e3164da9a5 100644
+--- a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+@@ -5925,6 +5925,270 @@ def warmup_cute_dsl_indexer_topk(
+             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
+             f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
+ 
++    # ------------------------------------------------------------------ #
++    #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
++    # ------------------------------------------------------------------ #
++    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
++
++    def _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
++                                           block_table, schedule_meta,
++                                           epi_dtype, acc_dtype, output_dtype):
++        errs = []
++        if q.dtype != torch.float8_e4m3fn:
++            errs.append(f"q must be float8_e4m3fn, got {q.dtype}")
++        if kv_fused.dtype != torch.uint8:
++            errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
++        # TODO: update to (torch.float32, torch.float16) once fp16 weights
++        # are validated end-to-end and the in-kernel .half() conversion is removed.
++        if weights.dtype != torch.float32:
++            errs.append(f"weights must be float32, got {weights.dtype}")
++        if context_lens.dtype != torch.int32:
++            errs.append(f"context_lens must be int32, got {context_lens.dtype}")
++        if block_table.dtype != torch.int32:
++            errs.append(f"block_table must be int32, got {block_table.dtype}")
++        if schedule_meta.dtype != torch.int32:
++            errs.append(
++                f"schedule_meta must be int32, got {schedule_meta.dtype}")
++        for name, dt in [("epi_dtype", epi_dtype), ("acc_dtype", acc_dtype),
++                         ("output_dtype", output_dtype)]:
++            if dt not in (torch.float16, torch.float32):
++                errs.append(f"{name} must be float16 or float32, got {dt}")
++        if errs:
++            raise ValueError("FP8 Paged MQA Logits dtype errors:\n  " +
++                             "\n  ".join(errs))
++
++    class CuteDSLPagedMQALogitsRunner:
++        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
++
++        Caches compiled kernels keyed by static params
++        (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
++        """
++
++        kernel_cache = dict()
++
++        @classmethod
++        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
++                     next_n, num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
++                     output_dtype):
++            """Compile kernel using fake tensors + TVM FFI."""
++            key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
++                   num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
++                   output_dtype)
++            if key in cls.kernel_cache:
++                return
++
++            to_cutlass = _TORCH_TO_CUTLASS_DTYPE
++            N = next_n * num_heads
++            block_bytes = phys_block_kv * (head_dim + 4)
++
++            sym_num_phys_blocks = cute.sym_int()
++            sym_B = cute.sym_int()
++            max_ctx = cute.sym_int()
++            max_blocks_per_seq = cute.sym_int()
++            num_ctas = cute.sym_int()
++
++            kv_fake = cute.runtime.make_fake_compact_tensor(
++                cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
++                stride_order=(1, 0))
++
++            q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
++                                                           (N, head_dim, sym_B),
++                                                           stride_order=(1, 0,
++                                                                         2))
++
++            w_dtype = (cutlass.Float16
++                       if epi_dtype == torch.float16 else to_cutlass[epi_dtype])
++            w_fake = cute.runtime.make_fake_compact_tensor(w_dtype, (N, sym_B),
++                                                           stride_order=(0, 1))
++
++            logits_fake = cute.runtime.make_fake_tensor(
++                to_cutlass[output_dtype], (cute.sym_int(), max_ctx),
++                stride=(cute.sym_int64(), 1))
++
++            bt_fake = cute.runtime.make_fake_compact_tensor(
++                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0))
++
++            cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
++                                                            (sym_B, ),
++                                                            stride_order=(0, ))
++
++            sm_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
++                                                            (num_ctas, 2),
++                                                            stride_order=(1, 0))
++
++            fake_stream = cute.runtime.make_fake_stream(
++                use_tvm_ffi_env_stream=True)
++
++            kernel = FP8MQALogitsKernel(
++                block_kv=compute_block_kv,
++                phys_block_kv=phys_block_kv,
++                num_heads=num_heads,
++                head_dim=head_dim,
++                next_n=next_n,
++                num_sms=num_sms,
++                num_epi_subtiles=num_epi_subtiles,
++                epi_dtype=to_cutlass[epi_dtype],
++                acc_dtype=to_cutlass[acc_dtype],
++                output_dtype=to_cutlass[output_dtype],
++            )
++
++            compiled = cute.compile(
++                kernel,
++                kv_fake,
++                q_fake,
++                w_fake,
++                logits_fake,
++                bt_fake,
++                cl_fake,
++                sm_fake,
++                cutlass.Int32(1),
++                cutlass.Int32(1),
++                fake_stream,
++                options="--enable-tvm-ffi",
++            )
++            cls.kernel_cache[key] = compiled
++            logger.debug(f"[compile cute_dsl fp8_paged_mqa_logits] {key}"
++                         f" kv_stages={kernel.num_kv_stages}"
++                         f" umma_stages={kernel.num_umma_stages}")
++
++        @classmethod
++        def forward(
++            cls,
++            q: torch.Tensor,
++            kv_fused: torch.Tensor,
++            weights: torch.Tensor,
++            context_lens: torch.Tensor,
++            block_table: torch.Tensor,
++            schedule_meta: torch.Tensor,
++            max_context_len: int,
++            num_epi_subtiles: int = 1,
++            epi_dtype: torch.dtype = torch.float32,
++            acc_dtype: torch.dtype = torch.float32,
++            output_dtype: torch.dtype = torch.float32,
++        ) -> torch.Tensor:
++            """Execute FP8 paged MQA logits kernel.
++
++            Args:
++                q: [B, next_n, H, D] FP8
++                kv_fused: [num_blocks, phys_block_kv, 1, D+4] uint8
++                weights: [B*next_n, H] float32
++                context_lens: [B] int32
++                block_table: [B, max_blocks] int32
++                schedule_meta: [num_sms+1, 2] int32
++                max_context_len: int
++                num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
++                epi_dtype: epilogue compute dtype
++                acc_dtype: MMA accumulator dtype
++                output_dtype: output logits dtype
++            Returns:
++                logits: [B*next_n, max_context_len] output_dtype
++            """
++            B, next_n, H, D = q.shape
++            N = next_n * H
++            phys_block_kv = kv_fused.shape[1]
++            compute_block_kv = 128
++            num_phys_blocks = kv_fused.shape[0]
++            num_sms = _get_num_sms()
++
++            # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
++            q_3d = q.reshape(B, N, D).permute(1, 2, 0)
++
++            # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B]
++            if epi_dtype == torch.float16:
++                # TODO: move type conversion to weight loading
++                w_2d = weights.reshape(B, N).half().t()
++            else:
++                w_2d = weights.reshape(B, N).t()
++
++            # Flatten fused KV to [num_phys_blocks, block_bytes]
++            kv_flat = kv_fused.reshape(num_phys_blocks, -1)
++
++            # Allocate output with alignment padding
++            SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
++            aligned_max_ctx = (
++                (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
++            logits = torch.empty(
++                (B * next_n, aligned_max_ctx),
++                device=q.device,
++                dtype=output_dtype,
++            )
++            logits = logits[:, :max_context_len]
++
++            # Compile if needed (fake tensors, no real data required)
++            key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
++                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
++            if key not in cls.kernel_cache:
++                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
++                             num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
++                             output_dtype)
++            compiled = cls.kernel_cache[key]
++
++            # FP8 q needs uint8 view to match compile-time dtype
++            q_for_ffi = (q_3d.view(torch.uint8) if q_3d.dtype
++                         in (torch.float8_e4m3fn, torch.float8_e5m2) else q_3d)
++
++            # TVM FFI: pass raw tensors, no dlpack/stream needed
++            compiled(kv_flat, q_for_ffi, w_2d, logits, block_table,
++                     context_lens, schedule_meta, num_phys_blocks, B)
++            return logits
++
++    @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
++                             mutates_args=(),
++                             device_types="cuda")
++    def cute_dsl_fp8_paged_mqa_logits(
++        q: torch.Tensor,
++        kv_fused: torch.Tensor,
++        weights: torch.Tensor,
++        context_lens: torch.Tensor,
++        block_table: torch.Tensor,
++        schedule_meta: torch.Tensor,
++        max_context_len: int,
++        num_epi_subtiles: int = 1,
++        epi_dtype: torch.dtype = torch.float32,
++        acc_dtype: torch.dtype = torch.float32,
++        output_dtype: torch.dtype = torch.float32,
++    ) -> torch.Tensor:
++        if not is_sm_100f():
++            raise ValueError(
++                f"CuteDSL: SM version {get_sm_version()} is not supported. "
++                f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
++        _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
++                                           block_table, schedule_meta,
++                                           epi_dtype, acc_dtype, output_dtype)
++        return CuteDSLPagedMQALogitsRunner.forward(
++            q,
++            kv_fused,
++            weights,
++            context_lens,
++            block_table,
++            schedule_meta,
++            max_context_len,
++            num_epi_subtiles=num_epi_subtiles,
++            epi_dtype=epi_dtype,
++            acc_dtype=acc_dtype,
++            output_dtype=output_dtype)
++
++    @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits")
++    def _(
++        q: torch.Tensor,
++        kv_fused: torch.Tensor,
++        weights: torch.Tensor,
++        context_lens: torch.Tensor,
++        block_table: torch.Tensor,
++        schedule_meta: torch.Tensor,
++        max_context_len: int,
++        num_epi_subtiles: int = 1,
++        epi_dtype: torch.dtype = torch.float32,
++        acc_dtype: torch.dtype = torch.float32,
++        output_dtype: torch.dtype = torch.float32,
++    ) -> torch.Tensor:
++        B = q.shape[0]
++        next_n = q.shape[1]
++        return torch.empty(B * next_n,
++                           max_context_len,
++                           dtype=output_dtype,
++                           device=q.device)
++
+     # ======================================================================
+     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell
+     # ======================================================================
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/__init__.py b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/__init__.py
+new file mode 100644
+index 000000000000..ab0c83ef090e
+--- /dev/null
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/__init__.py
+@@ -0,0 +1,20 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from .fp8_paged_mqa_logits import FP8MQALogitsKernel
++
++__all__ = [
++    "FP8MQALogitsKernel",
++]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits.py b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits.py
+new file mode 100644
+index 000000000000..e94073112209
+--- /dev/null
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits.py
+@@ -0,0 +1,1708 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""
++CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100).
++
++Architecture:
++  - 384 threads: 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
++  - 1 TMA per KV block [128, 128], UMMA iterates 4x K=32
++  - 2 warp groups process 2 KV blocks per iteration (kNumMathWarpGroups=2)
++  - Q reloaded via TMA pipeline when q_idx (batch) changes
++  - Persistent kernel: CTAs iterate through assigned (q_idx, kv_idx) pairs
++  - Weights cached in registers: preloaded once per q_idx change (not per KV block)
++  - KV Scales loaded via TMA to SMEM (separate pipeline per group, Math consumes)
++
++Merged KV+Scale pipeline:
++  - KV data and scales share a single TMA barrier per group
++  - TMA loads both KV and Scale under one barrier (combined tx_count)
++  - UMMA waits on merged barrier (for KV GEMM), does NOT release
++  - Math waits on merged barrier (for scale read), Math releases
++
++Fused KV layout:
++  - KV data and scales stored contiguously per physical block:
++    [num_phys_blocks, block_kv * (head_dim + 4)] bytes
++  - Per block: [KV_all_tokens (block_kv * head_dim bytes)] [Scales (block_kv * 4 bytes)]
++  - KV and Scale views are derived inside __call__ using CuTE pointer arithmetic
++
++Scheduler:
++  - schedule_meta[sm_idx] = (start_q_idx, start_kv_idx / kNumMathWarpGroups)
++  - schedule_meta[sm_idx+1] = end boundary for this CTA
++  - fetch_next_task pattern: each warp role independently advances (q_idx, kv_idx)
++  - kv_idx in units of KV blocks, advances by kNumMathWarpGroups=2 per step
++
++Dynamic shape support:
++  - Model-constant dims (block_kv, head_dim, N, per_token) remain static for codegen
++  - Runtime-varying dims (batch_size, num_phys_blocks, max_ctx, max_blocks_per_seq,
++    num_ctas) are marked dynamic via mark_compact_shape_dynamic
++  - Allows JIT cache reuse across different batch sizes / sequence lengths
++
++Epilogue dtype flows (--acc_dtype / --epi_dtype):
++
++  Flow 1: --acc_dtype fp32 --epi_dtype fp16
++    Q(FP8) x K(FP8) -> MMA acc(FP32) -> TMEM(FP32)
++      -> LDTM -> Reg(FP32) -> cvt FP16 -> ReLU(FP16)
++      -> FMA(fma.rn.f16x2) with weights(FP16 from SMEM) -> partial sum(FP16)
++      -> x scale(FP32->FP16) -> cvt output_dtype -> store logits(output_dtype)
++
++  Flow 2: --acc_dtype fp16 --epi_dtype fp16
++    Q(FP8) x K(FP8) -> MMA acc(FP16) -> TMEM(FP16, pack_16b)
++      -> LDTM -> Reg(FP16) -> ReLU(FP16)
++      -> FMA(fma.rn.f16x2) with weights(FP16 from SMEM) -> partial sum(FP16)
++      -> x scale(FP32->FP16) -> cvt output_dtype -> store logits(output_dtype)
++
++  --output_dtype: fp32 (default), fp16, bf16. Controls logits tensor dtype and final store conversion.
++  Default: --acc_dtype fp32 --epi_dtype fp32 --output_dtype fp32
++"""
++
++from typing import Tuple
++
++import cuda.bindings.driver as cuda
++import cutlass
++import cutlass.cute as cute
++import cutlass.pipeline as pipeline
++import cutlass.utils as utils
++import cutlass.utils.blackwell_helpers as sm100_utils
++from cutlass import Float16, Int32
++from cutlass._mlir import ir
++from cutlass._mlir.dialects import llvm, nvvm, vector
++from cutlass.cute.nvgpu import cpasync, tcgen05
++from cutlass.cutlass_dsl import dsl_user_op
++from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
++
++
++@dsl_user_op
++def pack_f16x2(
++    a: Float16,
++    b: Float16,
++    *,
++    loc=None,
++    ip=None,
++) -> Int32:
++    f16_ty = Float16.mlir_type
++    i32_ty = Int32.mlir_type
++    vec2_f16 = ir.VectorType.get([2], f16_ty, loc=loc)
++    v = vector.from_elements(
++        vec2_f16,
++        (Float16(a).ir_value(loc=loc, ip=ip), Float16(b).ir_value(loc=loc, ip=ip)),
++        loc=loc,
++        ip=ip,
++    )
++    return Int32(llvm.bitcast(i32_ty, v, loc=loc, ip=ip))
++
++
++@dsl_user_op
++def unpack_f16x2(
++    packed: Int32,
++    *,
++    loc=None,
++    ip=None,
++) -> Tuple[Float16, Float16]:
++    f16_ty = Float16.mlir_type
++    vec2_f16 = ir.VectorType.get([2], f16_ty, loc=loc)
++    v = llvm.bitcast(vec2_f16, Int32(packed).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
++    r0 = Float16(vector.extract(v, dynamic_position=[], static_position=[0], loc=loc, ip=ip))
++    r1 = Float16(vector.extract(v, dynamic_position=[], static_position=[1], loc=loc, ip=ip))
++    return r0, r1
++
++
++@dsl_user_op
++def fma_f16x2(
++    a: Int32,
++    b: Int32,
++    c: Int32,
++    *,
++    loc=None,
++    ip=None,
++) -> Int32:
++    i32_ty = Int32.mlir_type
++    return Int32(
++        llvm.inline_asm(
++            i32_ty,
++            [
++                Int32(a).ir_value(loc=loc, ip=ip),
++                Int32(b).ir_value(loc=loc, ip=ip),
++                Int32(c).ir_value(loc=loc, ip=ip),
++            ],
++            "fma.rn.f16x2 $0, $1, $2, $3;",
++            "=r,r,r,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def max_f16x2(
++    a: Int32,
++    b: Int32,
++    *,
++    loc=None,
++    ip=None,
++) -> Int32:
++    i32_ty = Int32.mlir_type
++    return Int32(
++        llvm.inline_asm(
++            i32_ty,
++            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
++            "max.f16x2 $0, $1, $2;",
++            "=r,r,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def add_f16x2(
++    a: Int32,
++    b: Int32,
++    *,
++    loc=None,
++    ip=None,
++) -> Int32:
++    i32_ty = Int32.mlir_type
++    return Int32(
++        llvm.inline_asm(
++            i32_ty,
++            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
++            "add.f16x2 $0, $1, $2;",
++            "=r,r,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++class FP8MQALogitsKernel:
++    """FP8 paged MQA logits kernel for Blackwell (SM100).
++
++    Each CTA processes a range of (q_idx, kv_split) pairs.
++    A split = 2 consecutive KV blocks within a sequence (one per warp group).
++    Q is shared between warp groups and reloaded when q_idx changes.
++    """
++
++    def __init__(
++        self,
++        block_kv: int = 128,
++        phys_block_kv: int = 128,
++        num_heads: int = 64,
++        head_dim: int = 128,
++        next_n: int = 1,
++        num_sms: int = 148,
++        remove_kv_wait_in_epilogue: bool = False,
++        early_tmem_copy: bool = False,
++        smem_subpartition_opt: bool = False,
++        max_kv_pipeline: bool = False,
++        max_umma_pipeline: bool = False,
++        num_epi_subtiles: int = 1,
++        epi_dtype=cutlass.Float32,
++        acc_dtype=cutlass.Float32,
++        output_dtype=cutlass.Float32,
++    ):
++        self.block_kv = block_kv
++        self.phys_block_kv = phys_block_kv
++        self.num_blocks_per_mma = block_kv // phys_block_kv
++        assert block_kv % phys_block_kv == 0, (
++            f"block_kv={block_kv} must be divisible by phys_block_kv={phys_block_kv}"
++        )
++        assert self.num_blocks_per_mma <= 4, (
++            f"num_blocks_per_mma={self.num_blocks_per_mma} exceeds max 4"
++        )
++        self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
++        self.early_tmem_copy = early_tmem_copy
++        self.smem_subpartition_opt = smem_subpartition_opt
++        self.num_heads = num_heads
++        self.head_dim = head_dim
++        self.next_n = next_n
++        self.N = next_n * num_heads
++        self.num_sms = num_sms
++        self.num_epi_subtiles = num_epi_subtiles
++        self.epi_dtype = epi_dtype
++        self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
++        # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
++        # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
++        # at +64 would be misaligned (TMA requires 128-byte aligned SMEM dest).
++        w_stage_bytes = self.N * self.epi_bytes
++        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
++        self.output_dtype = output_dtype
++        if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
++            raise ValueError("num_heads must be divisible by num_epi_subtiles")
++        if (num_heads // num_epi_subtiles) % 4 != 0:
++            raise ValueError(
++                "num_heads // num_epi_subtiles must be divisible by 4 (FMA unroll granularity)"
++            )
++        self.num_groups = 2
++
++        self.num_math_threads = 256
++        self.num_specialized_threads = 128
++        self.threads_per_cta = 384
++        self.num_math_warps = 8
++        self.tma_warp_base = 8
++        self.umma_warp_base = 10
++
++        self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
++
++        # TMEM: 512 columns total, each group needs N columns per UMMA stage
++        # max_umma_stages = 512 // (2 * N)
++        TMEM_COLS = 512
++        if max_umma_pipeline:
++            self.num_umma_stages = min(2, TMEM_COLS // (2 * self.N))
++        else:
++            self.num_umma_stages = 1
++
++        if max_kv_pipeline:
++            smem_capacity = utils.get_smem_capacity_in_bytes()
++            # Reserve ~1 KB for barriers and misc
++            SMEM_BUDGET = smem_capacity - 1024
++            # KV+Scale per stage (×2 groups):
++            #   2 * (block_kv * head_dim * 1B + block_kv * 4B)
++            kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
++            # Q+W per stage: Q is N * head_dim * 1B, W uses padded stride
++            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.epi_bytes
++            qw_total = qw_per_stage * self.num_q_stages
++            self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
++        else:
++            self.num_kv_stages = 3
++
++        # Pad SMEM to push sW/sScales into sub-partition 1 (>= 128KB),
++        # avoiding sub-bank conflicts with UMMA reading sKV.
++        # Layout: barriers(~256B) | sKV_0 | sKV_1 | sQ | [pad] | sW | sScales
++        if self.smem_subpartition_opt:
++            BOUNDARY = 128 * 1024
++            used = (
++                256
++                + 2 * (block_kv * head_dim * self.num_kv_stages)
++                + self.N * head_dim * self.num_q_stages
++            )
++            used = ((used + 127) // 128) * 128
++            if used < BOUNDARY:
++                self.smem_pad_bytes = ((BOUNDARY - used + 1023) // 1024) * 1024
++            else:
++                self.smem_pad_bytes = 0
++        else:
++            self.smem_pad_bytes = 0
++
++        self.acc_dtype = acc_dtype
++        self.cta_group = tcgen05.CtaGroup.ONE
++        self.cluster_shape_mn = (1, 1)
++        self.mma_tiler_mn = (block_kv, self.N)
++
++    def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
++        self.a_dtype = a_dtype
++        self.b_dtype = b_dtype
++        self.a_major_mode = a_major
++        self.b_major_mode = b_major
++
++        self.mma_tiler = (*self.mma_tiler_mn, 1)
++        tiled_mma = sm100_utils.make_trivial_tiled_mma(
++            a_dtype,
++            a_major,
++            b_major,
++            self.acc_dtype,
++            self.cta_group,
++            self.mma_tiler_mn,
++        )
++        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])  # 32
++
++        # Full-K: tile K = head_dim (128), 1 TMA per block
++        mma_inst_tile_k = self.head_dim // mma_inst_shape_k  # 4
++        full_k = mma_inst_shape_k * mma_inst_tile_k  # 128
++        self.mma_tiler = (
++            self.mma_tiler_mn[0],
++            self.mma_tiler_mn[1],
++            full_k,
++        )
++
++        self.cta_tile_shape_mnk = (
++            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
++            self.mma_tiler[1],
++            self.mma_tiler[2],
++        )
++        self.cluster_layout_vmnk = cute.tiled_divide(
++            cute.make_layout((*self.cluster_shape_mn, 1)),
++            (tiled_mma.thr_id.shape,),
++        )
++        self.epi_tile = self.cta_tile_shape_mnk[:2]
++
++        # KV SMEM: 3 stages per group, each stage holds full [128, 128]
++        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
++            tiled_mma,
++            self.mma_tiler,
++            a_dtype,
++            self.num_kv_stages,
++        )
++        # Q SMEM: 1 stage, holds full [N, 128]
++        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
++            tiled_mma,
++            self.mma_tiler,
++            b_dtype,
++            self.num_q_stages,
++        )
++
++        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
++        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
++        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
++        self.num_tmem_alloc_cols_total = (
++            self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
++        )
++
++        return tiled_mma
++
++    @cute.jit
++    def __call__(
++        self,
++        kv_fused: cute.Tensor,  # Fused KV: [num_phys_blocks, block_bytes] FP8
++        b: cute.Tensor,  # Q: [N, head_dim, batch_size]
++        weights: cute.Tensor,  # [N, batch_size] (transposed for TMA)
++        logits: cute.Tensor,  # [batch_size * next_n, max_context_len]
++        block_table: cute.Tensor,  # [batch_size, max_blocks_per_seq]
++        context_lens: cute.Tensor,  # [batch_size]
++        schedule_meta: cute.Tensor,  # [num_sms+1, 2] int32
++        num_phys_blocks: cutlass.Int32,
++        batch_size: cutlass.Int32,
++        stream: cuda.CUstream,
++    ):
++        # Derive KV and Scale views from fused buffer using CuTE ops.
++        # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
++        phys_block_kv = self.phys_block_kv
++        phys_block_bytes = phys_block_kv * (self.head_dim + 4)
++        scale_offset_elems = phys_block_kv * self.head_dim  # in FP8 elements
++
++        # Recast fused buffer to FP8 (same 1-byte elements, needed for MMA type inference)
++        kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
++
++        # Q (b) was passed as uint8 to work around DLPack's lack of float8 support;
++        # recast back to FP8 so MMA type inference and TMA descriptors are correct.
++        b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
++
++        # KV view: [phys_block_kv, head_dim, num_phys_blocks] FP8
++        # Each TMA loads one physical block; multiple TMAs fill a compute tile.
++        kv_layout = cute.make_layout(
++            (phys_block_kv, self.head_dim, num_phys_blocks),
++            stride=(self.head_dim, 1, phys_block_bytes),
++        )
++        a = cute.make_tensor(kv_fp8.iterator, kv_layout)
++
++        # Scale view: offset pointer to scale region, recast FP8 → Float32
++        # [phys_block_kv, num_phys_blocks] float32 (after recast)
++        scale_fp8_layout = cute.make_layout(
++            (phys_block_kv * 4, num_phys_blocks),
++            stride=(1, phys_block_bytes),
++        )
++        scale_fp8 = cute.make_tensor(kv_fp8.iterator + scale_offset_elems, scale_fp8_layout)
++        scales = cute.recast_tensor(scale_fp8, cutlass.Float32)
++
++        a_dtype = a.element_type
++        b_dtype = b.element_type
++        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
++
++        tiled_mma = self._setup_mma(a_dtype, b_dtype, a_major, b_major)
++        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
++
++        # TMA for KV (A) — fmha_decode_paged pattern.
++        # Build a TMA SMEM layout via tiled_divide on the full compute-tile
++        # layout, then select to drop trivial K dim. Atom uses mode [0] as
++        # single-tile SMEM layout and (phys, head) as cta_tiler.
++        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
++        self.a_tma_view_layout = sm100_utils.make_smem_layout(
++            tcgen05.OperandMajorMode.K,
++            (self.block_kv, self.head_dim),
++            a_dtype,
++            self.num_kv_stages,
++        )
++        self.a_tma_view_layout = cute.tiled_divide(
++            self.a_tma_view_layout, (self.phys_block_kv, self.head_dim)
++        )
++        # ((tile_M, tile_K), rest_M, rest_K, stages) → drop trivial rest_K
++        self.a_tma_view_layout = cute.select(self.a_tma_view_layout, mode=[0, 1, 3])
++        # ((tile_M, tile_K), rest_M=num_sub_blocks, stages)
++        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
++            tma_load_op,
++            a,
++            self.a_tma_view_layout[0],  # atom SMEM = single-tile (mode 0)
++            (self.phys_block_kv, self.head_dim),
++        )
++
++        # TMA for Q (B) — full K=128, L dim = batch_size (unchanged)
++        b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
++        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
++        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
++            b_op,
++            b,
++            b_smem_layout,
++            self.mma_tiler,
++            tiled_mma,
++            self.cluster_layout_vmnk.shape,
++        )
++
++        # TMA for Weights — [N, batch_size], tile [N], L=batch_size
++        self.w_smem_layout_staged = cute.make_layout(
++            (self.N, self.num_q_stages),
++            stride=(1, self.w_stage_stride),
++        )
++        w_smem_per_stage = cute.select(self.w_smem_layout_staged, mode=[0])
++        tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
++            tma_load_op,
++            weights,
++            w_smem_per_stage,
++            self.w_smem_layout_staged.shape[:1],
++        )
++
++        # TMA for Scales — [phys_block_kv, num_phys_blocks], tile [phys_block_kv]
++        # SMEM holds compute_block_kv scales per stage; filled by
++        # num_blocks_per_mma sub-block TMAs at consecutive offsets.
++        self.s_smem_layout_staged = cute.make_layout((self.block_kv, self.num_kv_stages))
++        s_smem_per_subblock = cute.make_layout((phys_block_kv,))
++        tma_atom_s, tma_tensor_s = cpasync.make_tiled_tma_atom(
++            tma_load_op,
++            scales,
++            s_smem_per_subblock,
++            (phys_block_kv,),
++        )
++
++        b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
++        w_copy_size = self.N * self.epi_bytes
++        # Per sub-block: phys_block_kv * head_dim (KV) + phys_block_kv * 4 (scales)
++        kv_tma_bytes_per_subblock = phys_block_kv * self.head_dim
++        scale_tma_bytes_per_subblock = phys_block_kv * 4
++        # Total per compute tile = num_blocks_per_mma sub-blocks
++        self.num_kv_scale_tma_bytes = self.num_blocks_per_mma * (
++            kv_tma_bytes_per_subblock + scale_tma_bytes_per_subblock
++        )
++        # Q + Weights share barrier (like DeepGEMM)
++        self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
++
++        num_ctas = self.num_sms
++
++        @cute.struct
++        class SharedStorage:
++            kv_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_kv_stages * 2]
++            kv_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_kv_stages * 2]
++            q_mbar: cute.struct.MemRange[cutlass.Int64, self.num_q_stages * 2]
++            umma_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
++            umma_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
++            tmem_holding_buf: cutlass.Int32
++
++        self.kernel(
++            tiled_mma,
++            tma_atom_a,
++            tma_tensor_a,
++            tma_atom_b,
++            tma_tensor_b,
++            tma_atom_w,
++            tma_tensor_w,
++            tma_atom_s,
++            tma_tensor_s,
++            logits,
++            block_table,
++            context_lens,
++            schedule_meta,
++            batch_size,
++            self.cluster_layout_vmnk,
++            self.a_smem_layout_staged,
++            self.b_smem_layout_staged,
++            self.w_smem_layout_staged,
++            self.s_smem_layout_staged,
++            self.a_tma_view_layout,
++            self.epi_tile,
++            SharedStorage,
++        ).launch(
++            grid=(1, 1, num_ctas),
++            block=[self.threads_per_cta, 1, 1],
++            cluster=(*self.cluster_shape_mn, 1),
++            stream=stream,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        tiled_mma: cute.TiledMma,
++        tma_atom_a: cute.CopyAtom,
++        mA_mkl: cute.Tensor,  # KV pool
++        tma_atom_b: cute.CopyAtom,
++        mB_nkl: cute.Tensor,  # Q (L dim = batch_size)
++        tma_atom_w: cute.CopyAtom,
++        mW_tma: cute.Tensor,  # Weights TMA coord tensor [N, batch_size]
++        tma_atom_s: cute.CopyAtom,
++        mS_tma: cute.Tensor,  # Scales TMA coord tensor [block_kv, num_phys_blocks]
++        mLogits: cute.Tensor,  # [batch_size * next_n, max_context_len]
++        mBlockTable: cute.Tensor,  # [batch_size, max_blocks_per_seq]
++        mContextLens: cute.Tensor,  # [batch_size]
++        mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
++        batch_size: cutlass.Int32,
++        cluster_layout_vmnk: cute.Layout,
++        a_smem_layout_staged: cute.ComposedLayout,
++        b_smem_layout_staged: cute.ComposedLayout,
++        w_smem_layout_staged: cute.Layout,
++        s_smem_layout_staged: cute.Layout,
++        a_tma_view_layout: cute.ComposedLayout,
++        epi_tile: cute.Tile,
++        SharedStorage: cutlass.Constexpr,
++    ):
++        warp_idx = cute.arch.warp_idx()
++        warp_idx = cute.arch.make_warp_uniform(warp_idx)
++        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
++
++        bidx, bidy, bidz = cute.arch.block_idx()
++        mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
++        is_leader_cta = mma_tile_coord_v == 0
++        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
++        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
++        tidx, _, _ = cute.arch.thread_idx()
++
++        # Warp roles (matches DeepGEMM SM100)
++        warpgroup_idx = warp_idx // 4
++        is_math_warp = warp_idx < 8
++        is_tma_warp_0 = warp_idx == 8
++        is_tma_warp_1 = warp_idx == 9
++        is_tma_warp = is_tma_warp_0 | is_tma_warp_1
++        is_umma_warp_0 = warp_idx == 10
++        is_umma_warp_1 = warp_idx == 11
++
++        # Early schedule metadata load: issue global loads ASAP so their
++        # ~200-cycle L2 latency overlaps with subsequent prologue setup
++        # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
++        NUM_MATH_WG = 2  # kNumMathWarpGroups
++        NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
++        sm_idx = bidz
++        start_q = mScheduleMeta[(sm_idx, 0)]
++        start_kv_half = mScheduleMeta[(sm_idx, 1)]
++        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
++        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
++        # Early mContextLens load: overlap ~200-cycle L2 latency with the
++        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
++        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
++        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
++        # element), but it is never used because has_work will be False.
++        start_q_clamped = min(start_q, batch_size - 1)
++        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
++
++        if is_tma_warp:
++            cpasync.prefetch_descriptor(tma_atom_a)
++            cpasync.prefetch_descriptor(tma_atom_b)
++            cpasync.prefetch_descriptor(tma_atom_w)
++            cpasync.prefetch_descriptor(tma_atom_s)
++
++        smem = utils.SmemAllocator()
++        storage = smem.allocate(SharedStorage)
++
++        block_kv_val = self.block_kv
++        num_heads = self.num_heads
++        next_n = self.next_n
++        num_epi_subtiles = self.num_epi_subtiles
++
++        # === Pipelines ===
++        prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
++
++        # Q pipeline: TMA producer → Math consumer (8 math warps)
++        # PipelineTmaAsync: consumer_release uses is_signalling_thread
++        # (lane 0 per warp). 8 math warps × 1 lane-0 = 8 arrives.
++        q_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 8)
++        q_pipeline = pipeline.PipelineTmaAsync.create(
++            barrier_storage=storage.q_mbar.data_ptr(),
++            num_stages=self.num_q_stages,
++            producer_group=prod_group,
++            consumer_group=q_cons_group,
++            tx_count=self.num_q_tma_bytes,
++            cta_layout_vmnk=cluster_layout_vmnk,
++            tidx=tidx,
++            defer_sync=True,
++        )
++        q_prod_state = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.num_q_stages
++        )
++        # Both Math WGs share the same pipeline state (advance in lockstep)
++        q_cons_state = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_q_stages
++        )
++        # UMMA warps observe Q pipeline (wait only, no release)
++        # to ensure Q is in SMEM before GEMM. Critical for UMMA warp 1
++        # since TMA warp 1 only loads KV1 (not Q).
++        q_cons_state_umma_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_q_stages
++        )
++        q_cons_state_umma_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_q_stages
++        )
++
++        # Merged KV+Scale pipelines (per-group, 3 stages each)
++        # Like DeepGEMM: KV data and scales share one barrier.
++        # TMA loads both under one barrier. Math is consumer (releases).
++        # UMMA also waits on this barrier (for KV GEMM) but does NOT release.
++        math_warps_per_group = self.num_math_warps // 2  # 4 warps
++        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, math_warps_per_group)
++        kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
++            barrier_storage=storage.kv_mbar_0.data_ptr(),
++            num_stages=self.num_kv_stages,
++            producer_group=prod_group,
++            consumer_group=kv_cons_group,
++            tx_count=self.num_kv_scale_tma_bytes,
++            cta_layout_vmnk=cluster_layout_vmnk,
++            tidx=tidx,
++            defer_sync=True,
++        )
++        kv_pipeline_1 = pipeline.PipelineTmaAsync.create(
++            barrier_storage=storage.kv_mbar_1.data_ptr(),
++            num_stages=self.num_kv_stages,
++            producer_group=prod_group,
++            consumer_group=kv_cons_group,
++            tx_count=self.num_kv_scale_tma_bytes,
++            cta_layout_vmnk=cluster_layout_vmnk,
++            tidx=tidx,
++            defer_sync=True,
++        )
++
++        kv_prod_state_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.num_kv_stages
++        )
++        kv_prod_state_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.num_kv_stages
++        )
++        # UMMA consumer states (wait only, no release)
++        kv_cons_state_umma_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_kv_stages
++        )
++        kv_cons_state_umma_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_kv_stages
++        )
++        # Math consumer states (wait + release)
++        kv_cons_state_math_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_kv_stages
++        )
++        kv_cons_state_math_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_kv_stages
++        )
++
++        # UMMA pipelines (per-group)
++        math_threads_per_group = self.num_math_threads // 2
++        umma_pipeline_0 = pipeline.PipelineUmmaAsync.create(
++            barrier_storage=storage.umma_mbar_0.data_ptr(),
++            num_stages=self.num_umma_stages,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
++            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, math_threads_per_group),
++            cta_layout_vmnk=cluster_layout_vmnk,
++            defer_sync=True,
++        )
++        umma_pipeline_1 = pipeline.PipelineUmmaAsync.create(
++            barrier_storage=storage.umma_mbar_1.data_ptr(),
++            num_stages=self.num_umma_stages,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
++            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, math_threads_per_group),
++            cta_layout_vmnk=cluster_layout_vmnk,
++            defer_sync=True,
++        )
++
++        umma_prod_state_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.num_umma_stages
++        )
++        umma_prod_state_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.num_umma_stages
++        )
++        umma_cons_state_0 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_umma_stages
++        )
++        umma_cons_state_1 = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.num_umma_stages
++        )
++
++        # TMEM — only Math warps (8×32=256) + UMMA warps (2×32=64) = 320 threads
++        # TMA warps do NOT participate, so they can start TMA loads earlier.
++        # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
++        # because math warps are the last TMEM consumers (epilogue reads).
++        tmem_alloc_num_threads = 320  # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
++        tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=tmem_alloc_num_threads)
++        tmem = utils.TmemAllocator(
++            storage.tmem_holding_buf,
++            barrier_for_retrieve=tmem_alloc_barrier,
++            allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
++            is_two_cta=False,
++        )
++
++        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
++
++        # SMEM allocation: per-group KV + shared Q
++        sKV_0 = smem.allocate_tensor(
++            element_type=self.a_dtype,
++            layout=a_smem_layout_staged.outer,
++            byte_alignment=128,
++            swizzle=a_smem_layout_staged.inner,
++        )
++        sKV_1 = smem.allocate_tensor(
++            element_type=self.a_dtype,
++            layout=a_smem_layout_staged.outer,
++            byte_alignment=128,
++            swizzle=a_smem_layout_staged.inner,
++        )
++        sQ = smem.allocate_tensor(
++            element_type=self.b_dtype,
++            layout=b_smem_layout_staged.outer,
++            byte_alignment=128,
++            swizzle=b_smem_layout_staged.inner,
++        )
++        # Pad SMEM to push sW/sScales into sub-partition 1 (>= 128KB)
++        # to avoid sub-bank conflicts with UMMA reading sKV from
++        # sub-partition 0.
++        if cutlass.const_expr(self.smem_pad_bytes > 0):
++            _ = smem.allocate(self.smem_pad_bytes)
++        # Weights SMEM: [N, num_q_stages], shared Q barrier
++        sW = smem.allocate_tensor(
++            element_type=self.epi_dtype,
++            layout=w_smem_layout_staged,
++            byte_alignment=128,
++        )
++        # Scales SMEM: [block_kv, num_kv_stages] float32, per group
++        sScales_0 = smem.allocate_tensor(
++            element_type=cutlass.Float32,
++            layout=s_smem_layout_staged,
++            byte_alignment=128,
++        )
++        sScales_1 = smem.allocate_tensor(
++            element_type=cutlass.Float32,
++            layout=s_smem_layout_staged,
++            byte_alignment=128,
++        )
++
++        a_mcast_mask = cpasync.create_tma_multicast_mask(
++            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
++        )
++        b_mcast_mask = cpasync.create_tma_multicast_mask(
++            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
++        )
++
++        # Partition KV (A): fmha_decode_paged pattern.
++        # SMEM view is ((tile), num_sub_blocks, stages) — built in __call__.
++        # Use .outer (plain layout); swizzle is captured by sKV_0's iterator.
++        # GMEM: local_tile by (phys, head), then group first 2 modes into tile.
++        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
++        sKV_0_for_tma = cute.make_tensor(sKV_0.iterator, a_tma_view_layout.outer)
++        sKV_1_for_tma = cute.make_tensor(sKV_1.iterator, a_tma_view_layout.outer)
++        gA = cute.local_tile(
++            mA_mkl,
++            (self.phys_block_kv, self.head_dim),
++            coord=(None, None, None),
++        )
++        tAsA_0, tAgA_0 = cpasync.tma_partition(
++            tma_atom_a,
++            0,
++            cute.make_layout(1),
++            sKV_0_for_tma,
++            cute.group_modes(gA, 0, 2),
++        )
++        tAsA_1, tAgA_1 = cpasync.tma_partition(
++            tma_atom_a,
++            0,
++            cute.make_layout(1),
++            sKV_1_for_tma,
++            cute.group_modes(gA, 0, 2),
++        )
++
++        # Partition Q (B): shared SMEM, L dim = batch_size
++        gB_nkl = cute.local_tile(
++            mB_nkl,
++            cute.slice_(self.mma_tiler, (0, None, None)),
++            (None, None, None),
++        )
++        tCgB = thr_mma.partition_B(gB_nkl)
++        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
++        tBsB, tBgB = cpasync.tma_partition(
++            tma_atom_b,
++            block_in_cluster_coord_vmnk[1],
++            b_cta_layout,
++            cute.group_modes(sQ, 0, 3),
++            cute.group_modes(tCgB, 0, 3),
++        )
++        tBgB = tBgB[(None, 0, None, None)]  # [tma, K, L]
++
++        # Partition Weights: standalone TMA, [N, batch_size] → [N] per stage
++        w_cta_layout = cute.make_layout((1,))
++        tWsW, tWgW = cpasync.tma_partition(
++            tma_atom_w,
++            0,
++            w_cta_layout,
++            cute.group_modes(sW, 0, 1),
++            cute.group_modes(mW_tma, 0, 1),
++        )
++
++        # Partition Scales: explicit sub_blocks + stages dims.
++        # Layout (phys_block_kv, num_sub, stages) K-major with custom strides.
++        s_tma_view_layout = cute.make_layout(
++            (self.phys_block_kv, self.num_blocks_per_mma, self.num_kv_stages),
++            stride=(1, self.phys_block_kv, self.block_kv),
++        )
++        sScales_0_for_tma = cute.make_tensor(sScales_0.iterator, s_tma_view_layout)
++        sScales_1_for_tma = cute.make_tensor(sScales_1.iterator, s_tma_view_layout)
++        # GMEM: local_tile by phys to match atom's tile size
++        gS = cute.local_tile(mS_tma, (self.phys_block_kv,), coord=(None, None))
++        tSsS_0, tSgS_0 = cpasync.tma_partition(
++            tma_atom_s,
++            0,
++            cute.make_layout(1),
++            sScales_0_for_tma,
++            gS,
++        )
++        tSsS_1, tSgS_1 = cpasync.tma_partition(
++            tma_atom_s,
++            0,
++            cute.make_layout(1),
++            sScales_1_for_tma,
++            gS,
++        )
++
++        # MMA fragments
++        tCrA_0 = tiled_mma.make_fragment_A(sKV_0)
++        tCrA_1 = tiled_mma.make_fragment_A(sKV_1)
++        tCrB = tiled_mma.make_fragment_B(sQ)  # shared
++        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
++
++        # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
++        # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
++        us = self.num_umma_stages
++        cols = self.num_tmem_alloc_cols
++        acc_shape_staged = cute.append(acc_shape, us)
++        tCtAcc_fake_staged = tiled_mma.make_fragment_C(acc_shape_staged)
++
++        # TMEM layout info (allocation deferred to UMMA/Math warp branches)
++        cols_per_group = cols * us * (32 // self.acc_dtype.width)
++        num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
++
++        # Epilogue setup
++        c_layout = utils.LayoutEnum.ROW_MAJOR
++        epi_sub_mn = (epi_tile[0], num_heads // num_epi_subtiles)
++        copy_atom_t2r = sm100_utils.get_tmem_load_op(
++            self.cta_tile_shape_mnk,
++            c_layout,
++            self.acc_dtype,
++            self.acc_dtype,
++            epi_sub_mn,
++            use_2cta_instrs,
++        )
++
++        # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
++        end_kv_idx = end_kv_half * NUM_MATH_WG
++
++        # Convert start to KV block units (matching DeepGEMM)
++        current_q_idx = start_q
++        current_kv_idx = start_kv_half * NUM_MATH_WG
++
++        # ===== COMMON SCHEDULER STATE (before warp branches) =====
++        # Each warp role independently maintains its own copy of these
++        # variables (like DeepGEMM where each role creates its own scheduler).
++        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
++        next_q_idx = current_q_idx
++        next_kv_idx = current_kv_idx
++        next_num_kv = current_num_kv
++        # Sentinel: no previous batch (matches DeepGEMM's q_idx = batch_size)
++        q_idx = batch_size
++        # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
++        # True if this CTA has work assigned (start != end in schedule_meta).
++        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
++
++        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
++
++        # ===== WARP-SPECIALIZED EXECUTION =====
++
++        if is_tma_warp_0:
++            # TMA warp 0: loads Q (prefetch) + KV for group 0
++            # Matches DeepGEMM's TMA warp with kv_group_idx == 0
++            cute.arch.warpgroup_reg_dealloc(24)
++            lane_idx = tidx % 32
++
++            # Block table prefetch: 32 lanes cache block indices,
++            # distributed via shuffle. Each lane holds num_blocks_per_mma
++            # physical block indices per compute tile. (DeepGEMM L233-244)
++            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
++            kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
++
++            # Prefetch first Q before loop (like DeepGEMM line 203-204)
++            q_pipeline.producer_acquire(q_prod_state)
++            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
++            cute.copy(
++                tma_atom_b,
++                tBgB[(None, 0, next_q_idx)],
++                tBsB[(None, q_prod_state.index)],
++                tma_bar_ptr=q_bar,
++                mcast_mask=b_mcast_mask,
++            )
++            cute.copy(
++                tma_atom_w,
++                tWgW[(None, next_q_idx)],
++                tWsW[(None, q_prod_state.index)],
++                tma_bar_ptr=q_bar,
++            )
++            q_prod_state.advance()
++
++            while has_work:
++                # fetch_next_task: commit next → current
++                q_idx_old = q_idx
++                q_idx = next_q_idx
++                kv_idx = next_kv_idx
++                num_kv = next_num_kv
++
++                # Q prefetch: when batch changes, load Q for NEXT batch
++                if q_idx != q_idx_old:
++                    kv_blk_ptr = cutlass.Int32(32)  # force re-prefetch
++                    prefetch_next = q_idx + 1
++                    if prefetch_next < end_q_idx:
++                        q_pipeline.producer_acquire(q_prod_state)
++                        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
++                        cute.copy(
++                            tma_atom_b,
++                            tBgB[(None, 0, prefetch_next)],
++                            tBsB[(None, q_prod_state.index)],
++                            tma_bar_ptr=q_bar,
++                            mcast_mask=b_mcast_mask,
++                        )
++                        cute.copy(
++                            tma_atom_w,
++                            tWgW[(None, prefetch_next)],
++                            tWsW[(None, q_prod_state.index)],
++                            tma_bar_ptr=q_bar,
++                        )
++                        q_prod_state.advance()
++                    elif prefetch_next == end_q_idx:
++                        if end_kv_idx > 0:
++                            q_pipeline.producer_acquire(q_prod_state)
++                            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
++                            cute.copy(
++                                tma_atom_b,
++                                tBgB[(None, 0, prefetch_next)],
++                                tBsB[(None, q_prod_state.index)],
++                                tma_bar_ptr=q_bar,
++                                mcast_mask=b_mcast_mask,
++                            )
++                            cute.copy(
++                                tma_atom_w,
++                                tWgW[(None, prefetch_next)],
++                                tWsW[(None, q_prod_state.index)],
++                                tma_bar_ptr=q_bar,
++                            )
++                            q_prod_state.advance()
++
++                # Block table prefetch for group 0 (like DeepGEMM L233-241).
++                # Each lane loads num_blocks_per_mma physical block indices
++                # for one compute tile (kv_idx counts compute tiles).
++                if kv_blk_ptr == 32:
++                    kv_blk_ptr = cutlass.Int32(0)
++                    prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
++                    if prefetch_kv < num_kv:
++                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
++                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
++                    else:
++                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                            cached_blks[i] = cutlass.Int32(0)
++
++                # Get block indices via shuffle before barrier (like DeepGEMM L244)
++                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
++                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
++                kv_blk_ptr = kv_blk_ptr + 1
++
++                # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
++                kv_pipeline_0.producer_acquire(kv_prod_state_0)
++                bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
++                stage = kv_prod_state_0.index
++                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                    cute.copy(
++                        tma_atom_a,
++                        tAgA_0[(None, 0, 0, phys_blks[i])],
++                        tAsA_0[(None, i, stage)],
++                        tma_bar_ptr=bar,
++                        mcast_mask=a_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_s,
++                        tSgS_0[(None, 0, phys_blks[i])],
++                        tSsS_0[(None, i, stage)],
++                        tma_bar_ptr=bar,
++                    )
++                kv_prod_state_0.advance()
++
++                # Advance: inline fetch_next_task
++                next_kv_idx = kv_idx + NUM_MATH_WG
++                if next_kv_idx >= num_kv:
++                    next_q_idx = q_idx + 1
++                    next_kv_idx = 0
++                    if next_q_idx < batch_size:
++                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
++                # Update while-loop condition
++                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++        elif is_tma_warp_1:
++            # TMA warp 1: loads KV + Scale for group 1 only
++            # Matches DeepGEMM's TMA warp with kv_group_idx == 1
++            cute.arch.warpgroup_reg_dealloc(24)
++            lane_idx = tidx % 32
++
++            # Block table prefetch for group 1
++            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
++            kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
++
++            while has_work:
++                # fetch_next_task: commit next → current
++                q_idx_old = q_idx
++                q_idx = next_q_idx
++                kv_idx = next_kv_idx
++                num_kv = next_num_kv
++
++                # New q_idx → force block table re-prefetch
++                if q_idx != q_idx_old:
++                    kv_blk_ptr = cutlass.Int32(32)
++
++                # Block table prefetch for group 1 (like DeepGEMM L233-241).
++                if kv_blk_ptr == 32:
++                    kv_blk_ptr = cutlass.Int32(0)
++                    prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
++                    if prefetch_kv < num_kv:
++                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
++                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
++                    else:
++                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                            cached_blks[i] = cutlass.Int32(0)
++
++                # Get block indices via shuffle before barrier (like DeepGEMM L244)
++                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
++                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
++                kv_blk_ptr = kv_blk_ptr + 1
++
++                # Load KV + Scale for group 1: num_blocks_per_mma TMAs per tile.
++                kv_pipeline_1.producer_acquire(kv_prod_state_1)
++                bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
++                stage = kv_prod_state_1.index
++                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
++                    cute.copy(
++                        tma_atom_a,
++                        tAgA_1[(None, 0, 0, phys_blks[i])],
++                        tAsA_1[(None, i, stage)],
++                        tma_bar_ptr=bar,
++                        mcast_mask=a_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_s,
++                        tSgS_1[(None, 0, phys_blks[i])],
++                        tSsS_1[(None, i, stage)],
++                        tma_bar_ptr=bar,
++                    )
++                kv_prod_state_1.advance()
++
++                # Advance: inline fetch_next_task
++                next_kv_idx = kv_idx + NUM_MATH_WG
++                if next_kv_idx >= num_kv:
++                    next_q_idx = q_idx + 1
++                    next_kv_idx = 0
++                    if next_q_idx < batch_size:
++                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
++                # Update while-loop condition
++                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++        elif is_umma_warp_0:
++            # UMMA warp for group 0
++            # Must wait on Q pipeline: TMA operations with different
++            # barriers are NOT visibility-ordered even within the same
++            # warp. KV0 barrier arriving does not guarantee Q SMEM
++            # writes are visible.
++            cute.arch.warpgroup_reg_dealloc(24)
++
++            # TMEM: wait for math warp 0's allocation, retrieve pointer
++            tmem.wait_for_alloc()
++            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
++            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
++            tCtAcc_base_1 = cute.make_tensor(tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout)
++
++            if is_leader_cta:
++                num_k_blocks = cute.size(tCrA_0.shape[2])
++                q_stage_0 = cutlass.Int32(0)
++
++                while has_work:
++                    # fetch_next_task: commit next → current
++                    q_idx_old = q_idx
++                    q_idx = next_q_idx
++                    kv_idx = next_kv_idx
++                    num_kv = next_num_kv
++
++                    # Wait for Q pipeline when batch changes
++                    if q_idx != q_idx_old:
++                        if q_idx_old < batch_size:
++                            q_cons_state_umma_0.advance()
++                        q_pipeline.consumer_wait(q_cons_state_umma_0)
++                        q_stage_0 = q_cons_state_umma_0.index
++
++                    # Process KV block for group 0 (kv_idx + 0)
++                    # Unconditional UMMA (like DeepGEMM): OOB iterations
++                    # compute on garbage data; results written to aligned
++                    # padding region in logits buffer.
++                    # Wait KV first, then TMEM empty (like DeepGEMM)
++                    kv_pipeline_0.consumer_wait(kv_cons_state_umma_0)
++                    umma_pipeline_0.producer_acquire(umma_prod_state_0)
++                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
++                    kv_stage = kv_cons_state_umma_0.index
++                    tCtAcc_0 = tCtAcc_base_0[(None, None, None, umma_prod_state_0.index)]
++                    for k_block in cutlass.range_constexpr(num_k_blocks):
++                        cute.gemm(
++                            tiled_mma,
++                            tCtAcc_0,
++                            tCrA_0[None, None, k_block, kv_stage],
++                            tCrB[None, None, k_block, q_stage_0],
++                            tCtAcc_0,
++                        )
++                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
++                    # No consumer_release here — Math WG 0 releases
++                    kv_cons_state_umma_0.advance()
++
++                    umma_pipeline_0.producer_commit(umma_prod_state_0)
++                    umma_prod_state_0.advance()
++
++                    # Advance: inline fetch_next_task
++                    next_kv_idx = kv_idx + NUM_MATH_WG
++                    if next_kv_idx >= num_kv:
++                        next_q_idx = q_idx + 1
++                        next_kv_idx = 0
++                        if next_q_idx < batch_size:
++                            next_num_kv = (
++                                mContextLens[next_q_idx] + block_kv_val - 1
++                            ) // block_kv_val
++                    # Update while-loop condition
++                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++        elif is_umma_warp_1:
++            # UMMA warp for group 1
++            # Explicitly waits on Q pipeline — critical because TMA warp 1
++            # only loads KV1, not Q. Without this wait, UMMA warp 1 can
++            # start GEMM before TMA warp 0 finishes loading Q into SMEM.
++            cute.arch.warpgroup_reg_dealloc(24)
++
++            # TMEM: wait for umma_warp_0's allocation, retrieve pointer
++            tmem.wait_for_alloc()
++            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
++            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
++            tCtAcc_base_1 = cute.make_tensor(tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout)
++
++            if is_leader_cta:
++                num_k_blocks_1 = cute.size(tCrA_1.shape[2])
++                q_stage_1 = cutlass.Int32(0)
++
++                while has_work:
++                    # fetch_next_task: commit next → current
++                    q_idx_old = q_idx
++                    q_idx = next_q_idx
++                    kv_idx = next_kv_idx
++                    num_kv = next_num_kv
++
++                    # Wait for Q pipeline when batch changes
++                    if q_idx != q_idx_old:
++                        if q_idx_old < batch_size:
++                            q_cons_state_umma_1.advance()
++                        q_pipeline.consumer_wait(q_cons_state_umma_1)
++                        q_stage_1 = q_cons_state_umma_1.index
++
++                    # Process KV block for group 1 (kv_idx + 1)
++                    # Unconditional UMMA (like DeepGEMM)
++                    # Wait KV first, then TMEM empty (like DeepGEMM)
++                    kv_pipeline_1.consumer_wait(kv_cons_state_umma_1)
++                    umma_pipeline_1.producer_acquire(umma_prod_state_1)
++                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
++                    kv_stage_1 = kv_cons_state_umma_1.index
++                    tCtAcc_1 = tCtAcc_base_1[(None, None, None, umma_prod_state_1.index)]
++                    for k_block in cutlass.range_constexpr(num_k_blocks_1):
++                        cute.gemm(
++                            tiled_mma,
++                            tCtAcc_1,
++                            tCrA_1[None, None, k_block, kv_stage_1],
++                            tCrB[None, None, k_block, q_stage_1],
++                            tCtAcc_1,
++                        )
++                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
++                    # No consumer_release here — Math WG 1 releases
++                    kv_cons_state_umma_1.advance()
++
++                    umma_pipeline_1.producer_commit(umma_prod_state_1)
++                    umma_prod_state_1.advance()
++
++                    # Advance: inline fetch_next_task
++                    next_kv_idx = kv_idx + NUM_MATH_WG
++                    if next_kv_idx >= num_kv:
++                        next_q_idx = q_idx + 1
++                        next_kv_idx = 0
++                        if next_q_idx < batch_size:
++                            next_num_kv = (
++                                mContextLens[next_q_idx] + block_kv_val - 1
++                            ) // block_kv_val
++                    # Update while-loop condition
++                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++        elif is_math_warp:
++            cute.arch.warpgroup_reg_alloc(240)
++
++            # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
++            tmem.allocate(num_tmem_alloc_cols_total)
++            tmem.wait_for_alloc()
++            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
++            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
++            tCtAcc_base_1 = cute.make_tensor(tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout)
++
++            local_tidx = tidx % 128
++            cC = cute.make_identity_tensor(epi_sub_mn)
++
++            if warpgroup_idx == 0:
++                # Math WG 0: process group 0
++                # Reference setup (stage 0) for m_coord
++                # flat_divide by sub-tile to get sub-tile partitions
++                tAcc_0_ref = tCtAcc_base_0[(None, None, None, 0)][((None, None), 0, 0)]
++                tAcc_0_ref_epi = cute.flat_divide(tAcc_0_ref, epi_sub_mn)
++                tiled_copy_ref_0 = tcgen05.make_tmem_copy(
++                    copy_atom_t2r, tAcc_0_ref_epi[(None, None, 0, 0)]
++                )
++                thr_copy_ref_0 = tiled_copy_ref_0.get_slice(local_tidx)
++                tTR_cC = thr_copy_ref_0.partition_D(cC)
++                m_coord = tTR_cC[0][0]
++
++                tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
++
++                # Weight register cache: only first NUM_W_IN_REG
++                # per next_n slot (like DeepGEMM min(52, kNumHeads)).
++                # Remaining weights read from SMEM in epilogue.
++                # FP16 weights use half the regs, so we can fit
++                # all heads for next_n <= 3.
++                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                    MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
++                else:
++                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
++                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
++                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
++                q_stage_local = cutlass.Int32(0)
++
++                while has_work:
++                    # fetch_next_task: commit next → current
++                    q_idx_old = q_idx
++                    q_idx = next_q_idx
++                    kv_idx = next_kv_idx
++                    num_kv = next_num_kv
++
++                    # Q pipeline consumer: wait for Q+Weights SMEM
++                    if q_idx != q_idx_old:
++                        if q_idx_old < batch_size:
++                            q_pipeline.consumer_release(q_cons_state)
++                            q_cons_state.advance()
++                        q_pipeline.consumer_wait(q_cons_state)
++                        q_stage_local = q_cons_state.index
++                        # Preload first NUM_W_IN_REG weights per slot
++                        for t_i in cutlass.range_constexpr(next_n):
++                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
++                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
++                                    (t_i * num_heads + w_j, q_stage_local)
++                                ]
++
++                    # Process KV block for group 0 (kv_idx + 0)
++                    # Unconditional Math (like DeepGEMM): OOB results
++                    # written to aligned padding region in logits buffer.
++                    kv_pos = kv_idx * block_kv_val + m_coord
++
++                    if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                        # Skip KV wait, rely on UMMA barrier's
++                        # transitive visibility.
++                        umma_pipeline_0.consumer_wait(umma_cons_state_0)
++                    else:
++                        # Default: wait KV first to overlap lds with
++                        # UMMA computation.
++                        kv_pipeline_0.consumer_wait(kv_cons_state_math_0)
++                        sc_stage_0 = kv_cons_state_math_0.index
++                        scale_val = sScales_0[(m_coord, sc_stage_0)]
++                        umma_pipeline_0.consumer_wait(umma_cons_state_0)
++
++                    # --- TMEM sub-tile setup ---
++                    # flat_divide accumulator by sub-tile shape;
++                    # partition once, then loop over sub-tiles.
++                    tCtAcc_c0 = tCtAcc_base_0[(None, None, None, umma_cons_state_0.index)]
++                    tAcc_c0 = tCtAcc_c0[((None, None), 0, 0)]
++                    tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
++                    tc_0 = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_c0_epi[(None, None, 0, 0)])
++                    tr_0 = tc_0.get_slice(local_tidx)
++                    tTR_0 = tr_0.partition_S(tAcc_c0_epi)
++
++                    # --- First sub-tile LDTM + KV release ---
++                    if cutlass.const_expr(self.early_tmem_copy):
++                        # Issue first sub-tile LDTM early
++                        cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
++                        # Scale LDS + KV release fill latency
++                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                            sc_stage_0 = kv_cons_state_math_0.index
++                            scale_val = sScales_0[(m_coord, sc_stage_0)]
++                        kv_pipeline_0.consumer_release(kv_cons_state_math_0)
++                        kv_cons_state_math_0.advance()
++                        cute.arch.fence_view_async_tmem_load()
++                    else:
++                        # Default: scale LDS + KV release first
++                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                            sc_stage_0 = kv_cons_state_math_0.index
++                            scale_val = sScales_0[(m_coord, sc_stage_0)]
++                        kv_pipeline_0.consumer_release(kv_cons_state_math_0)
++                        kv_cons_state_math_0.advance()
++                        cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
++                        cute.arch.fence_view_async_tmem_load()
++
++                    # --- Sub-tile compute loop ---
++                    # Each sub-tile: LDTM.xN → fence → load →
++                    # ReLU+FMA. Breaks FMA chain (16→4 per chunk)
++                    # and interleaves LDTM with FP32 compute to
++                    # reduce ShadowPipeThrottle.
++                    # Sub-tiles are within each t-slot (num_heads
++                    # // num_epi_subtiles wide). flat_divide yields
++                    # next_n * num_epi_subtiles sub-tiles total;
++                    # global index = t * num_epi_subtiles + i.
++                    subtile_n = num_heads // num_epi_subtiles
++                    if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                        packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
++                    for t in cutlass.range_constexpr(next_n):
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            ps0 = packed_zero
++                            ps1 = packed_zero
++                        else:
++                            s0x = cutlass.Float32(0.0)
++                            s0y = cutlass.Float32(0.0)
++                            s1x = cutlass.Float32(0.0)
++                            s1y = cutlass.Float32(0.0)
++                        for i in cutlass.range_constexpr(num_epi_subtiles):
++                            # LDTM for sub-tiles 1..N-1
++                            # (sub-tile 0 handled above)
++                            if t > 0 or i > 0:
++                                cute.copy(
++                                    tc_0,
++                                    tTR_0[(None, None, None, 0, t * num_epi_subtiles + i)],
++                                    tTR_rAcc,
++                                )
++                                cute.arch.fence_view_async_tmem_load()
++                            # Release UMMA after last LDTM+fence
++                            if t == next_n - 1 and i == num_epi_subtiles - 1:
++                                umma_pipeline_0.consumer_release(umma_cons_state_0)
++                                umma_cons_state_0.advance()
++                            acc_vec = tTR_rAcc.load()
++                            # Reg-path: weights from registers
++                            reg_h_end = min(subtile_n, max(0, NUM_W_IN_REG - i * subtile_n))
++                            for h in cutlass.range_constexpr(0, reg_h_end, 4):
++                                n0 = h
++                                h_g = i * subtile_n + h
++                                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                                    pa01 = pack_f16x2(
++                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
++                                    )
++                                    pa23 = pack_f16x2(
++                                        Float16(acc_vec[n0 + 2]), Float16(acc_vec[n0 + 3])
++                                    )
++                                    pa01 = max_f16x2(pa01, packed_zero)
++                                    pa23 = max_f16x2(pa23, packed_zero)
++                                    r0 = t * NUM_W_IN_REG + h_g
++                                    pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
++                                    pw23 = pack_f16x2(w_cache[r0 + 2], w_cache[r0 + 3])
++                                    ps0 = fma_f16x2(pa01, pw01, ps0)
++                                    ps1 = fma_f16x2(pa23, pw23, ps1)
++                                else:
++                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
++                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
++                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
++                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
++                                    r0 = t * NUM_W_IN_REG + h_g
++                                    w0 = w_cache[r0]
++                                    w1 = w_cache[r0 + 1]
++                                    w2 = w_cache[r0 + 2]
++                                    w3 = w_cache[r0 + 3]
++                                    s0x, s0y = cute.arch.fma_packed_f32x2(
++                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                                    s1x, s1y = cute.arch.fma_packed_f32x2(
++                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                            # SMEM-path: weights from shared mem
++                            smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
++                            for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
++                                n0 = h
++                                h_g = i * subtile_n + h
++                                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                                    pa01 = pack_f16x2(
++                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
++                                    )
++                                    pa23 = pack_f16x2(
++                                        Float16(acc_vec[n0 + 2]), Float16(acc_vec[n0 + 3])
++                                    )
++                                    pa01 = max_f16x2(pa01, packed_zero)
++                                    pa23 = max_f16x2(pa23, packed_zero)
++                                    pw01 = pack_f16x2(
++                                        sW[(t * num_heads + h_g, q_stage_local)],
++                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
++                                    )
++                                    pw23 = pack_f16x2(
++                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
++                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
++                                    )
++                                    ps0 = fma_f16x2(pa01, pw01, ps0)
++                                    ps1 = fma_f16x2(pa23, pw23, ps1)
++                                else:
++                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
++                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
++                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
++                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
++                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
++                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
++                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
++                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
++                                    s0x, s0y = cute.arch.fma_packed_f32x2(
++                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                                    s1x, s1y = cute.arch.fma_packed_f32x2(
++                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            ps_sum = add_f16x2(ps0, ps1)
++                            sum_lo, sum_hi = unpack_f16x2(ps_sum)
++                            result_t = sum_lo + sum_hi
++                        else:
++                            result_t = s0x + s0y + s1x + s1y
++                        out_row = q_idx * next_n + t
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            mLogits[(out_row, kv_pos)] = self.output_dtype(
++                                result_t * Float16(scale_val)
++                            )
++                        else:
++                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
++
++                    # Advance: inline fetch_next_task
++                    next_kv_idx = kv_idx + NUM_MATH_WG
++                    if next_kv_idx >= num_kv:
++                        next_q_idx = q_idx + 1
++                        next_kv_idx = 0
++                        if next_q_idx < batch_size:
++                            next_num_kv = (
++                                mContextLens[next_q_idx] + block_kv_val - 1
++                            ) // block_kv_val
++                    # Update while-loop condition
++                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++                # Release last Q stage (WG 0)
++                if q_idx < batch_size:
++                    q_pipeline.consumer_release(q_cons_state)
++                    q_cons_state.advance()
++
++            else:
++                # Math WG 1: process group 1
++                tAcc_1_ref = tCtAcc_base_1[(None, None, None, 0)][((None, None), 0, 0)]
++                tAcc_1_ref_epi = cute.flat_divide(tAcc_1_ref, epi_sub_mn)
++                tiled_copy_ref_1 = tcgen05.make_tmem_copy(
++                    copy_atom_t2r, tAcc_1_ref_epi[(None, None, 0, 0)]
++                )
++                thr_copy_ref_1 = tiled_copy_ref_1.get_slice(local_tidx)
++                tTR_cC = thr_copy_ref_1.partition_D(cC)
++                m_coord = tTR_cC[0][0]
++
++                tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
++
++                # Weight register cache: only first NUM_W_IN_REG
++                # per next_n slot (like DeepGEMM min(52, kNumHeads)).
++                # FP16 weights use half the regs, so we can fit
++                # all heads for next_n <= 3.
++                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                    MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
++                else:
++                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
++                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
++                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
++                q_stage_local = cutlass.Int32(0)
++
++                while has_work:
++                    # fetch_next_task: commit next → current
++                    q_idx_old = q_idx
++                    q_idx = next_q_idx
++                    kv_idx = next_kv_idx
++                    num_kv = next_num_kv
++
++                    # Q pipeline consumer: wait for Q+Weights SMEM
++                    if q_idx != q_idx_old:
++                        if q_idx_old < batch_size:
++                            q_pipeline.consumer_release(q_cons_state)
++                            q_cons_state.advance()
++                        q_pipeline.consumer_wait(q_cons_state)
++                        q_stage_local = q_cons_state.index
++                        # Preload first NUM_W_IN_REG weights per slot
++                        for t_i in cutlass.range_constexpr(next_n):
++                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
++                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
++                                    (t_i * num_heads + w_j, q_stage_local)
++                                ]
++
++                    # Process KV block for group 1 (kv_idx + 1)
++                    # Unconditional Math (like DeepGEMM)
++                    kv_idx_1 = kv_idx + 1
++
++                    kv_pos = kv_idx_1 * block_kv_val + m_coord
++
++                    if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                        umma_pipeline_1.consumer_wait(umma_cons_state_1)
++                    else:
++                        kv_pipeline_1.consumer_wait(kv_cons_state_math_1)
++                        sc_stage_1 = kv_cons_state_math_1.index
++                        scale_val = sScales_1[(m_coord, sc_stage_1)]
++                        umma_pipeline_1.consumer_wait(umma_cons_state_1)
++
++                    # --- TMEM sub-tile setup (WG1) ---
++                    tCtAcc_c1 = tCtAcc_base_1[(None, None, None, umma_cons_state_1.index)]
++                    tAcc_c1 = tCtAcc_c1[((None, None), 0, 0)]
++                    tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
++                    tc_1 = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_c1_epi[(None, None, 0, 0)])
++                    tr_1 = tc_1.get_slice(local_tidx)
++                    tTR_1 = tr_1.partition_S(tAcc_c1_epi)
++
++                    # --- First sub-tile LDTM + KV release (WG1) ---
++                    if cutlass.const_expr(self.early_tmem_copy):
++                        cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
++                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                            sc_stage_1 = kv_cons_state_math_1.index
++                            scale_val = sScales_1[(m_coord, sc_stage_1)]
++                        kv_pipeline_1.consumer_release(kv_cons_state_math_1)
++                        kv_cons_state_math_1.advance()
++                        cute.arch.fence_view_async_tmem_load()
++                    else:
++                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
++                            sc_stage_1 = kv_cons_state_math_1.index
++                            scale_val = sScales_1[(m_coord, sc_stage_1)]
++                        kv_pipeline_1.consumer_release(kv_cons_state_math_1)
++                        kv_cons_state_math_1.advance()
++                        cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
++                        cute.arch.fence_view_async_tmem_load()
++
++                    # --- Sub-tile compute loop (WG1) ---
++                    subtile_n = num_heads // num_epi_subtiles
++                    if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                        packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
++                    for t in cutlass.range_constexpr(next_n):
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            ps0 = packed_zero
++                            ps1 = packed_zero
++                        else:
++                            s0x = cutlass.Float32(0.0)
++                            s0y = cutlass.Float32(0.0)
++                            s1x = cutlass.Float32(0.0)
++                            s1y = cutlass.Float32(0.0)
++                        for i in cutlass.range_constexpr(num_epi_subtiles):
++                            if t > 0 or i > 0:
++                                cute.copy(
++                                    tc_1,
++                                    tTR_1[(None, None, None, 0, t * num_epi_subtiles + i)],
++                                    tTR_rAcc,
++                                )
++                                cute.arch.fence_view_async_tmem_load()
++                            if t == next_n - 1 and i == num_epi_subtiles - 1:
++                                umma_pipeline_1.consumer_release(umma_cons_state_1)
++                                umma_cons_state_1.advance()
++                            acc_vec = tTR_rAcc.load()
++                            # Reg-path
++                            reg_h_end = min(subtile_n, max(0, NUM_W_IN_REG - i * subtile_n))
++                            for h in cutlass.range_constexpr(0, reg_h_end, 4):
++                                n0 = h
++                                h_g = i * subtile_n + h
++                                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                                    pa01 = pack_f16x2(
++                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
++                                    )
++                                    pa23 = pack_f16x2(
++                                        Float16(acc_vec[n0 + 2]), Float16(acc_vec[n0 + 3])
++                                    )
++                                    pa01 = max_f16x2(pa01, packed_zero)
++                                    pa23 = max_f16x2(pa23, packed_zero)
++                                    r0 = t * NUM_W_IN_REG + h_g
++                                    pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
++                                    pw23 = pack_f16x2(w_cache[r0 + 2], w_cache[r0 + 3])
++                                    ps0 = fma_f16x2(pa01, pw01, ps0)
++                                    ps1 = fma_f16x2(pa23, pw23, ps1)
++                                else:
++                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
++                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
++                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
++                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
++                                    r0 = t * NUM_W_IN_REG + h_g
++                                    w0 = w_cache[r0]
++                                    w1 = w_cache[r0 + 1]
++                                    w2 = w_cache[r0 + 2]
++                                    w3 = w_cache[r0 + 3]
++                                    s0x, s0y = cute.arch.fma_packed_f32x2(
++                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                                    s1x, s1y = cute.arch.fma_packed_f32x2(
++                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                            # SMEM-path
++                            smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
++                            for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
++                                n0 = h
++                                h_g = i * subtile_n + h
++                                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                                    pa01 = pack_f16x2(
++                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
++                                    )
++                                    pa23 = pack_f16x2(
++                                        Float16(acc_vec[n0 + 2]), Float16(acc_vec[n0 + 3])
++                                    )
++                                    pa01 = max_f16x2(pa01, packed_zero)
++                                    pa23 = max_f16x2(pa23, packed_zero)
++                                    pw01 = pack_f16x2(
++                                        sW[(t * num_heads + h_g, q_stage_local)],
++                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
++                                    )
++                                    pw23 = pack_f16x2(
++                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
++                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
++                                    )
++                                    ps0 = fma_f16x2(pa01, pw01, ps0)
++                                    ps1 = fma_f16x2(pa23, pw23, ps1)
++                                else:
++                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
++                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
++                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
++                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
++                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
++                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
++                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
++                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
++                                    s0x, s0y = cute.arch.fma_packed_f32x2(
++                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                                    s1x, s1y = cute.arch.fma_packed_f32x2(
++                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
++                                    )
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            ps_sum = add_f16x2(ps0, ps1)
++                            sum_lo, sum_hi = unpack_f16x2(ps_sum)
++                            result_t = sum_lo + sum_hi
++                        else:
++                            result_t = s0x + s0y + s1x + s1y
++                        out_row = q_idx * next_n + t
++                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
++                            mLogits[(out_row, kv_pos)] = self.output_dtype(
++                                result_t * Float16(scale_val)
++                            )
++                        else:
++                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
++
++                    # Advance: inline fetch_next_task
++                    next_kv_idx = kv_idx + NUM_MATH_WG
++                    if next_kv_idx >= num_kv:
++                        next_q_idx = q_idx + 1
++                        next_kv_idx = 0
++                        if next_q_idx < batch_size:
++                            next_num_kv = (
++                                mContextLens[next_q_idx] + block_kv_val - 1
++                            ) // block_kv_val
++                    # Update while-loop condition
++                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
++
++                # Release last Q stage (WG 1)
++                if q_idx < batch_size:
++                    q_pipeline.consumer_release(q_cons_state)
++                    q_cons_state.advance()
++
++            # TMEM dealloc: math warps are allocator + last consumer
++            tmem.relinquish_alloc_permit()
++            tmem.free(tmem_ptr)
++
++        else:
++            cute.arch.warpgroup_reg_dealloc(24)
+diff --git a/tensorrt_llm/_torch/model_config.py b/tensorrt_llm/_torch/model_config.py
+index 7cc732b7a865..8d66b9634b79 100644
+--- a/tensorrt_llm/_torch/model_config.py
++++ b/tensorrt_llm/_torch/model_config.py
+@@ -543,6 +543,7 @@ def from_pretrained(cls,
+                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
++                        use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
+                         q_split_threshold = sparse_attention_config.q_split_threshold
+                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+@@ -553,6 +554,7 @@ def from_pretrained(cls,
+                         indexer_max_chunk_size = None
+                         skip_indexer_for_short_seqs = True
+                         use_cute_dsl_topk = False
++                        use_cute_dsl_paged_mqa_logits = False
+                         q_split_threshold = 8192
+                         enable_heuristic_topk = False
+                         indexer_k_dtype = "fp8"
+@@ -565,6 +567,8 @@ def from_pretrained(cls,
+                             skip_indexer_for_short_seqs=
+                             skip_indexer_for_short_seqs,
+                             use_cute_dsl_topk=use_cute_dsl_topk,
++                            use_cute_dsl_paged_mqa_logits=
++                            use_cute_dsl_paged_mqa_logits,
+                             q_split_threshold=q_split_threshold,
+                             indexer_rope_interleave=indexer_rope_interleave,
+                             enable_heuristic_topk=enable_heuristic_topk,
+diff --git a/tensorrt_llm/llmapi/llm_args.py b/tensorrt_llm/llmapi/llm_args.py
+index 891ed0c8fca2..b13f8e62231c 100644
+--- a/tensorrt_llm/llmapi/llm_args.py
++++ b/tensorrt_llm/llmapi/llm_args.py
+@@ -332,6 +332,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
+         description=
+         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
+     )
++    use_cute_dsl_paged_mqa_logits: bool = Field(
++        default=False,
++        description=
++        "Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM."
++    )
+     q_split_threshold: int = Field(
+         default=8192,
+         description=
+diff --git a/tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py b/tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
+new file mode 100644
+index 000000000000..9e5461bc275f
+--- /dev/null
++++ b/tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
+@@ -0,0 +1,779 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""
++Test CuTe DSL fp8_paged_mqa_logits kernel against C++ DeepGEMM reference.
++"""
++
++import pytest
++import torch
++
++from tensorrt_llm._utils import get_sm_version
++
++skip_not_sm100 = pytest.mark.skipif(
++    get_sm_version() not in (100, 103),
++    reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
++)
++
++
++def _ceil_to_ue8m0(x: torch.Tensor):
++    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
++
++
++def _ref_fp8_paged_mqa_logits(
++    q_fp8,
++    kv_fp8,
++    kv_scales,
++    weights,
++    context_lens,
++    block_table,
++    max_model_len,
++    block_kv,
++    epi_dtype=torch.float32,
++):
++    """Pure PyTorch reference for fp8_paged_mqa_logits.
++
++    Args:
++        q_fp8: [B, next_n, H, D] float8_e4m3fn
++        kv_fp8: [num_blocks, block_kv, D] float8_e4m3fn
++        kv_scales: [num_blocks, block_kv] float32
++        weights: [B*next_n, H] float32
++        context_lens: [B] int32
++        block_table: [B, max_blocks] int32
++        max_model_len: int
++        block_kv: int
++        epi_dtype: epilogue dtype — GEMM stays fp32, weighted sum + scale
++            use this dtype (torch.float32 or torch.float16)
++
++    Returns:
++        logits: [B*next_n, max_model_len] epi_dtype
++    """
++    B, next_n, H, D = q_fp8.shape
++    device = q_fp8.device
++
++    logits = torch.full((B * next_n, max_model_len), float("-inf"), device=device, dtype=epi_dtype)
++
++    q_f32 = q_fp8.float()
++
++    for b in range(B):
++        ctx_len = context_lens[b].item()
++        q_positions = torch.arange(ctx_len - next_n, ctx_len, device=device)
++
++        w = weights[b * next_n : (b + 1) * next_n, :].to(epi_dtype)
++
++        for blk_idx in range((ctx_len + block_kv - 1) // block_kv):
++            phys_blk = block_table[b, blk_idx].item()
++
++            k_f32 = kv_fp8[phys_blk].float()
++            scales = kv_scales[phys_blk].to(epi_dtype)
++
++            k_positions = torch.arange(blk_idx * block_kv, (blk_idx + 1) * block_kv, device=device)
++
++            mask = (k_positions[None, :] < ctx_len) & (k_positions[None, :] <= q_positions[:, None])
++
++            # GEMM in fp32
++            qk = torch.matmul(q_f32[b].permute(1, 0, 2), k_f32.T)  # [H, next_n, block_kv]
++            qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
++            qk = torch.relu(qk)
++
++            # Epilogue in epi_dtype
++            qk = qk.to(epi_dtype)
++            weighted = (w.T[:, :, None] * qk).sum(dim=0)  # [next_n, block_kv]
++            weighted = weighted * scales[None, :]
++
++            start_pos = blk_idx * block_kv
++            end_pos = start_pos + block_kv
++            logits[b * next_n : (b + 1) * next_n, start_pos:end_pos] = torch.where(
++                mask, weighted, torch.tensor(float("-inf"), device=device, dtype=epi_dtype)
++            )
++
++    return logits
++
++
++def _make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim):
++    """Create fused KV in packed-by-type layout matching DeepGEMM/DSL kernel.
++
++    Per block: [all FP8 bytes (block_kv * head_dim)] [all scale bytes (block_kv * 4)]
++    Viewed as [num_blocks, block_kv, 1, head_dim + 4].
++    """
++    num_phys_blocks = kv_fp8.shape[0]
++    per_token_size = head_dim + 4
++    block_bytes = block_kv * per_token_size
++    scale_offset = block_kv * head_dim
++
++    fused = torch.zeros(num_phys_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device)
++    for blk in range(num_phys_blocks):
++        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
++        fused[blk, scale_offset:] = (
++            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
++        )
++    return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
++
++
++def _generate_test_data(
++    batch_size,
++    next_n,
++    num_heads,
++    head_dim,
++    block_kv,
++    avg_context_len,
++    max_model_len,
++    device="cuda",
++    use_int_data=False,
++    fix_length=True,
++):
++    """Generate test data for fp8 paged MQA logits.
++
++    Args:
++        use_int_data: When True, use small random integers ([-3, 3]) for Q/KV
++            and integer weights so that GEMM accumulation is exact across
++            FP8/FP16/FP32. Useful for isolating kernel bugs from precision.
++    """
++    torch.manual_seed(42)
++    torch.cuda.manual_seed(42)
++    if fix_length:
++        context_lens = torch.full((batch_size,), max_model_len, dtype=torch.int32, device="cpu")
++    else:
++        context_lens = torch.randint(
++            max(block_kv, int(0.7 * avg_context_len)),
++            int(1.3 * avg_context_len) + 1,
++            (batch_size,),
++            dtype=torch.int32,
++            device="cpu",
++        )
++        context_lens = context_lens.clamp(max=max_model_len)
++
++    max_blocks_per_seq = (max_model_len + block_kv - 1) // block_kv
++    total_blocks = ((context_lens + block_kv - 1) // block_kv).sum().item()
++    num_phys_blocks = total_blocks + batch_size * 2
++
++    block_table = torch.full((batch_size, max_blocks_per_seq), 0, dtype=torch.int32, device=device)
++    blk_offset = 0
++    for i in range(batch_size):
++        n_blks = (context_lens[i].item() + block_kv - 1) // block_kv
++        block_table[i, :n_blks] = torch.arange(
++            blk_offset, blk_offset + n_blks, dtype=torch.int32, device=device
++        )
++        blk_offset += n_blks
++
++    if use_int_data:
++        q_fp8 = torch.randint(
++            -3,
++            4,
++            (batch_size, next_n, num_heads, head_dim),
++            device=device,
++            dtype=torch.float32,
++        ).to(torch.float8_e4m3fn)
++
++        kv_fp8 = torch.randint(
++            -3,
++            4,
++            (num_phys_blocks, block_kv, head_dim),
++            device=device,
++            dtype=torch.float32,
++        ).to(torch.float8_e4m3fn)
++        kv_scale = torch.ones(num_phys_blocks, block_kv, device=device, dtype=torch.float32)
++
++        weights = torch.randint(
++            -3,
++            4,
++            (batch_size * next_n, num_heads),
++            device=device,
++            dtype=torch.float32,
++        )
++    else:
++        q_bf16 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device)
++        q_fp8 = q_bf16.to(torch.float8_e4m3fn)
++
++        kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
++        kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
++        kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
++        kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
++
++        weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
++
++    kv_fused = _make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
++
++    return {
++        "q_fp8": q_fp8,
++        "kv_fp8": kv_fp8,
++        "kv_scales": kv_scale,
++        "kv_fused": kv_fused,
++        "weights": weights,
++        "context_lens": context_lens.to(device),
++        "block_table": block_table,
++        "max_model_len": max_model_len,
++        "block_kv": block_kv,
++        "num_phys_blocks": num_phys_blocks,
++    }
++
++
++@skip_not_sm100
++@pytest.mark.parametrize("batch_size", [1, 4, 32])
++@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
++@pytest.mark.parametrize("num_heads", [64])
++@pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
++@pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])
++@pytest.mark.parametrize("fix_length", [True, False])
++def test_cute_dsl_fp8_paged_mqa_logits(
++    batch_size, next_n, num_heads, avg_ctx, output_dtype, fix_length
++):
++    """Compare CuTe DSL kernel output against a pure PyTorch reference.
++
++    Tests both fp32 and fp16 epi/acc/output paths.
++    """
++    head_dim = 128
++    block_kv = 128
++    max_model_len = max(avg_ctx * 2, 2048)
++
++    data = _generate_test_data(
++        batch_size,
++        next_n,
++        num_heads,
++        head_dim,
++        block_kv,
++        avg_ctx,
++        max_model_len,
++        use_int_data=(output_dtype == torch.float16),
++        fix_length=fix_length,
++    )
++
++    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
++
++    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
++
++    # New DeepGEMM `get_paged_mqa_logits_metadata` arg conventions on SM100:
++    #
++    # 1) `context_lens` must be 2D. Passing (B, 1) makes the wrapper see
++    #    `next_n = size(1) = 1` and compute `num_next_n_atoms = 1`, which
++    #    matches DSL's 1-atom-per-q design (DSL always processes all real
++    #    next_n positions in one atom regardless of value).
++    #
++    # 2) `block_kv` arg must be 64 — independent of the physical cache page
++    #    size. The metadata kernel computes `SPLIT_KV = block_kv * 4` (the
++    #    multiplier 4 is hardcoded in DeepGEMM's JIT impl, not arch-aware
++    #    on SM100 since #304). Both DSL and DG compute kernels assume
++    #    `SPLIT_KV = 256` (DG hardcodes it at apis/attention.hpp:353; DSL
++    #    expects compute_tile=128 × kNumMathWarpGroups=2 = 256). So
++    #    metadata must give SPLIT_KV=256 → `block_kv = 256 / 4 = 64`.
++    #    Production passes `tokens_per_block` here, which equals 64 by
++    #    DSV3 indexer-cache convention.
++    DG_METADATA_BLOCK_KV = 64
++    dsl_schedule_meta = get_paged_mqa_logits_metadata(
++        data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
++    )
++
++    ref_logits = _ref_fp8_paged_mqa_logits(
++        data["q_fp8"],
++        data["kv_fp8"],
++        data["kv_scales"],
++        data["weights"],
++        data["context_lens"],
++        data["block_table"],
++        max_model_len,
++        block_kv,
++        epi_dtype=output_dtype,
++    )
++
++    # CuTe DSL kernel
++    dsl_logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++        data["q_fp8"],
++        data["kv_fused"],
++        data["weights"],
++        data["context_lens"],
++        data["block_table"],
++        dsl_schedule_meta,
++        max_model_len,
++        epi_dtype=output_dtype,
++        acc_dtype=output_dtype,
++        output_dtype=output_dtype,
++    )
++
++    assert dsl_logits.dtype == output_dtype
++
++    # Mask invalid positions
++    B = batch_size
++    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
++    row_indices = torch.arange(B * next_n, device="cuda") // next_n
++    next_n_offset = torch.arange(B * next_n, device="cuda") % next_n
++    end_pos = data["context_lens"][row_indices] - next_n + next_n_offset
++    mask = positions <= end_pos.unsqueeze(1)
++
++    dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
++    ref_masked = ref_logits.float().masked_fill(~mask, 0)
++    finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
++    dsl_clean = dsl_masked.masked_fill(~finite, 0)
++    ref_clean = ref_masked.masked_fill(~finite, 0)
++
++    # Element-wise check on the valid (finite + in-context) region.
++    # Kernel is deterministic (disjoint CTA writes, no atomics), so every
++    # element must be within elem_atol.
++    elem_atol = 1e-3 if output_dtype == torch.float16 else 5e-5
++    elem_rtol = 1e-3 if output_dtype == torch.float16 else 1e-5
++
++    # Debug probe: print max/mean abs error for CI failure diagnosis.
++    valid = mask & finite
++    elem_abs = (dsl_clean - ref_clean).abs()[valid]
++    if elem_abs.numel() > 0:
++        print(
++            f"[acc-probe] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
++            f"dtype={output_dtype} -> "
++            f"max_abs={elem_abs.max().item():.3e} "
++            f"mean_abs={elem_abs.mean().item():.3e}"
++        )
++
++    torch.testing.assert_close(
++        dsl_clean,
++        ref_clean,
++        atol=elem_atol,
++        rtol=elem_rtol,
++        msg=lambda m: (
++            f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, dtype={output_dtype}"
++        ),
++    )
++
++
++@skip_not_sm100
++@pytest.mark.parametrize("batch_size", [1, 4])
++@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
++@pytest.mark.parametrize("num_heads", [64])
++@pytest.mark.parametrize("avg_ctx", [256, 4096])
++@pytest.mark.parametrize("phys_block_kv", [32, 64])
++def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
++    batch_size, next_n, num_heads, avg_ctx, phys_block_kv
++):
++    """Test multi-block TMA: physical block < compute tile (128).
++
++    When phys_block_kv < 128, the kernel issues num_blocks_per_mma
++    separate TMA copies per compute tile to fill the 128-token SMEM.
++    """
++    head_dim = 128
++    max_model_len = max(avg_ctx * 2, 2048)
++    output_dtype = torch.float32
++
++    data = _generate_test_data(
++        batch_size,
++        next_n,
++        num_heads,
++        head_dim,
++        phys_block_kv,
++        avg_ctx,
++        max_model_len,
++        fix_length=True,
++    )
++
++    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
++
++    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
++
++    # See `test_cute_dsl_fp8_paged_mqa_logits` above for the full reasoning.
++    # Short version: DG metadata wrapper requires 2D context_lens, and
++    # `block_kv` arg must be 64 (yields SPLIT_KV = 64 * 4 = 256, matching
++    # DSL's compute-tile expectation). Independent of `phys_block_kv` /
++    # `compute_block_kv` of the test cache.
++    DG_METADATA_BLOCK_KV = 64
++    dsl_schedule_meta = get_paged_mqa_logits_metadata(
++        data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
++    )
++
++    ref_logits = _ref_fp8_paged_mqa_logits(
++        data["q_fp8"],
++        data["kv_fp8"],
++        data["kv_scales"],
++        data["weights"],
++        data["context_lens"],
++        data["block_table"],
++        max_model_len,
++        phys_block_kv,
++        epi_dtype=output_dtype,
++    )
++
++    dsl_logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++        data["q_fp8"],
++        data["kv_fused"],
++        data["weights"],
++        data["context_lens"],
++        data["block_table"],
++        dsl_schedule_meta,
++        max_model_len,
++        epi_dtype=output_dtype,
++        acc_dtype=output_dtype,
++        output_dtype=output_dtype,
++    )
++
++    assert dsl_logits.dtype == output_dtype
++
++    B = batch_size
++    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
++    row_indices = torch.arange(B * next_n, device="cuda") // next_n
++    next_n_offset = torch.arange(B * next_n, device="cuda") % next_n
++    end_pos = data["context_lens"][row_indices] - next_n + next_n_offset
++    mask = positions <= end_pos.unsqueeze(1)
++
++    dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
++    ref_masked = ref_logits.float().masked_fill(~mask, 0)
++    finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
++    dsl_clean = dsl_masked.masked_fill(~finite, 0)
++    ref_clean = ref_masked.masked_fill(~finite, 0)
++
++    elem_atol = 5e-5
++    elem_rtol = 1e-5
++
++    valid = mask & finite
++    elem_abs = (dsl_clean - ref_clean).abs()[valid]
++    if elem_abs.numel() > 0:
++        print(
++            f"[multi-block] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
++            f"phys_block_kv={phys_block_kv} -> "
++            f"max_abs={elem_abs.max().item():.3e} "
++            f"mean_abs={elem_abs.mean().item():.3e}"
++        )
++
++    torch.testing.assert_close(
++        dsl_clean,
++        ref_clean,
++        atol=elem_atol,
++        rtol=elem_rtol,
++        msg=lambda m: (
++            f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, "
++            f"phys_block_kv={phys_block_kv}"
++        ),
++    )
++
++
++def _profile_kernel_us(fn, num_warmup=10, num_iterations=30):
++    """Profile CUDA kernel time in microseconds using torch.profiler."""
++    from torch.profiler import ProfilerActivity, profile
++
++    for _ in range(num_warmup):
++        fn()
++    torch.cuda.synchronize()
++
++    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
++        for _ in range(num_iterations):
++            fn()
++        torch.cuda.synchronize()
++
++    total_cuda_us = 0
++    for evt in prof.events():
++        if evt.device_type == torch.autograd.DeviceType.CUDA:
++            # for fp16 dtype, we use .half() to convert weights to fp16 dtype currently.
++            # so we need to skip the vectorized_elementwise_kernel event.
++            if "vectorized_elementwise_kernel" in evt.name:
++                continue
++            total_cuda_us += evt.device_time_total
++    return total_cuda_us / num_iterations
++
++
++def _generate_bench_data(
++    batch_size,
++    context_len,
++    next_n,
++    num_heads=64,
++    head_dim=128,
++    block_kv=128,
++    varlen=False,
++    device="cuda",
++):
++    """Generate benchmark data.
++
++    ``context_len`` is treated as the max length. When varlen=False, all
++    sequences use this exact length. When varlen=True, per-sequence lengths
++    are drawn uniformly from [min(2048, max), max] to mimic real mixed-batch
++    serving workloads.
++    """
++    torch.manual_seed(42)
++    torch.cuda.manual_seed(42)
++    num_blocks_per_seq = (context_len + block_kv - 1) // block_kv
++
++    if varlen:
++        lo = min(2048, context_len)
++        context_lens = torch.randint(
++            lo, context_len + 1, (batch_size,), dtype=torch.int32, device=device
++        )
++        total_blocks = ((context_lens + block_kv - 1) // block_kv).sum().item()
++        block_table = torch.zeros(
++            (batch_size, num_blocks_per_seq), dtype=torch.int32, device=device
++        )
++        cursor = 0
++        for i in range(batch_size):
++            n_blks = (context_lens[i].item() + block_kv - 1) // block_kv
++            block_table[i, :n_blks] = torch.arange(
++                cursor, cursor + n_blks, dtype=torch.int32, device=device
++            )
++            cursor += n_blks
++    else:
++        total_blocks = batch_size * num_blocks_per_seq
++        # fix-length workload: all sequences have the same context length.
++        context_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
++        block_table = torch.arange(total_blocks, dtype=torch.int32, device=device).reshape(
++            batch_size, num_blocks_per_seq
++        )
++
++    q_fp8 = torch.randn(
++        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
++    ).to(torch.float8_e4m3fn)
++    weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
++
++    kv_fp8 = torch.randn(total_blocks, block_kv, head_dim, device=device, dtype=torch.bfloat16).to(
++        torch.float8_e4m3fn
++    )
++    kv_scales = (
++        torch.rand(total_blocks, block_kv, device=device, dtype=torch.float32) * 0.01 + 0.001
++    )
++
++    kv_fused = _make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim)
++
++    return {
++        "q_fp8": q_fp8,
++        "kv_fused": kv_fused,
++        "weights": weights,
++        "context_lens": context_lens,
++        "block_table": block_table,
++        "max_model_len": context_len,
++        "total_blocks": total_blocks,
++    }
++
++
++def benchmark_fp8_paged_mqa_logits(
++    batch_sizes,
++    next_ns,
++    context_lens,
++    num_warmup=10,
++    num_iterations=30,
++    output_dtype=torch.float32,
++    num_epi_subtiles=1,
++    varlen=False,
++    block_kv=128,
++):
++    """Benchmark CuTe DSL vs C++ DeepGEMM kernel time.
++
++    Args:
++        block_kv: physical block size (tokens per page). DSL scheduler always
++            uses compute_block_kv=128; when block_kv < 128, the DSL kernel
++            issues num_blocks_per_mma TMA copies per compute tile.
++    """
++    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
++
++    num_heads = 64
++    head_dim = 128
++    compute_block_kv = 128  # DSL scheduler / compute tile (always 128 on SM100)
++    assert compute_block_kv % block_kv == 0, (
++        f"compute_block_kv={compute_block_kv} must be divisible by block_kv={block_kv}"
++    )
++    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
++
++    dtype_str = str(output_dtype).split(".")[-1]
++    mode_str = "varlen" if varlen else "fix-len"
++    print(
++        f"output_dtype={dtype_str}  num_epi_subtiles={num_epi_subtiles}  "
++        f"mode={mode_str}  block_kv={block_kv}"
++    )
++    is_non_default = output_dtype != torch.float32 or num_epi_subtiles != 1
++    hdr = (
++        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
++        f"{'DSL(us)':>8s} {'DG(fp32,us)':>12s} {'DG/DSL':>7s}"
++    )
++    if is_non_default:
++        hdr += f" {'DSL(fp32,us)':>13s} {'DSL(fp32)/DSL':>13s}"
++    print(hdr)
++    print("-" * len(hdr))
++
++    for next_n in next_ns:
++        for context_len in context_lens:
++            for batch_size in batch_sizes:
++                nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
++
++                data = _generate_bench_data(
++                    batch_size,
++                    context_len,
++                    next_n,
++                    num_heads,
++                    head_dim,
++                    block_kv,
++                    varlen=varlen,
++                )
++
++                # See `test_cute_dsl_fp8_paged_mqa_logits` for full reasoning
++                # on the `block_kv = 64` choice. Short version: DG metadata
++                # SPLIT_KV = block_kv * 4; we need SPLIT_KV = 256 (DSL
++                # compute tile = 128 × kNumMathWarpGroups = 2), so pass 64.
++                # 2D `(B, 1)` context_lens forces num_next_n_atoms = 1.
++                DG_METADATA_BLOCK_KV = 64
++                dsl_schedule_meta = get_paged_mqa_logits_metadata(
++                    data["context_lens"].unsqueeze(-1),
++                    DG_METADATA_BLOCK_KV,
++                    num_sms,
++                )
++
++                def dsl_fn(data=data):
++                    torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++                        data["q_fp8"],
++                        data["kv_fused"],
++                        data["weights"],
++                        data["context_lens"],
++                        data["block_table"],
++                        dsl_schedule_meta,
++                        data["max_model_len"],
++                        num_epi_subtiles=num_epi_subtiles,
++                        epi_dtype=output_dtype,
++                        acc_dtype=output_dtype,
++                        output_dtype=output_dtype,
++                    )
++
++                dsl_us = _profile_kernel_us(dsl_fn, num_warmup, num_iterations)
++
++                dg_us = None
++                try:
++                    from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
++
++                    # SM100 always uses num_kv_multicast=1 in upgraded DeepGEMM
++                    # (cluster(2,1,1) for next_n=4 was removed). Atom-split is
++                    # encoded in metadata via num_next_n_atoms which the wrapper
++                    # derives from context_lens.size(1). DG natively supports
++                    # next_n in {1,2,3,4}.
++                    num_clusters = num_sms
++                    # 2D context_lens shape (B, next_n): for next_n>1 the wrapper
++                    # computes `num_next_n_atoms = next_n / next_n_atom_size`
++                    # which DG's compute kernel expects. All next_n positions
++                    # of a batch share the same KV length here (broadcast via
++                    # expand) — TRT-LLM does the same in production.
++                    dg_ctx_2d = data["context_lens"].unsqueeze(-1).expand(-1, next_n).contiguous()
++                    # `block_kv = 64` for the same reason as the DSL path:
++                    # metadata SPLIT_KV = block_kv * 4 must equal DG compute
++                    # kernel's hardcoded SPLIT_KV = 256 (apis/attention.hpp:353).
++                    # Independent of `compute_block_kv` of the test cache.
++                    DG_METADATA_BLOCK_KV = 64
++                    dg_schedule_meta = get_paged_mqa_logits_metadata(
++                        dg_ctx_2d, DG_METADATA_BLOCK_KV, num_clusters
++                    )
++
++                    def dg_fn(data=data, dg_ctx_2d=dg_ctx_2d):
++                        fp8_paged_mqa_logits(
++                            data["q_fp8"],
++                            data["kv_fused"],
++                            data["weights"],
++                            dg_ctx_2d,
++                            data["block_table"],
++                            dg_schedule_meta,
++                            data["max_model_len"],
++                        )
++
++                    dg_us = _profile_kernel_us(dg_fn, num_warmup, num_iterations)
++                except RuntimeError:
++                    pass
++
++                dsl_f32_us = None
++                if is_non_default:
++
++                    def dsl_f32_fn(data=data):
++                        torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++                            data["q_fp8"],
++                            data["kv_fused"],
++                            data["weights"],
++                            data["context_lens"],
++                            data["block_table"],
++                            dsl_schedule_meta,
++                            data["max_model_len"],
++                        )
++
++                    dsl_f32_us = _profile_kernel_us(dsl_f32_fn, num_warmup, num_iterations)
++
++                ratio_str = f"{dg_us / dsl_us:6.3f}x" if dg_us else "   N/A "
++                dg_str = f"{dg_us:11.1f}" if dg_us else "        N/A"
++                line = (
++                    f"{batch_size:5d} {context_len:7d} {next_n:6d} "
++                    f"{nblk:7d} | {dsl_us:7.1f} {dg_str} {ratio_str}"
++                )
++                if is_non_default:
++                    f32_str = f"{dsl_f32_us:12.1f}" if dsl_f32_us else "         N/A"
++                    f32_ratio = f"{dsl_f32_us / dsl_us:12.3f}x" if dsl_f32_us else "         N/A "
++                    line += f" {f32_str} {f32_ratio}"
++                print(line)
++
++                del data
++                torch.cuda.empty_cache()
++            print()
++
++
++if __name__ == "__main__":
++    import argparse
++    import os
++    import sys
++
++    sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
++
++    parser = argparse.ArgumentParser(description="Benchmark CuTe DSL fp8_paged_mqa_logits kernel")
++    parser.add_argument(
++        "--batch_size",
++        type=int,
++        nargs="+",
++        default=[1, 32, 128],
++        help="batch sizes (default: 1 32 128)",
++    )
++    parser.add_argument(
++        "--next_n", type=int, nargs="+", default=[1, 2, 4], help="next_n values (default: 1 2 4)"
++    )
++    parser.add_argument(
++        "--context_len",
++        type=int,
++        nargs="+",
++        default=[4096, 32768, 131072],
++        help="context lengths (default: 4096 32768 131072)",
++    )
++    parser.add_argument("--warmup", type=int, default=10, help="warmup iterations (default: 10)")
++    parser.add_argument("--repeat", type=int, default=30, help="profiling iterations (default: 30)")
++    parser.add_argument(
++        "--output_dtype",
++        type=str,
++        default="float32",
++        choices=["float32", "float16"],
++        help="output dtype (default: float32)",
++    )
++    parser.add_argument(
++        "--num_epi_subtiles",
++        type=int,
++        default=1,
++        choices=[1, 2, 4],
++        help="epilogue sub-tile count (default: 1)",
++    )
++    parser.add_argument(
++        "--varlen",
++        action="store_true",
++        help="use varlen workload (per-seq lengths in [min(2048,max), max]); "
++        "default is fix-length where all sequences use --context_len",
++    )
++    parser.add_argument(
++        "--block_kv",
++        type=int,
++        default=64,
++        choices=[32, 64, 128],
++        help="physical block size / tokens per page (default: 64). "
++        "DSL compute tile is always 128; when block_kv<128, DSL issues "
++        "num_blocks_per_mma=128/block_kv TMA copies per compute tile.",
++    )
++    args = parser.parse_args()
++
++    dtype_map = {"float32": torch.float32, "float16": torch.float16}
++    benchmark_fp8_paged_mqa_logits(
++        batch_sizes=args.batch_size,
++        next_ns=args.next_n,
++        context_lens=args.context_len,
++        num_warmup=args.warmup,
++        num_iterations=args.repeat,
++        output_dtype=dtype_map[args.output_dtype],
++        num_epi_subtiles=args.num_epi_subtiles,
++        varlen=args.varlen,
++        block_kv=args.block_kv,
++    )
+diff --git a/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py b/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
+index 6f4191940316..ab5f3a78a52d 100644
+--- a/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
++++ b/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py
+@@ -76,6 +76,7 @@ def __init__(self, index_head_dim, index_n_heads, index_topk,
+             self.index_topk = index_topk
+             self.prompt_budget = 1024
+             self.use_cute_dsl_topk = False
++            self.use_cute_dsl_paged_mqa_logits = False
+             self.enable_heuristic_topk = False
+             self.indexer_k_dtype = indexer_k_dtype
+ 
+@@ -403,7 +404,8 @@ def _create_mock_metadata(request_ids,
+                           max_draft_tokens=0,
+                           enable_context_mla_with_cached_kv=False,
+                           index_topk=2048,
+-                          enable_indexer_skip=False):
++                          enable_indexer_skip=False,
++                          use_cute_dsl_paged_mqa_logits=False):
+     """Helper to create mock metadata for testing."""
+ 
+     class MockKVCacheParams:
+@@ -461,7 +463,16 @@ def __init__(self):
+             self.scheduler_metadata_buffer = torch.zeros((self.num_sms + 1, 2),
+                                                          device='cuda',
+                                                          dtype=torch.int32)
+-            self.scheduler_metadata_buffer_full_next_n = self.scheduler_metadata_buffer
++            # DSL needs the next_n=1 schedule preserved (kNumNextNAtoms=1),
++            # so allocate a separate buffer for the full-next_n schedule.
++            # DeepGEMM expects the full-next_n schedule in
++            # `scheduler_metadata_buffer` itself (the alias makes
++            # `Indexer.prepare()`'s second populate overwrite the first).
++            if use_cute_dsl_paged_mqa_logits:
++                self.scheduler_metadata_buffer_full_next_n = torch.zeros(
++                    (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
++            else:
++                self.scheduler_metadata_buffer_full_next_n = self.scheduler_metadata_buffer
+             # Pre-allocated 2D kv_lens buffer for the DeepGEMM 2D context_lens API.
+             self.kv_lens_cuda_2d = torch.zeros(
+                 (self.num_seqs, 1 + self.max_draft_tokens),
+@@ -552,10 +563,12 @@ def __init__(self):
+             self.runtime_features = RuntimeFeatures()
+ 
+             # Add expanded buffers for MTP support
++            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
+             self.use_expanded_buffers_for_mtp = (
+-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
+-                or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+-                    and get_sm_version() >= 100))
++                not use_cute_dsl_paged_mqa_logits
++                and ((self.max_draft_tokens > 1 and get_sm_version() == 90) or
++                     ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
++                      and get_sm_version() >= 100)))
+             self.kv_lens_expanded_cuda = torch.zeros(
+                 (self.num_seqs * (1 + self.max_draft_tokens), ),
+                 device='cuda',
+@@ -928,7 +941,17 @@ def test_fp8_k_cache_roundtrip():
+ @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+ @skip_pre_hopper
+ @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
+-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
++@pytest.mark.parametrize("backend", [
++    "deepgemm",
++    pytest.param(
++        "dsl",
++        marks=pytest.mark.skipif(
++            get_sm_version() not in (100, 103),
++            reason=
++            f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
++        )),
++])
++def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
+     """
+     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
+ 
+@@ -943,8 +966,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+     torch.manual_seed(123)
+     random.seed(123)
+ 
+-    # Test parameters
+-    heads, head_dim = 32, 128
++    use_dsl = backend == "dsl"
++    heads, head_dim = (32, 128)
+     block_size = 64
+     avg_context_len = 2048
+     num_gen_tokens = next_n  # Number of tokens to generate per sequence
+@@ -1015,6 +1038,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+         num_ctx_tokens=total_context_tokens,
+         num_tokens=total_context_tokens,
+         max_draft_tokens=next_n - 1,
++        use_cute_dsl_paged_mqa_logits=use_dsl,
+     )
+     Indexer.prepare(metadata_context)
+ 
+@@ -1041,6 +1065,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+         num_ctx_tokens=0,
+         num_tokens=batch_size * num_gen_tokens,
+         max_draft_tokens=next_n - 1,
++        use_cute_dsl_paged_mqa_logits=use_dsl,
+     )
+     Indexer.prepare(metadata_gen)
+ 
+@@ -1065,7 +1090,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+         # (verified by the _schedule_meta_size assertion in
+         # deepgemm-src/csrc/apis/attention.hpp firing when we try to pass
+         # the legacy (num_sms // 2 + 1, 2) layout). The base scheduler
+-        # buffer is the only layout the kernel will accept now.
++        # buffer is the only layout the kernel will accept now. The DSL
++        # path uses its own schedule buffer instead (see below).
+         scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
+     else:
+         q_fp8 = q_fp8.view(-1, 1, *q_fp8.shape[2:])
+@@ -1076,9 +1102,20 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+         block_table = metadata_gen.block_table_expanded[:num_tokens]
+         scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_expanded
+ 
+-    logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
+-                                  context_lens, block_table,
+-                                  scheduler_metadata_buffer, max_model_len)
++    if use_dsl:
++        # DSL design: kNumNextNAtoms = 1 for any real next_n. Reuse the base
++        # `scheduler_metadata_buffer` which is also built with num_atoms=1
++        # (from a (num_gen, 1) input shape). 1D contiguous kv_lens slice
++        # suffices for context_lens (all next_n positions share the same KV
++        # length on this path; kernel signature is 1D).
++        dsl_context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
++        logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
++            q_fp8, kv_cache_fp8_pool, weights, dsl_context_lens, block_table,
++            metadata_gen.scheduler_metadata_buffer, max_model_len)
++    else:
++        logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
++                                      context_lens, block_table,
++                                      scheduler_metadata_buffer, max_model_len)
+     print(f"✓ Kernel output shape: {logits.shape}")
+ 
+     # Reference: Reconstruct BF16 cache from original values

@@ -1,0 +1,2034 @@
+diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+index 2374ff3261..eada56660c 100644
+--- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
++++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+@@ -29,6 +29,7 @@
+ #include "moe_gemm_kernels.h"
+ #include "tensorrt_llm/common/workspace.h"
+ #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
++#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h"
+ 
+ namespace common = tensorrt_llm::common;
+ namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+@@ -1286,4 +1287,48 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
+   return tvm::ffi::Module(ptr);
+ }
+ 
++// Interleave a 4-bit packed weight tensor into the layout required by the
++// SM90 mixed-input MoE GEMM. Expected input shape (num_experts, n,
++// k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
++// quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
++void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
++                                                int64_t quant_type) {
++  CHECK_INPUT_TYPE(weight, dl_uint8);
++  CHECK_INPUT_TYPE(weight_interleaved, dl_uint8);
++  CHECK_CONTIGUOUS(weight);
++  CHECK_CONTIGUOUS(weight_interleaved);
++  CHECK_DIM(3, weight);
++  CHECK_DIM(3, weight_interleaved);
++  TVM_FFI_ICHECK_EQ(weight.size(0), weight_interleaved.size(0))
++      << "weight and weight_interleaved must share num_experts dim";
++  TVM_FFI_ICHECK_EQ(weight.size(1), weight_interleaved.size(1))
++      << "weight and weight_interleaved must share n dim";
++  TVM_FFI_ICHECK_EQ(weight.size(2), weight_interleaved.size(2))
++      << "weight and weight_interleaved must share packed-k dim";
++  TVM_FFI_ICHECK(quant_type == 0 || quant_type == 1)
++      << "quant_type must be 0 (INT4) or 1 (FP4), got " << quant_type;
++
++  int64_t const num_experts = weight.size(0);
++  int64_t const n = weight.size(1);
++  int64_t const k = weight.size(2) * 2;
++  int64_t const per_expert_bytes = n * (k / 2);
++
++  auto stream = get_stream(weight.device());
++  auto* src = static_cast<uint8_t*>(weight.data_ptr());
++  auto* dst = static_cast<uint8_t*>(weight_interleaved.data_ptr());
++  for (int64_t e = 0; e < num_experts; ++e) {
++    uint8_t* src_e = src + e * per_expert_bytes;
++    uint8_t* dst_e = dst + e * per_expert_bytes;
++    if (quant_type == 1) {
++      tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_weights_for_sm90_mixed_gemm(
++          src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
++    } else {
++      tensorrt_llm::kernels::cutlass_kernels::interleave_int4_weights_for_sm90_mixed_gemm(
++          src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
++    }
++  }
++}
++
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, init);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(interleave_moe_weights_for_sm90_mixed_gemm,
++                              interleave_moe_weights_for_sm90_mixed_gemm);
+diff --git a/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/detail/collective/mixed_input_utils.hpp b/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/detail/collective/mixed_input_utils.hpp
+index 9059f7a526..74a0703594 100644
+--- a/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/detail/collective/mixed_input_utils.hpp
++++ b/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/detail/collective/mixed_input_utils.hpp
+@@ -29,6 +29,8 @@ using namespace cute;
+ 
+ typedef uint32_t __nv_fp4x8_storage_t;
+ typedef uint32_t __nv_bf16x2_storage_t;
++typedef uint32_t __nv_int4x8_storage_t;
++typedef uint64_t __nv_fp8x8_storage_t;
+ typedef cutlass::uint128_t __nv_bf16x8_storage_t;
+ 
+ constexpr int int4_group_size = 128;
+@@ -47,52 +49,94 @@ inline __device__ unsigned prmt(unsigned hi, unsigned lo, unsigned select_code)
+   return res;
+ }
+ 
+-__device__ __inline__ __nv_fp8x4_storage_t cvt_lut_bf16(unsigned const index) {
+-  const __nv_fp8x4_storage_t h4b_lut = 0x03020100U;  // 7654
+-  const __nv_fp8x4_storage_t l4b_lut = 0xFFFEFC00U;  // 3210
++__constant__ static __nv_fp8x4_storage_t HIGH_E4M3s_LUT_[2] = {0x03020100U, 0x03020100U};
++__constant__ static __nv_fp8x4_storage_t LOW_E4M3s_LUT_[2] = {0xFFFEFC00U, 0xFFFEFC00U};
++
++__device__ __inline__ __nv_fp8x4_storage_t cvt_lut_fp4_to_bf16(unsigned const index) {
++  auto lane_id = threadIdx.x & 0x1;
++  __nv_fp8x4_storage_t h4b_lut = HIGH_E4M3s_LUT_[lane_id];
++  __nv_fp8x4_storage_t l4b_lut = LOW_E4M3s_LUT_[lane_id];
+ 
+   __nv_fp8x4_storage_t lut_res = prmt(h4b_lut, l4b_lut, index);
+ 
+   return lut_res;
+ }
+ 
+-__device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8(
++__device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(
+     const __nv_fp4x8_storage_t fp4x8) {
+-  __nv_bf16x8_storage_t bf16x8_raw = {0, 0};
++  __nv_bf16x8_storage_t bf16x8_raw;
+   __nv_bf16x2_storage_t* bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t*>(&bf16x8_raw);
+ 
+-  unsigned zero_padding = 0x00000000U;
++  __nv_fp8x4_storage_t h_fp8x4_0to1_bits = (fp4x8 & 0xC0C0C0C0U) >> 6;  // 7632
++  __nv_fp8x4_storage_t l_fp8x4_0to1_bits = (fp4x8 & 0x0C0C0C0CU) >> 2;  // 5410
+ 
+   unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+   unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+ 
+-  __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4);  // 7654
+-  __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4);  // 3210
++  __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_fp4_to_bf16(h4b_em_fp4x4);  // 7564
++  __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_fp4_to_bf16(l4b_em_fp4x4);  // 3120
+ 
+-  bf16x2_raw[0] = prmt(zero_padding, l4b_2to9_bits, 0x1707U) >> 2U;  // 1 0
+-  bf16x2_raw[1] = prmt(zero_padding, l4b_2to9_bits, 0x3727U) >> 2U;  // 3 2
+-  bf16x2_raw[2] = prmt(h4b_2to9_bits, zero_padding, 0x5040U) >> 2U;  // 5 4
+-  bf16x2_raw[3] = prmt(h4b_2to9_bits, zero_padding, 0x7060U) >> 2U;  // 7 6
++  bf16x2_raw[0] = prmt(l_fp8x4_0to1_bits, l4b_2to9_bits, 0x5240U) << 6U;  // 1 0
++  bf16x2_raw[1] = prmt(h_fp8x4_0to1_bits, l4b_2to9_bits, 0x5341U) << 6U;  // 3 2
+ 
+-  __nv_bf16x2_storage_t bf16x2_0to1_bits;
++  bf16x2_raw[2] = prmt(l_fp8x4_0to1_bits, h4b_2to9_bits, 0x7260U) << 6U;  // 5 4
++  bf16x2_raw[3] = prmt(h_fp8x4_0to1_bits, h4b_2to9_bits, 0x7361U) << 6U;  // 7 6
+ 
+-  __nv_fp8x4_storage_t h_fp8x2_0to1_bits = (fp4x8 & 0x0000C0C0U);        // 3 1
+-  __nv_fp8x4_storage_t l_fp8x2_0to1_bits = (fp4x8 & 0x00000C0CU) << 4U;  // 2 0
++  return bf16x8_raw;
++}
+ 
+-  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x4707U);  // 1 0
+-  bf16x2_raw[0] = bf16x2_raw[0] | bf16x2_0to1_bits;
+-  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x5717U);  // 3 2
+-  bf16x2_raw[1] = bf16x2_raw[1] | bf16x2_0to1_bits;
++// [ 0,  1,  2,  3] encoded as FP8
++__constant__ static uint32_t POS_E4M3s_REG1_[2] = {0x44403800, 0x44403800};
++// [ 4,  5,  6,  7] encoded as FP8
++__constant__ static uint32_t POS_E4M3s_REG2_[2] = {0x4E4C4A48, 0x4E4C4A48};
++// [-8, -7, -6, -5] encoded as FP8
++__constant__ static uint32_t NEG_E4M3s_REG1_[2] = {0xCACCCED0, 0xCACCCED0};
++// [-4, -3, -2, -1] encoded as FP8
++__constant__ static uint32_t NEG_E4M3s_REG2_[2] = {0xB8C0C4C8, 0xB8C0C4C8};
+ 
+-  h_fp8x2_0to1_bits = (fp4x8 & 0xC0C00000U);        // 7 5
+-  l_fp8x2_0to1_bits = (fp4x8 & 0x0C0C0000U) << 4U;  // 6 4
++__device__ __inline__ __nv_fp8x8_storage_t psx_cvt_lut_prmt_int4x8_to_fp8x8(
++    const __nv_int4x8_storage_t int4x8) {
++  __nv_fp8x8_storage_t fp8x8_raw;
++  __nv_fp8x4_storage_t* fp8x4_raw = reinterpret_cast<__nv_fp8x4_storage_t*>(&fp8x8_raw);
+ 
+-  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x6020U);  // 5 4
+-  bf16x2_raw[2] = bf16x2_raw[2] | bf16x2_0to1_bits;
+-  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x7030U);  // 7 6
+-  bf16x2_raw[3] = bf16x2_raw[3] | bf16x2_0to1_bits;
++  // View the input as reg
++  uint32_t reg = reinterpret_cast<uint32_t const&>(int4x8);
+ 
+-  return bf16x8_raw;
++  // Determines if to get from the signed or unsigned candidates
++  uint32_t sign = (reg & 0x88888888) >> 1;
++
++  // Ignore sign bit when indexing into LUT
++  uint32_t lut_idx = (reg & 0x77777777);
++
++  // Signed is OR'd with 0x32103210 to find the correct value in the LUT
++  const uint32_t final_prmt_base = 0x32103210;
++
++  auto lane_id = threadIdx.x & 0x1;
++  uint32_t POS_E4M3s_REG1 = POS_E4M3s_REG1_[lane_id];
++  uint32_t POS_E4M3s_REG2 = POS_E4M3s_REG2_[lane_id];
++  uint32_t NEG_E4M3s_REG1 = NEG_E4M3s_REG1_[lane_id];
++  uint32_t NEG_E4M3s_REG2 = NEG_E4M3s_REG2_[lane_id];
++
++  asm volatile(
++      "{\n"
++      "  .reg .b32 pos_f8s, neg_f8s;\n"
++      "  .reg .b32 lut1, sign1, prmt0, prmt1;\n"
++      "  or.b32 prmt0, %4, %3;\n"
++      "  prmt.b32 pos_f8s, %5, %6, %2;\n"
++      "  prmt.b32 neg_f8s, %7, %8, %2;\n"
++      "  prmt.b32 %0, pos_f8s, neg_f8s, prmt0;\n"
++      "  shr.u32 lut1, %2, 16;\n"
++      "  shr.u32 sign1, %3, 16;\n"
++      "  or.b32 prmt1, %4, sign1;\n"
++      "  prmt.b32 pos_f8s, %5, %6, lut1;\n"
++      "  prmt.b32 neg_f8s, %7, %8, lut1;\n"
++      "  prmt.b32 %1, pos_f8s, neg_f8s, prmt1;\n"
++      "}\n"
++      : "=r"(fp8x4_raw[0]), "=r"(fp8x4_raw[1])
++      : "r"(lut_idx), "r"(sign), "r"(final_prmt_base), "r"(POS_E4M3s_REG1), "r"(POS_E4M3s_REG2),
++        "r"(NEG_E4M3s_REG1), "r"(NEG_E4M3s_REG2));
++
++  return fp8x8_raw;
+ }
+ 
+ template <class Collective>
+@@ -114,6 +158,7 @@ struct MixedGroupedGemmInputUtils {
+   static constexpr auto ModeHasScales = Collective::ModeHasScales;
+   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+   static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
++  static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
+ 
+  public:
+   static constexpr auto elements_per_smem_scale() {
+@@ -180,6 +225,47 @@ struct MixedGroupedGemmInputUtils {
+     }
+   }
+ 
++  /// Utilities to copy A from smem to RF
++  template <class SmemTiledCopyA, class TensorASmemView, class TensorACopyView>
++  CUTLASS_DEVICE static void copy_tensors_A(SmemTiledCopyA const& smem_tiled_copy_A,
++                                            TensorASmemView const& tCsA,
++                                            TensorACopyView& tCrA_copy_view, int k_block,
++                                            int read_stage) {
++    if (k_block < size<2>(tCsA.shape())) {
++      copy(smem_tiled_copy_A, tCsA(_, _, k_block, read_stage), tCrA_copy_view(_, _, k_block));
++    }
++  }
++
++  /// Utilities to copy Scales for A from smem to RF
++  template <class... Ts, class... Us>
++  CUTLASS_DEVICE static void copy_tensors_SFA(cute::tuple<Ts...> const& partitioned_mma_extra_info,
++                                              cute::tuple<Us...> const& tiled_copy_and_views,
++                                              int k_block, int read_stage) {
++    // We are starting a new k-tile so copy the scale
++    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
++      // nothing to do
++    } else if constexpr (ModeHasScales) {
++      auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
++      auto tCrS_copy_view = cute::get<1>(tiled_copy_and_views);
++      auto tCsS = cute::get<0>(partitioned_mma_extra_info);
++
++      copy(smem_tiled_copy_S, tCsS(_, _, k_block, read_stage), tCrS_copy_view(_, _, k_block));
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        // Nothing extra to do
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        auto tCsZ = cute::get<2>(partitioned_mma_extra_info);
++        auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
++        copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage), tCrZ_copy_view(_, _, k_block));
++      } else {
++        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                      "Conversion mode not handled in A -> RF path.");
++      }
++    } else {
++      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                    "Conversion mode not handled in A -> RF path.");
++    }
++  }
++
+   /// Utilities to copy A and extra inputs from smem to RF
+   template <class SmemTiledCopyA, class TensorASmemView, class TensorACopyView, class... Ts,
+             class... Us>
+@@ -189,7 +275,9 @@ struct MixedGroupedGemmInputUtils {
+                                              cute::tuple<Ts...> const& partitioned_mma_extra_info,
+                                              cute::tuple<Us...> const& tiled_copy_and_views,
+                                              int k_block, int read_stage) {
+-    copy(smem_tiled_copy_A, tCsA(_, _, k_block, read_stage), tCrA_copy_view(_, _, k_block));
++    if (k_block < size<2>(tCsA.shape())) {
++      copy(smem_tiled_copy_A, tCsA(_, _, k_block, read_stage), tCrA_copy_view(_, _, k_block));
++    }
+ 
+     if (k_block == 0) {
+       // We are starting a new k-tile so copy the scale
+@@ -277,7 +365,6 @@ struct MixedGroupedGemmInputUtils {
+     }
+   }
+ 
+-  // The core converter uses a lookup table to converts i4 -> 8 bit value.
+   template <class EngineIn, class LayoutIn, class EngineOut,
+             class LayoutOut>
+   CUTLASS_DEVICE static void fp4tobf16_lookup_table_convert(  // Accept mutable temporaries
+@@ -292,7 +379,24 @@ struct MixedGroupedGemmInputUtils {
+     auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
+     auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
+ 
+-    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
++    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
++  }
++
++  template <class EngineIn, class LayoutIn, class EngineOut,
++            class LayoutOut>
++  CUTLASS_DEVICE static void int4tofp8_lookup_table_convert(  // Accept mutable temporaries
++      Tensor<EngineIn, LayoutIn> const& src, Tensor<EngineOut, LayoutOut>&& dst) {
++    int4tofp8_lookup_table_convert(src, dst);
++  }
++
++  template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut>
++  CUTLASS_DEVICE static void int4tofp8_lookup_table_convert(Tensor<EngineIn, LayoutIn> const& src,
++                                                            Tensor<EngineOut, LayoutOut>& dst) {
++    // View the input as reg
++    auto&& src_ = cute::recast<__nv_int4x8_storage_t>(src)(0);
++    auto&& dst_ = cute::recast<__nv_fp8x8_storage_t>(dst)(0);
++
++    dst_ = psx_cvt_lut_prmt_int4x8_to_fp8x8(src_);
+   }
+ 
+   /// Utilities to dequantize A.
+@@ -478,6 +582,8 @@ struct MixedGroupedGemmInputUtils {
+     for (int i = 0; i < size<1>(dst_vm); ++i) {
+       if constexpr (UseFP4ToBF16LookupTable) {
+         fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
++      } else if constexpr (UseInt4ToFP8LookupTable) {
++        int4tofp8_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+       } else {
+         LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+       }
+@@ -596,4 +702,195 @@ struct MixedGroupedGemmInputUtils {
+   }
+ };
+ 
++template <class Collective>
++struct MixedInputUtilsSM100 {
++ private:
++  using KernelSchedule = typename Collective::KernelSchedule;
++  using ConversionMode = typename Collective::ConversionMode;
++  using SmemLayoutA = typename Collective::SmemLayoutA;
++  using SmemLayoutB = typename Collective::SmemLayoutB;
++  using ElementScale = typename Collective::ElementScale;
++  using ElementZero = typename Collective::ElementZero;
++  static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
++
++ public:
++  // Helper functions to select packing for conversion
++  template <class SrcType, class DstType, int Cosize>
++  struct select_packing {  // Naive packing policy
++
++    static constexpr auto value() {
++      return Int<cute::gcd(Cosize,
++                           32 / cute::min(sizeof_bits_v<SrcType>, sizeof_bits_v<DstType>))>{};
++    }
++  };
++
++  /// (Designed for separate transform pipeline in Blackwell)
++  /// Utilities to dequantize A.
++  template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
++  CUTLASS_DEVICE static void dequantize_A_kblock_for_transform(
++      Tensor<EngineIn, LayoutIn> const& tArA, Tensor<EngineOut, LayoutOut>& tArACompute,
++      cute::tuple<Ts...> const& partitioned_extra_info, int const k_block) {
++    static_assert(is_rmem<EngineIn>::value,
++                  "Input tensor for A conversion must come from registers");
++    static_assert(is_rmem<EngineOut>::value,
++                  "Output tensor for A conversion must come from registers");
++    static_assert(cosize_v<LayoutIn> == cosize_v<LayoutOut>);
++    static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
++    static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
++    using SrcType = typename EngineIn::value_type;
++    using DstType = typename EngineOut::value_type;
++
++    auto src = tArA(_, _, _, k_block);
++    auto dst = tArACompute(_, _, _, k_block);
++    auto pSrc = raw_pointer_cast(src.data());
++    auto pDst = const_cast<DstType*>(raw_pointer_cast(dst.data()));
++    constexpr int num_elements = decltype(size(src))::value;
++
++    constexpr int pack = decltype(select_packing<SrcType, DstType, num_elements>::value())::value;
++    using Converter = cutlass::NumericArrayConverter<DstType, SrcType, pack,
++                                                     cutlass::FloatRoundStyle::round_to_nearest>;
++    using SrcArray = cutlass::Array<SrcType, pack>;
++    using DstArray = cutlass::Array<DstType, pack>;
++    constexpr int DstElementsPerReg = 32 / sizeof_bits_v<DstType>;
++    using RegArray = cutlass::AlignedArray<uint32_t, pack / DstElementsPerReg, sizeof(DstArray)>;
++
++    auto src_arr = recast<SrcArray>(src);
++    auto dst_arr = recast<DstArray>(dst);
++
++    Tensor dst_vm = cute::group_modes<1, -1>(cute::zipped_divide(dst, pack));
++
++    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
++      cute::transform(src_arr, dst_arr, Converter::convert);
++    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++      auto const& scales = cute::get<1>(partitioned_extra_info)(_, _, _, k_block);
++
++      CUTE_STATIC_ASSERT_V(size(src) == size(scales));
++
++      if constexpr (is_same_v<DstType, ElementScale>) {
++        cute::transform(src_arr, dst_arr, Converter::convert);
++
++        using ScaleArray = cutlass::Array<ElementScale, pack>;
++        auto scale_arr = recast<ScaleArray>(filter_zeros(scales));
++
++        if constexpr (is_same_v<DstType, cutlass::bfloat16_t>) {
++          Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, pack));
++
++          for (int i = 0; i < size<1>(dst_vm); ++i) {
++            auto&& r = cute::recast<RegArray>(dst_vm(_, i))(0);
++            auto&& scale_reg = cute::recast<RegArray>(scales_vm(_, i))(0);
++            CUTLASS_PRAGMA_UNROLL
++            for (size_t ii = 0; ii < RegArray::kElements; ++ii) {
++              __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
++              bf16x2_val =
++                  __hmul2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(scale_reg[ii]));
++            }
++          }
++        } else {
++          cute::transform(dst_arr, scale_arr, dst_arr, cute::multiplies{});
++        }
++      } else {
++        constexpr int pack1 =
++            decltype(select_packing<SrcType, ElementScale, num_elements>::value())::value;
++        constexpr int pack2 =
++            decltype(select_packing<ElementScale, DstType, num_elements>::value())::value;
++        constexpr int pack = cute::gcd(pack1, pack2);
++        using Converter1 =
++            cutlass::NumericArrayConverter<ElementScale, SrcType, pack,
++                                           cutlass::FloatRoundStyle::round_to_nearest>;
++        using Converter2 =
++            cutlass::NumericArrayConverter<DstType, ElementScale, pack,
++                                           cutlass::FloatRoundStyle::round_to_nearest>;
++        using SrcArray = cutlass::Array<SrcType, pack>;
++        using DstArray = cutlass::Array<DstType, pack>;
++        using StageArray = cutlass::Array<ElementScale, pack>;
++        constexpr int iters = num_elements / pack;
++
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < iters; ++i) {
++          SrcArray const* pSrcArr = reinterpret_cast<SrcArray const*>(pSrc) + i;
++          DstArray* pDstArr = reinterpret_cast<DstArray*>(pDst) + i;
++          StageArray stageArr;
++          stageArr = Converter1::convert(*pSrcArr);
++          CUTLASS_PRAGMA_UNROLL
++          for (int j = 0; j < pack; ++j) {
++            stageArr[j] = stageArr[j] * scales[i * pack + j];
++          }
++          *pDstArr = Converter2::convert(stageArr);
++        }
++      }
++    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++      static_assert(is_same_v<ElementScale, ElementZero>,
++                    "ElementScale and ElementZero must be the same.");
++
++      auto const& scales = cute::get<1>(partitioned_extra_info)(_, _, _, k_block);
++      auto const& zeros = cute::get<3>(partitioned_extra_info)(_, _, _, k_block);
++      CUTE_STATIC_ASSERT_V(size(src) == size(scales));
++      CUTE_STATIC_ASSERT_V(size(src) == size(zeros));
++
++      if constexpr (is_same_v<DstType, ElementZero>) {
++        cute::transform(src_arr, dst_arr, Converter::convert);
++
++        using ScaleArray = cutlass::Array<ElementScale, pack>;
++        auto scale_arr = recast<ScaleArray>(filter_zeros(scales));
++
++        using ZeroArray = cutlass::Array<ElementZero, pack>;
++        auto zero_arr = recast<ZeroArray>(filter_zeros(zeros));
++
++        if constexpr (is_same_v<DstType, cutlass::bfloat16_t>) {
++          Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, pack));
++          Tensor zeros_vm = cute::group_modes<1, -1>(cute::zipped_divide(zeros, pack));
++
++          for (int i = 0; i < size<1>(dst_vm); ++i) {
++            auto&& r = cute::recast<RegArray>(dst_vm(_, i))(0);
++            auto&& scale_reg = cute::recast<RegArray>(scales_vm(_, i))(0);
++            auto&& zero_reg = cute::recast<RegArray>(zeros_vm(_, i))(0);
++            CUTLASS_PRAGMA_UNROLL
++            for (size_t ii = 0; ii < RegArray::kElements; ++ii) {
++              __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
++              bf16x2_val =
++                  __hmul2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(scale_reg[ii]));
++              bf16x2_val =
++                  __hadd2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(zero_reg[ii]));
++            }
++          }
++        } else {
++          cute::transform(dst_arr, scale_arr, dst_arr, cute::multiplies{});
++          cute::transform(dst_arr, zero_arr, dst_arr, cute::plus{});
++        }
++      } else {
++        constexpr int pack1 =
++            decltype(select_packing<SrcType, ElementScale, num_elements>::value())::value;
++        constexpr int pack2 =
++            decltype(select_packing<ElementScale, DstType, num_elements>::value())::value;
++        constexpr int pack = cute::gcd(pack1, pack2);
++        using Converter1 =
++            cutlass::NumericArrayConverter<ElementScale, SrcType, pack,
++                                           cutlass::FloatRoundStyle::round_to_nearest>;
++        using Converter2 =
++            cutlass::NumericArrayConverter<DstType, ElementScale, pack,
++                                           cutlass::FloatRoundStyle::round_to_nearest>;
++        using SrcArray = cutlass::Array<SrcType, pack>;
++        using DstArray = cutlass::Array<DstType, pack>;
++        using StageArray = cutlass::Array<ElementScale, pack>;
++        constexpr int iters = num_elements / pack;
++
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < iters; ++i) {
++          SrcArray const* pSrcArr = reinterpret_cast<SrcArray const*>(pSrc) + i;
++          DstArray* pDstArr = reinterpret_cast<DstArray*>(pDst) + i;
++          StageArray stageArr;
++          stageArr = Converter1::convert(*pSrcArr);
++          CUTLASS_PRAGMA_UNROLL
++          for (int j = 0; j < pack; ++j) {
++            stageArr[j] = stageArr[j] * scales[i * pack + j] + zeros[i * pack + j];
++          }
++          *pDstArr = Converter2::convert(stageArr);
++        }
++      }
++    } else {
++      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                    "Conversion mode not handled for input partitioning.");
++    }
++  }
++};
+ }  // namespace cutlass::gemm::collective::detail
+diff --git a/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp b/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp
+index 6964886a8a..c000399d02 100644
+--- a/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp
++++ b/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp
+@@ -246,6 +246,8 @@ struct CollectiveMmaArrayMixedInput<
+     }
+   }
+ 
++  bool TensormapUpdateShapesStridesForAandScale = true;
++
+  public:
+   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
+   static constexpr bool ModeHasScales =
+@@ -258,6 +260,10 @@ struct CollectiveMmaArrayMixedInput<
+       KernelConversionMode == ConversionMode::ConvertAndScale &&
+       cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+       cute::is_same_v<ElementB, cutlass::bfloat16_t>;
++  static constexpr bool UseInt4ToFP8LookupTable =
++      KernelConversionMode == ConversionMode::ConvertAndScale &&
++      cute::is_same_v<ElementA, cutlass::int4_t> &&
++      cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
+   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
+   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
+   static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
+@@ -856,6 +862,19 @@ struct CollectiveMmaArrayMixedInput<
+   }
+ 
+   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++  template <class T>
++  CUTLASS_DEVICE float scale_convertor(T scale) {
++    if constexpr (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
++      cutlass::float_ue8m0_t scale_ue8m0 = scale;
++
++      uint32_t temp = 0;
++      temp = (temp | *reinterpret_cast<uint8_t*>(&scale_ue8m0)) << 23;
++      return *reinterpret_cast<float*>(&temp);
++    } else {
++      return static_cast<float>(scale);
++    }
++  }
++
+   /// Perform a collective-scoped matrix multiply-accumulate
+   /// Consumer Perspective
+   template <class FrgTensorC>
+@@ -947,6 +966,31 @@ struct CollectiveMmaArrayMixedInput<
+     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));  // PIPE
+     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));  // PIPE
+ 
++    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++    using SmemCopyAtomA_LDSM = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
++
++    auto smem_tiled_copy_A_LDSM = make_tiled_copy_A(SmemCopyAtomA_LDSM{}, tiled_mma);
++    auto smem_thr_copy_A_LDSM = smem_tiled_copy_A_LDSM.get_thread_slice(thread_idx);
++
++    Tensor sA_LDSM = recast<ElementB>(sA);
++    auto tCsA_LDSM = smem_thr_copy_A_LDSM.partition_S(sA_LDSM);
++
++    using ABBitWidthRatio = Int<sizeof_bits_v<ElementB> / sizeof_bits_v<ElementA>>;
++    auto tCrA_load_LDSM_shape =
++        replace<2>(tCrA_mma.shape(), size(get<2>(tCrA_mma.shape())) / ABBitWidthRatio{});
++    Tensor tCrA_load_LDSM = make_fragment_like<ElementB>(tCrA_load_LDSM_shape);
++    Tensor tCrA_copy_view_LDSM =
++        smem_thr_copy_A_LDSM.retile_D(tCrA_load_LDSM);  // (CPY,CPY_M,CPY_K)
++
++    auto ptr = recast_ptr<RealSwappedElementA>(tCrA_load_LDSM.data());
++    auto old_shape = tCrA_load_LDSM.shape();
++    auto new_shape =
++        make_shape(size<0>(old_shape), get<1>(old_shape), size<2>(old_shape) * ABBitWidthRatio{});
++    Tensor tCrA_load_4b_packed = make_tensor(ptr, make_layout(new_shape));
++
++    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
+     //
+     // PIPELINED MAIN LOOP
+     //
+@@ -975,17 +1019,14 @@ struct CollectiveMmaArrayMixedInput<
+       ++smem_pipe_read;
+       barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+ 
+-      // copy smem->rmem for A operand
+-
+-      Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                             copy_partitions_extra_info, 0, read_stage);
++      Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, read_stage);
+       if (K_BLOCK_MAX > 1) {
+-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                               copy_partitions_extra_info, 1, read_stage);
++        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1,
++                              read_stage);
+       }
+ 
+       // src: tCrA_load, dst: tCrA_mma
+-      Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
++      Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+ 
+       // Unroll the K mode manually to set scale D to 1
+       CUTLASS_PRAGMA_UNROLL
+@@ -1003,42 +1044,47 @@ struct CollectiveMmaArrayMixedInput<
+                      intermediate_array[chunk_id]);
+           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+ 
+-          warpgroup_commit_batch();
++          if (k_block == 0) {
++            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0,
++                                    read_stage);
++          }
+ 
+           if (k_block < K_BLOCK_MAX - 2) {
+-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                                   copy_partitions_extra_info, k_block + 2, read_stage);
++            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM,
++                                  k_block + 2, read_stage);
+           }
+           if (k_block < K_BLOCK_MAX - 1) {
+-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
++            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
+           }
+         }
+-      }
+ 
+-      warpgroup_wait<0>();
++        warpgroup_commit_batch();
+ 
+-      CUTLASS_PRAGMA_UNROLL
+-      for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+-        warpgroup_fence_operand(intermediate_array[chunk_id_]);
+-
+-        // Apply the group-wise scaling
+-        // tCrS  ((4, _2, _2), MMA_M, _1)
+-        // accum ((2, _2, _2), MMA_M, _1)
+-        auto tCrS = cute::get<1>(partitioned_extra_info);
+-        for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+-          for (int m = 0; m < size<0, 1>(accum); m++) {
+-            for (int n = 0; n < size<0, 2>(accum); n++) {
+-              for (int e = 0; e < size<0, 0>(accum); e++) {
+-                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
++        if (chunk_id > 0) {
++          warpgroup_wait<1>();
+ 
+-                if (chunk_id_ == 0) {
+-                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) *
+-                                       static_cast<float>(tCrS(scale_coord)[0]);
+-                } else {
+-                  accum(accum_coord) =
+-                      fma(intermediate_array[chunk_id_](accum_coord),
+-                          static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
++          int chunk_id_ = chunk_id - 1;
++          warpgroup_fence_operand(intermediate_array[chunk_id_]);
++
++          // Apply the group-wise scaling
++          // tCrS  ((4, _2, _2), MMA_M, _1)
++          // accum ((2, _2, _2), MMA_M, _1)
++          auto tCrS = cute::get<1>(partitioned_extra_info);
++          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
++            for (int m = 0; m < size<0, 1>(accum); m++) {
++              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
++              for (int n = 0; n < size<0, 2>(accum); n++) {
++                for (int e = 0; e < size<0, 0>(accum); e++) {
++                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
++
++                  if (chunk_id_ == 0) {
++                    accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) *
++                                         scale_convertor(tCrS(scale_coord)[0]);
++                  } else {
++                    accum(accum_coord) =
++                        fma(intermediate_array[chunk_id_](accum_coord),
++                            scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
++                  }
+                 }
+               }
+             }
+@@ -1046,19 +1092,42 @@ struct CollectiveMmaArrayMixedInput<
+         }
+       }
+ 
++      warpgroup_wait<0>();
++
++      int chunk_id_ = NumChunksPerTileK - 1;
++      warpgroup_fence_operand(intermediate_array[chunk_id_]);
++
++      // Apply the group-wise scaling
++      // tCrS  ((4, _2, _2), MMA_M, _1)
++      // accum ((2, _2, _2), MMA_M, _1)
++      auto tCrS = cute::get<1>(partitioned_extra_info);
++      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
++        for (int m = 0; m < size<0, 1>(accum); m++) {
++          auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
++          for (int n = 0; n < size<0, 2>(accum); n++) {
++            for (int e = 0; e < size<0, 0>(accum); e++) {
++              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
++
++              accum(accum_coord) =
++                  fma(intermediate_array[chunk_id_](accum_coord),
++                      scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
++            }
++          }
++        }
++      }
++
+       --k_tile_count;
+       if (k_tile_count > 0) {
+         // Wait for K_BLOCK_MAX - 1 to be in flight to ensure that it is safe to overwrite the A
+         // registers for the first mma.
+         pipeline.consumer_wait(smem_pipe_read, barrier_token);
+ 
+-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                               copy_partitions_extra_info, 0, smem_pipe_read.index());
++        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0,
++                              smem_pipe_read.index());
++        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1,
++                              smem_pipe_read.index());
+ 
+-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                               copy_partitions_extra_info, 1, smem_pipe_read.index());
+-
+-        Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
++        Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+       }
+     }
+ 
+@@ -1090,7 +1159,6 @@ struct CollectiveMmaArrayMixedInput<
+           cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage),
+                      intermediate_array[chunk_id]);
+           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+-          warpgroup_commit_batch();
+ 
+           if (k_block == K_BLOCK_MAX - 1) {
+             pipeline.consumer_release(
+@@ -1100,50 +1168,74 @@ struct CollectiveMmaArrayMixedInput<
+ 
+           if (k_block == 0) {
+             barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
++            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0,
++                                    read_stage);
+           }
+ 
+           if (k_block == K_BLOCK_MAX - 1) {
+             // The last k_block
+ 
++            pipeline.consumer_wait(smem_pipe_read, barrier_token);
++            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0,
++                                  smem_pipe_read.index());
++            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1,
++                                  smem_pipe_read.index());
++
++            warpgroup_commit_batch();
+             warpgroup_wait<0>();
+ 
+-            CUTLASS_PRAGMA_UNROLL
+-            for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+-              warpgroup_fence_operand(intermediate_array[chunk_id_]);
+-
+-              // Apply the group-wise scaling
+-              auto tCrS = cute::get<1>(partitioned_extra_info);
+-              for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+-                for (int m = 0; m < size<0, 1>(accum); m++) {
+-                  for (int n = 0; n < size<0, 2>(accum); n++) {
+-                    for (int e = 0; e < size<0, 0>(accum); e++) {
+-                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+-
+-                      accum(accum_coord) =
+-                          fma(intermediate_array[chunk_id_](accum_coord),
+-                              static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+-                    }
++            warpgroup_fence_operand(intermediate_array[chunk_id]);
++
++            // Apply the group-wise scaling
++            auto tCrS = cute::get<1>(partitioned_extra_info);
++            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
++              for (int m = 0; m < size<0, 1>(accum); m++) {
++                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
++                for (int n = 0; n < size<0, 2>(accum); n++) {
++                  for (int e = 0; e < size<0, 0>(accum); e++) {
++                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
++
++                    accum(accum_coord) =
++                        fma(intermediate_array[chunk_id](accum_coord),
++                            scale_convertor(tCrS(scale_coord)[chunk_id]), accum(accum_coord));
+                   }
+                 }
+               }
+             }
+ 
+-            pipeline.consumer_wait(smem_pipe_read, barrier_token);
+-
+-            // copy scales when passing k_block=0
+-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                                   copy_partitions_extra_info, 0, smem_pipe_read.index());
+-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                                   copy_partitions_extra_info, 1, smem_pipe_read.index());
+-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
++            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+           } else {
+             if (k_block < K_BLOCK_MAX - 2) {
+-              Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view,
+-                                     partitioned_extra_info, copy_partitions_extra_info,
+-                                     k_block + 2, read_stage);
++              Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM,
++                                    k_block + 2, read_stage);
++            }
++            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
++          }
++        }
++
++        warpgroup_commit_batch();
++
++        if (chunk_id > 0) {
++          warpgroup_wait<1>();
++
++          int chunk_id_ = chunk_id - 1;
++          warpgroup_fence_operand(intermediate_array[chunk_id_]);
++
++          // Apply the group-wise scaling
++          auto tCrS = cute::get<1>(partitioned_extra_info);
++          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
++            for (int m = 0; m < size<0, 1>(accum); m++) {
++              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
++              for (int n = 0; n < size<0, 2>(accum); n++) {
++                for (int e = 0; e < size<0, 0>(accum); e++) {
++                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
++
++                  accum(accum_coord) =
++                      fma(intermediate_array[chunk_id_](accum_coord),
++                          scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
++                }
++              }
+             }
+-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+           }
+         }
+       }
+@@ -1167,7 +1259,11 @@ struct CollectiveMmaArrayMixedInput<
+         cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage),
+                    intermediate);
+         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+-        warpgroup_commit_batch();
++
++        if (k_block == 0) {
++          Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0,
++                                  read_stage);
++        }
+ 
+         if (k_block == K_BLOCK_MAX - 1) {
+           // release prior barrier
+@@ -1177,16 +1273,17 @@ struct CollectiveMmaArrayMixedInput<
+         }
+ 
+         if (k_block < K_BLOCK_MAX - 2) {
+-          Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
+-                                 copy_partitions_extra_info, k_block + 2, read_stage);
++          Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2,
++                                read_stage);
+         }
+         if (k_block < K_BLOCK_MAX - 1) {
+-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
++          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
+         }
+ 
+         if ((k_block + 1) % NumMMAsPerChunk == 0) {
+           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+ 
++          warpgroup_commit_batch();
+           warpgroup_wait<0>();
+           warpgroup_fence_operand(intermediate);
+ 
+@@ -1194,15 +1291,15 @@ struct CollectiveMmaArrayMixedInput<
+           auto tCrS = cute::get<1>(partitioned_extra_info);
+           for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+             for (int m = 0; m < size<0, 1>(accum); m++) {
++              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+               for (int n = 0; n < size<0, 2>(accum); n++) {
+                 for (int e = 0; e < size<0, 0>(accum); e++) {
+                   auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                   int scale_idx = k_block / NumMMAsPerChunk;
+ 
+                   accum(accum_coord) =
+-                      fma(intermediate(accum_coord),
+-                          static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
++                      fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx]),
++                          accum(accum_coord));
+                 }
+               }
+             }
+@@ -1222,9 +1319,6 @@ struct CollectiveMmaArrayMixedInput<
+ 
+     smem_pipe_release.advance(k_tile_count);
+ 
+-    // Wait on all GMMAs to complete
+-    // warpgroup_wait<0>();
+-
+     for (int count = 0; count < prologue_mma_count; ++count) {
+       pipeline.consumer_release(
+           smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
+@@ -1298,23 +1392,41 @@ struct CollectiveMmaArrayMixedInput<
+   }
+ 
+   // Replace address for the global tensor (to be done by single thread)
+-  CUTLASS_DEVICE
+-  void tensormaps_replace_global_address(TensorMapStorage& shared_tensormaps,
+-                                         Params const& mainloop_params, int32_t next_batch) {
++  template <class... TMs>
++  CUTLASS_DEVICE void tensormaps_replace_global_address(TensorMapStorage& shared_tensormaps,
++                                                        Params const& mainloop_params,
++                                                        cute::tuple<TMs...> const& input_tensormaps,
++                                                        int32_t next_batch) {
+     // Replacing global_address for the next batch
+-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+-                                                    mainloop_params.ptr_A[next_batch]);
+     cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
+                                                     mainloop_params.ptr_B[next_batch]);
+-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
+-                                                      mainloop_params.ptr_S[next_batch]);
+-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
+-                                                      mainloop_params.ptr_Z[next_batch]);
+-    } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+-      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+-                    "Conversion mode not handled in tensormaps_replace_global_address.");
++
++    if (TensormapUpdateShapesStridesForAandScale) {
++      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
++                                                      mainloop_params.ptr_A[next_batch]);
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
++                                                        mainloop_params.ptr_S[next_batch]);
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
++                                                        mainloop_params.ptr_Z[next_batch]);
++      } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
++        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                      "Conversion mode not handled in tensormaps_replace_global_address.");
++      }
++    } else {
++      cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
++                                                      mainloop_params.ptr_A[next_batch]);
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        cute::tma_descriptor_replace_addr_in_global_mem(get<2>(input_tensormaps),
++                                                        mainloop_params.ptr_S[next_batch]);
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        cute::tma_descriptor_replace_addr_in_global_mem(get<3>(input_tensormaps),
++                                                        mainloop_params.ptr_Z[next_batch]);
++      } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
++        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                      "Conversion mode not handled in tensormaps_replace_global_address.");
++      }
+     }
+   }
+ 
+@@ -1339,72 +1451,74 @@ struct CollectiveMmaArrayMixedInput<
+     cute::array<uint32_t, MaxTensorRank> prob_shape_zero = {1, 1, 1, 1, 1};
+     cute::array<uint64_t, MaxTensorRank> prob_stride_zero = {0, 0, 0, 0, 0};
+ 
+-    SwappedElementA const* ptr_A = nullptr;
+-    Tensor tensor_a = make_tensor(
+-        ptr_A,
+-        detail::get_gmem_layout(make_shape(M, K, Int<1>{}), mainloop_params.ptr_dA[next_group]));
+-
+     SwappedElementB const* ptr_B = nullptr;
+     Tensor tensor_b = make_tensor(
+         ptr_B,
+         detail::get_gmem_layout(make_shape(N, K, Int<1>{}), mainloop_params.ptr_dB[next_group]));
+-
+-    cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, prob_shape_A,
+-                                             prob_stride_A);
+     cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, prob_shape_B,
+                                              prob_stride_B);
+ 
+-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+-      NonVoidElementScale const* ptr_S = nullptr;
+-      // auto scale_k = K / mainloop_params.chunk_size;
+-      auto scale_k = K / ScalingGroupSize;
+-      Tensor tensor_scale =
+-          make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}),
+-                      mainloop_params.dS[next_group]);
+-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale,
+-                                               prob_shape_scale, prob_stride_scale);
+-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+-      ElementZero const* ptr_Z = nullptr;
+-      // auto scale_k = K / mainloop_params.chunk_size;
+-      auto scale_k = K / ScalingGroupSize;
+-      Tensor tensor_zero =
+-          make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}),
+-                      mainloop_params.dS[next_group]);
+-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero,
+-                                               prob_shape_zero, prob_stride_zero);
+-    } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+-      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+-                    "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
+-    }
+-
+-    // Convert strides to byte strides
+-    for (uint64_t& stride : prob_stride_A) {
+-      stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
+-    }
+     for (uint64_t& stride : prob_stride_B) {
+       stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
+     }
+-    for (uint64_t& stride : prob_stride_scale) {
+-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+-    }
+-    for (uint64_t& stride : prob_stride_zero) {
+-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+-    }
+ 
+-    cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+-                                                            prob_shape_A, prob_stride_A);
+     cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_B,
+                                                             prob_shape_B, prob_stride_B);
+ 
+-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(
+-          shared_tensormaps.smem_tensormap_scale, prob_shape_scale, prob_stride_scale);
+-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
+-                                                              prob_shape_zero, prob_stride_zero);
+-    } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+-      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+-                    "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
++    if (TensormapUpdateShapesStridesForAandScale) {
++      SwappedElementA const* ptr_A = nullptr;
++      Tensor tensor_a = make_tensor(
++          ptr_A,
++          detail::get_gmem_layout(make_shape(M, K, Int<1>{}), mainloop_params.ptr_dA[next_group]));
++      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, prob_shape_A,
++                                               prob_stride_A);
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        NonVoidElementScale const* ptr_S = nullptr;
++        // auto scale_k = K / mainloop_params.chunk_size;
++        auto scale_k = K / ScalingGroupSize;
++        Tensor tensor_scale =
++            make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}),
++                        mainloop_params.dS[next_group]);
++        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale,
++                                                 prob_shape_scale, prob_stride_scale);
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        ElementZero const* ptr_Z = nullptr;
++        // auto scale_k = K / mainloop_params.chunk_size;
++        auto scale_k = K / ScalingGroupSize;
++        Tensor tensor_zero =
++            make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}),
++                        mainloop_params.dS[next_group]);
++        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero,
++                                                 prob_shape_zero, prob_stride_zero);
++      } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
++        static_assert(
++            cutlass::detail::dependent_false<KernelSchedule>,
++            "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
++      }
++
++      // Convert strides to byte strides
++      for (uint64_t& stride : prob_stride_A) {
++        stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
++      }
++      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
++                                                              prob_shape_A, prob_stride_A);
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        for (uint64_t& stride : prob_stride_scale) {
++          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
++        }
++        cute::tma_descriptor_replace_dims_strides_in_shared_mem(
++            shared_tensormaps.smem_tensormap_scale, prob_shape_scale, prob_stride_scale);
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        for (uint64_t& stride : prob_stride_zero) {
++          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
++        }
++        cute::tma_descriptor_replace_dims_strides_in_shared_mem(
++            shared_tensormaps.smem_tensormap_zero, prob_shape_zero, prob_stride_zero);
++      } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
++        static_assert(
++            cutlass::detail::dependent_false<KernelSchedule>,
++            "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
++      }
+     }
+   }
+ 
+@@ -1416,7 +1530,8 @@ struct CollectiveMmaArrayMixedInput<
+                                                 int32_t next_batch) {
+     if (cute::elect_one_sync()) {
+       // Replacing global_address for the next batch
+-      tensormaps_replace_global_address(shared_tensormaps, mainloop_params, next_batch);
++      tensormaps_replace_global_address(shared_tensormaps, mainloop_params, input_tensormaps,
++                                        next_batch);
+ 
+       if constexpr (IsGroupedGemmKernel) {
+         // Replacing global dims and strides for the next batch
+@@ -1429,18 +1544,32 @@ struct CollectiveMmaArrayMixedInput<
+   template <class... TMs>
+   CUTLASS_DEVICE void tensormaps_cp_fence_release(TensorMapStorage& shared_tensormaps,
+                                                   cute::tuple<TMs...> const& input_tensormaps) {
++    // [None][fix] Fix W4A8 MoE kernel issue
++    // https://github.com/NVIDIA/TensorRT-LLM/pull/7072
++    if (cute::elect_one_sync()) {
++      cute::tma_desc_commit_group();
++      cute::tma_desc_wait_group();
++    }
++
+     // Entire warp must do this (i.e. it's aligned)
+-    tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
+     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
+-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+-      tma_descriptor_cp_fence_release(get<2>(input_tensormaps),
+-                                      shared_tensormaps.smem_tensormap_scale);
+-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+-      tma_descriptor_cp_fence_release(get<3>(input_tensormaps),
+-                                      shared_tensormaps.smem_tensormap_zero);
+-    } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+-      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+-                    "Conversion mode not handled in tensormaps_cp_fence_release.");
++
++    if (TensormapUpdateShapesStridesForAandScale) {
++      TensormapUpdateShapesStridesForAandScale = false;
++
++      tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
++      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
++        tma_descriptor_cp_fence_release(get<2>(input_tensormaps),
++                                        shared_tensormaps.smem_tensormap_scale);
++      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
++        tma_descriptor_cp_fence_release(get<3>(input_tensormaps),
++                                        shared_tensormaps.smem_tensormap_zero);
++      } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
++        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
++                      "Conversion mode not handled in tensormaps_cp_fence_release.");
++      }
++    } else {
++      tma_descriptor_fence_release();
+     }
+   }
+ 
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+index b1e41cebf1..643c2ffa57 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+@@ -389,9 +389,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
+         (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
+     if (has_w4afp8) {
+       bool const has_coop_supported = sm90_supports_coop(tile_config);
+-      std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
++      std::set<MainloopScheduleType> mainloop_schedules;
+       if (has_coop_supported) {
++        // Due to the limitation on the number of registers on SM,
++        // cooperative scheduler does not support CtaShape128x128x128B
++        // for mixed-dtype (W4A16) grouped GEMM. Skip the tile entirely
++        // to avoid register overflow.
++        if (tile_config == CutlassTileConfigSM90::CtaShape128x128x128B) continue;
+         mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
++      } else {
++        mainloop_schedules.insert(MainloopScheduleType::PINGPONG);
+       }
+       auto const epilogue_schedule = EpilogueScheduleType::AUTO;
+       for (auto const& mainloop_schedule : mainloop_schedules) {
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl
+index e9071d12e9..78f91bbd63 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl
+@@ -26,6 +26,7 @@
+ #include "cutlass/gemm/device/gemm_universal_adapter.h"
+ #include "cutlass/gemm/dispatch_policy.hpp"
+ #include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+ #include "cutlass/util/command_line.h"
+ #include "cutlass/util/distribution.h"
+ #include "cutlass/util/host_tensor.h"
+@@ -202,6 +203,12 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
+        reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
+       hw_info};
+ 
++  // Optimize tile scheduling for better L2 locality
++  using RasterOrderOptions =
++      typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
++  arguments.scheduler.max_swizzle_size = 2;
++  arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
++
+   assert(group_size == int(inputs.groupwise_quant_group_size));
+   if (workspace_size != nullptr) {
+     *workspace_size = gemm.get_workspace_size(arguments);
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu
+new file mode 100644
+index 0000000000..8b146366c7
+--- /dev/null
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu
+@@ -0,0 +1,114 @@
++/*
++ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "moe_gemm_mixed_utils.h"
++
++namespace tensorrt_llm {
++namespace kernels {
++namespace cutlass_kernels {
++
++/////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++__global__ void interleave_fp4_weights_for_sm90_mixed_gemm_kernel(uint8_t* fp4_weight,
++                                                                  uint8_t* fp4_weight_interleaved,
++                                                                  int const rows, int const cols) {
++  for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x) {
++    for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y) {
++      int lane_id = threadIdx.x;
++      int row_id = block_id / 8 * 16 + block_id % 8;
++
++      int mma_id = lane_id / 8;
++      int dst_row_id = row_id + (mma_id % 2) * 8;
++
++      int interleaved_lane_id = lane_id / 16 * 16 + (lane_id % 4) * 4 + (lane_id % 8) / 4 * 2;
++
++      int col_id = partition_id * 32 + lane_id;
++      int dst_col_id = partition_id * 32 + interleaved_lane_id;
++
++      int index_a = row_id * cols / 2 + col_id;
++      int index_b = (row_id + 8) * cols / 2 + col_id;
++
++      uint8_t fp4x2_a = fp4_weight[index_a];
++      uint8_t fp4x2_b = fp4_weight[index_b];
++
++      uint8_t fp4_temp_a = (fp4x2_a & 0xF0U) >> 4;
++      uint8_t fp4_temp_b = (fp4x2_b & 0x0FU) << 4;
++
++      fp4x2_a = (fp4x2_a & 0x0FU) | fp4_temp_b;
++      fp4x2_b = (fp4x2_b & 0xF0U) | fp4_temp_a;
++
++      int dst_id = dst_row_id * cols / 2 + dst_col_id;
++
++      fp4_weight_interleaved[dst_id] = fp4x2_a;
++      fp4_weight_interleaved[dst_id + 1] = fp4x2_b;
++    }
++  }
++}
++
++__global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(uint8_t* int4_weight,
++                                                                   uint8_t* int4_weight_interleaved,
++                                                                   int const rows, int const cols) {
++  uint16_t* uint16_ptr = reinterpret_cast<uint16_t*>(int4_weight);
++  uint16_t* uint16_interleaved_ptr = reinterpret_cast<uint16_t*>(int4_weight_interleaved);
++
++  for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x) {
++    for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y) {
++      int lane_id = threadIdx.x;
++
++      int row_id = block_id / 8 * 16 + block_id % 8;
++      int dst_row_id = row_id + (lane_id % 8) / 4 * 8;
++
++      int mma_id = lane_id / 8;
++      int interleaved_lane_id = mma_id * 8 + lane_id % 4 * 2;
++
++      int col_id = partition_id * 16 + lane_id;
++      int dst_col_id = partition_id * 16 + interleaved_lane_id;
++
++      int src_id_a = row_id * cols / 4 + col_id;
++      int src_id_b = (row_id + 8) * cols / 4 + col_id;
++
++      uint16_t int4x2_a = uint16_ptr[src_id_a];
++      uint16_t int4x2_b = uint16_ptr[src_id_b];
++
++      int dst_id = dst_row_id * cols / 4 + dst_col_id;
++
++      uint16_interleaved_ptr[dst_id] = int4x2_a;
++      uint16_interleaved_ptr[dst_id + 1] = int4x2_b;
++    }
++  }
++}
++
++/////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* fp4_weight,
++                                                uint8_t* fp4_weight_interleaved, int const rows,
++                                                int const cols, cudaStream_t stream) {
++  dim3 block(32, 32);
++  interleave_fp4_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
++      fp4_weight, fp4_weight_interleaved, rows, cols);
++}
++
++void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* int4_weight,
++                                                 uint8_t* int4_weight_interleaved, int const rows,
++                                                 int const cols, cudaStream_t stream) {
++  dim3 block(16, 32);
++  interleave_int4_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
++      int4_weight, int4_weight_interleaved, rows, cols);
++}
++
++}  // namespace cutlass_kernels
++}  // namespace kernels
++}  // namespace tensorrt_llm
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h
+new file mode 100644
+index 0000000000..314f7bcd32
+--- /dev/null
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace tensorrt_llm {
++namespace kernels {
++namespace cutlass_kernels {
++
++void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
++                                                int rows, int cols, cudaStream_t stream = 0);
++
++void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
++                                                 int rows, int cols, cudaStream_t stream = 0);
++
++}  // namespace cutlass_kernels
++}  // namespace kernels
++}  // namespace tensorrt_llm
+diff --git a/docs/api/fused_moe.rst b/docs/api/fused_moe.rst
+index 2de3047c7d..ba9eeaf656 100644
+--- a/docs/api/fused_moe.rst
++++ b/docs/api/fused_moe.rst
+@@ -24,6 +24,8 @@ Utility Functions
+ 
+     convert_to_block_layout
+     reorder_rows_for_gated_act_gemm
++    interleave_moe_weights_for_sm90_mixed_gemm
++    interleave_moe_scales_for_sm90_mixed_gemm
+ 
+ CUTLASS Fused MoE
+ -----------------
+diff --git a/flashinfer/fused_moe/__init__.py b/flashinfer/fused_moe/__init__.py
+index df6e1f72cc..d983f9d4c8 100644
+--- a/flashinfer/fused_moe/__init__.py
++++ b/flashinfer/fused_moe/__init__.py
+@@ -17,6 +17,8 @@
+ from .core import (
+     convert_to_block_layout,
+     cutlass_fused_moe,
++    interleave_moe_scales_for_sm90_mixed_gemm,
++    interleave_moe_weights_for_sm90_mixed_gemm,
+     gen_cutlass_fused_moe_sm120_module,
+     gen_cutlass_fused_moe_sm103_module,
+     gen_cutlass_fused_moe_sm100_module,
+@@ -64,6 +66,8 @@
+     "WeightLayout",
+     "convert_to_block_layout",
+     "cutlass_fused_moe",
++    "interleave_moe_scales_for_sm90_mixed_gemm",
++    "interleave_moe_weights_for_sm90_mixed_gemm",
+     "gen_cutlass_fused_moe_sm120_module",
+     "gen_cutlass_fused_moe_sm103_module",
+     "gen_cutlass_fused_moe_sm100_module",
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 5a0814e6aa..6e6d409d2d 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -622,9 +622,122 @@ def _fake_cutlass_fused_moe(
+     # Register the module
+     return SimpleNamespace(
+         cutlass_fused_moe=cutlass_fused_moe,
++        interleave_moe_weights_for_sm90_mixed_gemm=(
++            module.interleave_moe_weights_for_sm90_mixed_gemm
++        ),
+     )
+ 
+ 
++@flashinfer_api
++def interleave_moe_scales_for_sm90_mixed_gemm(
++    scales: torch.Tensor,
++    group_size: int = 32,
++) -> torch.Tensor:
++    """Interleave MXFP4 block scales for the SM90 mixed-input MoE GEMM.
++
++    The kernel expects scales in layout
++    ``(num_experts, K // (group_size * 4), rows * 4)`` rather than the natural
++    ``(num_experts, rows, K // group_size)`` produced by the MXFP4 quantizer.
++    This helper performs the reshape + permute equivalent to TensorRT-LLM's
++    ``WFP4A16FusedMoEMethod.load_quant_scales`` (PR #12451), with the fixed
++    interleave factor of ``128 // group_size`` used for MXFP4.
++
++    Parameters
++    ----------
++    scales:
++        ``[num_experts, rows, K // group_size]`` uint8 tensor of E8M0 block
++        scales.
++    group_size:
++        MXFP4 quantization group size (default 32).
++
++    Returns
++    -------
++    torch.Tensor
++        Contiguous uint8 tensor with shape
++        ``[num_experts, K // (group_size * factor), rows * factor]``
++        where ``factor = 128 // group_size``.
++    """
++    if scales.dim() != 3:
++        raise ValueError(
++            f"scales must be 3D (num_experts, rows, K/group_size); got {tuple(scales.shape)}"
++        )
++    if scales.dtype != torch.uint8:
++        raise ValueError(f"scales must be uint8 (E8M0); got {scales.dtype}")
++
++    factor = 128 // group_size
++    if factor < 1 or 128 % group_size != 0:
++        raise ValueError(
++            f"group_size={group_size} must divide 128 (interleave factor = 128 // group_size)"
++        )
++    e, rows, kgs = scales.shape
++    if kgs % factor != 0:
++        raise ValueError(
++            f"K/group_size={kgs} must be divisible by interleave factor {factor}"
++        )
++    tmp = (
++        scales.reshape(e, rows, kgs // factor, factor).permute(0, 2, 1, 3).contiguous()
++    )
++    return tmp.reshape(e, kgs // factor, rows * factor)
++
++
++@flashinfer_api
++def interleave_moe_weights_for_sm90_mixed_gemm(
++    weight: torch.Tensor,
++    quant_type: str = "fp4",
++) -> torch.Tensor:
++    """Interleave 4-bit packed MoE weights for the SM90 mixed-input GEMM.
++
++    The SM90 mixed-dtype MoE GEMM (used by ``cutlass_fused_moe`` with
++    ``use_w4_group_scaling=True``) expects weights in a specific interleaved
++    layout; without preprocessing, the LUT-based FP4→BF16 conversion reads
++    bytes from the wrong positions and the output diverges from a dequantized
++    reference for any K > 128. TensorRT-LLM's W4A16 MoE runs the equivalent
++    preprocessing at weight-load time (see
++    ``interleave_4bit_weights_for_Hopper_mixed_gemm`` in TRT-LLM PR #12451).
++
++    Parameters
++    ----------
++    weight:
++        ``[num_experts, n, k // 2]`` uint8 CUDA tensor (4-bit values packed
++        two-per-byte).
++    quant_type:
++        ``"fp4"`` for MXFP4 (the W4A16 path) or ``"int4"`` for INT4 (the
++        W4A8 path).
++
++    Returns
++    -------
++    torch.Tensor
++        A new uint8 tensor with the same shape as ``weight`` holding the
++        interleaved layout. Feed this directly as ``fc1_expert_weights`` /
++        ``fc2_expert_weights`` to :func:`cutlass_fused_moe`.
++    """
++    if weight.dim() != 3:
++        raise ValueError(
++            f"weight must be 3D (num_experts, n, k/2); got shape {tuple(weight.shape)}"
++        )
++    if weight.dtype != torch.uint8:
++        raise ValueError(f"weight must be uint8 (packed 4-bit); got {weight.dtype}")
++    if not weight.is_cuda:
++        raise ValueError("weight must live on CUDA")
++
++    qtype_map = {"fp4": 1, "int4": 0}
++    if quant_type not in qtype_map:
++        raise ValueError(
++            f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}"
++        )
++
++    weight = weight.contiguous()
++    out = torch.empty_like(weight)
++
++    major, minor = get_compute_capability(weight.device)
++    device_arch = f"{major * 10 + minor}"
++    module = get_cutlass_fused_moe_module(device_arch)
++    module.interleave_moe_weights_for_sm90_mixed_gemm(
++        weight, out, qtype_map[quant_type]
++    )
++    return out
++
++
+ # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
+ @flashinfer_api
+ def cutlass_fused_moe(
+diff --git a/flashinfer/jit/fused_moe.py b/flashinfer/jit/fused_moe.py
+index 3c6efb4314..2a8529a945 100644
+--- a/flashinfer/jit/fused_moe.py
++++ b/flashinfer/jit/fused_moe.py
+@@ -194,6 +194,8 @@ def gen_cutlass_fused_moe_module(
+             jit_env.FLASHINFER_CSRC_DIR
+             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
+             jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
++            jit_env.FLASHINFER_CSRC_DIR
+             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
+             jit_env.FLASHINFER_CSRC_DIR
+             / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
+diff --git a/tests/moe/test_trtllm_cutlass_fused_moe.py b/tests/moe/test_trtllm_cutlass_fused_moe.py
+index debffb1790..eafc9f8b91 100644
+--- a/tests/moe/test_trtllm_cutlass_fused_moe.py
++++ b/tests/moe/test_trtllm_cutlass_fused_moe.py
+@@ -22,7 +22,11 @@
+ from torch.nn import functional as F
+ 
+ import flashinfer.fused_moe as fused_moe
+-from flashinfer.utils import is_sm100a_supported, is_sm12x_supported
++from flashinfer.utils import (
++    is_sm90a_supported,
++    is_sm100a_supported,
++    is_sm12x_supported,
++)
+ from flashinfer import (
+     autotune,
+     fp4_quantize,
+@@ -1567,9 +1571,22 @@ def test_moe_bf16_mxfp4(
+     pad_size = hidden_size - x.shape[1]
+     x_pad = torch.nn.functional.pad(x, (0, pad_size))
+ 
++    # SM90 mixed-input path reads weights / scales in an interleaved byte
++    # layout (see ``interleave_moe_{weights,scales}_for_sm90_mixed_gemm``
++    # and the LDSM + LUT pipeline ported from TRT-LLM PR #12451). Raw
++    # weights produce stale output.
++    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        w1.contiguous().view(torch.uint8), "fp4"
++    )
++    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        w2.contiguous().view(torch.uint8), "fp4"
++    )
++    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_scale)
++    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_scale)
++
+     quant_scales = [
+-        w1_scale.view(torch.int32),
+-        w2_scale.view(torch.int32),
++        w1_scale_il.view(torch.int32),
++        w2_scale_il.view(torch.int32),
+     ]
+ 
+     # Call cutlass_fused_moe with BF16 activations and MXFP4 weights
+@@ -1577,8 +1594,8 @@ def test_moe_bf16_mxfp4(
+         x_pad,
+         selected_experts.to(torch.int),
+         routing_weights,
+-        w1.contiguous().view(torch.uint8),
+-        w2.contiguous().view(torch.uint8),
++        w1_il,
++        w2_il,
+         torch.bfloat16,
+         swiglu_alpha=alpha_t,
+         swiglu_limit=limit_t,
+@@ -1680,6 +1697,15 @@ def test_moe_w4a8(
+     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
+     fc2_weights = w2_weight
+ 
++    # Weight byte interleave required by the SM90 mixed-input GEMM
++    # (ported from TRT-LLM PR #12451). Scale reshape+permute is done below.
++    fc1_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        fc1_weights.contiguous().view(torch.uint8), "int4"
++    )
++    fc2_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        fc2_weights.contiguous().view(torch.uint8), "int4"
++    )
++
+     def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
+         # Factors are chosen based on TRTLLM's quantization.py
+         interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
+@@ -1744,8 +1770,8 @@ def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
+             x,
+             selected_experts_int32,
+             routing_weights,
+-            fc1_weights.view(torch.uint8),
+-            fc2_weights.view(torch.uint8),
++            fc1_weights_il,
++            fc2_weights_il,
+             dtype,
+             quant_scales=quant_scales,
+             use_w4_group_scaling=True,
+@@ -2400,5 +2426,436 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
+     )
+ 
+ 
++# ============================================================================
++# SM90 mixed-input MoE tests — PR #3084
++#
++# Exercise the W4A16 (MXFP4 x BF16) and W4A8 (INT4 x FP8) paths with the
++# preprocessing helpers exposed by this PR: weights go through
++# ``interleave_moe_weights_for_sm90_mixed_gemm``, MXFP4 block scales go
++# through ``interleave_moe_scales_for_sm90_mixed_gemm``, and W4A8 weight
++# scales use a local group-wise reshape+permute (factor = 4 / 2 / 1 based on
++# whether K is divisible by 512 / 256) to match the W4A8 kernel layout.
++# ============================================================================
++
++
++_MXFP4_LUT = (
++    0.0,
++    0.5,
++    1.0,
++    1.5,
++    2.0,
++    3.0,
++    4.0,
++    6.0,
++    -0.0,
++    -0.5,
++    -1.0,
++    -1.5,
++    -2.0,
++    -3.0,
++    -4.0,
++    -6.0,
++)
++
++
++def _dequant_mxfp4_on_device(
++    w_fp4: torch.Tensor, w_scale: torch.Tensor
++) -> torch.Tensor:
++    """GPU dequant for a batched MXFP4 tensor. Avoids the host round-trip
++    of ``dequant_mxfp4_batches_host`` and — crucially — allows the caller to
++    pass only the active-expert slice, which at e=256 / h=4096 / n=2048 is
++    the difference between fitting and OOMing a reference dequant on H200.
++    """
++    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=w_fp4.device)
++    lo = w_fp4 & 0x0F
++    hi = (w_fp4 >> 4) & 0x0F
++    nib = torch.stack([lo, hi], dim=-1).reshape(*w_fp4.shape[:-1], -1)
++    values = lut[nib.long()]
++    scale = torch.exp2(w_scale.to(torch.float32) - 127.0)
++    scale = scale.repeat_interleave(32, dim=-1)
++    return (values * scale).to(torch.bfloat16)
++
++
++def _compute_with_active_experts(
++    active_experts,
++    x,
++    w31_by_expert,
++    w2_by_expert,
++    selected_experts,
++    routing_weights,
++    alpha=None,
++    beta=None,
++    limit=None,
++):
++    results = torch.zeros_like(x)
++    for expert_id in active_experts.tolist():
++        mask = selected_experts == expert_id
++        if not mask.any():
++            continue
++        batch_idx, nth_expert = torch.where(mask)
++        w3_expert, w1_expert = torch.chunk(w31_by_expert[expert_id], 2, dim=0)
++        w2_expert = w2_by_expert[expert_id]
++        expert_inputs = x[batch_idx]
++        if alpha is not None and limit is not None and beta is not None:
++            x1 = expert_inputs @ w1_expert.t()
++            x1 = x1.clamp_(min=None, max=limit)
++            x1_scaled = x1 * torch.sigmoid(alpha * x1)
++            x2 = expert_inputs @ w3_expert.t()
++            x2 = x2.clamp_(min=-limit, max=limit) + beta
++            inter = x1_scaled * x2
++        else:
++            inter = F.silu(expert_inputs @ w1_expert.t()) * (
++                expert_inputs @ w3_expert.t()
++            )
++        output = inter @ w2_expert.t()
++        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
++    return results
++
++
++W4A16_CORRECTNESS_CONFIGS = [
++    (1, 128, 2, 2, 128),
++    (4, 128, 4, 2, 128),
++    (4, 768, 8, 2, 512),
++    (4, 2048, 8, 4, 1024),
++    (4, 4096, 8, 4, 2048),
++]
++
++W4A16_COVERAGE_CONFIGS = [
++    (1, 4096, 256, 6, 2048),
++    (4, 2048, 256, 6, 1024),
++    (4, 4096, 8, 2, 2048),
++    (4, 4096, 256, 1, 2048),
++    (4, 4096, 256, 8, 2048),
++]
++
++W4A16_ACTIVATION_CONFIGS = [
++    (4, 4096, 8, 4, 2048, None, None, None),
++    (4, 4096, 8, 4, 2048, 0.5, 0.0, 7.0),
++    (4, 4096, 8, 4, 2048, 1.702, 1.0, 7.0),
++]
++
++
++def _run_w4a16_moe_hopper(
++    batch_size,
++    hidden_size,
++    num_experts,
++    top_k,
++    intermediate_size,
++    alpha=None,
++    beta=None,
++    limit=None,
++    strict_correctness=True,
++):
++    torch.manual_seed(42)
++    device = torch.device("cuda")
++    e, m, n, k = num_experts, batch_size, intermediate_size, hidden_size
++
++    x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
++    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
++    w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
++    w1_scale = torch.randint(
++        118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8
++    )
++    w2_scale = torch.randint(
++        118, 123, (e, k, n // 32), device=device, dtype=torch.uint8
++    )
++
++    router_logits = torch.randn(m, e, dtype=torch.bfloat16, device=device)
++    routing_weights, selected_experts = compute_routing(router_logits, top_k)
++
++    if alpha is not None:
++        alpha_t = torch.ones(e, device=device) * alpha
++        limit_t = torch.ones(e, device=device) * limit
++        beta_t = torch.ones(e, device=device) * beta
++    else:
++        alpha_t = limit_t = beta_t = None
++
++    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1, "fp4")
++    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4")
++    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_scale)
++    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_scale)
++
++    flash_output = torch.zeros_like(x)
++    fused_moe.cutlass_fused_moe(
++        x,
++        selected_experts.to(torch.int),
++        routing_weights,
++        w1_il,
++        w2_il,
++        torch.bfloat16,
++        swiglu_alpha=alpha_t,
++        swiglu_limit=limit_t,
++        swiglu_beta=beta_t,
++        quant_scales=[w1_scale_il.view(torch.int32), w2_scale_il.view(torch.int32)],
++        use_w4_group_scaling=True,
++        output=flash_output,
++    )
++
++    active = torch.unique(selected_experts.flatten())
++    active_w1 = _dequant_mxfp4_on_device(w1[active], w1_scale[active])
++    active_w2 = _dequant_mxfp4_on_device(w2[active], w2_scale[active])
++    w31_by_expert = {eid: active_w1[i] for i, eid in enumerate(active.tolist())}
++    w2_by_expert = {eid: active_w2[i] for i, eid in enumerate(active.tolist())}
++    ref_output = _compute_with_active_experts(
++        active,
++        x,
++        w31_by_expert,
++        w2_by_expert,
++        selected_experts,
++        routing_weights,
++        alpha,
++        beta,
++        limit,
++    )
++    if strict_correctness:
++        torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
++    else:
++        diff = (ref_output.float() - flash_output.float()).abs()
++        tol = 0.1 + 1e-1 * ref_output.float().abs()
++        close_pct = (diff <= tol).float().mean().item()
++        assert close_pct >= 0.999, (
++            f"Only {close_pct:.4%} of elements within tolerance (need >= 99.9%). "
++            f"max_abs_err={diff.max().item():.4f}"
++        )
++
++
++@pytest.mark.skipif(
++    not is_sm90a_supported(torch.device("cuda")),
++    reason="W4A16 MoE (Hopper mixed-input) requires SM90",
++)
++@pytest.mark.parametrize(
++    "batch_size,hidden_size,num_experts,top_k,intermediate_size",
++    W4A16_CORRECTNESS_CONFIGS,
++    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A16_CORRECTNESS_CONFIGS],
++)
++def test_moe_bf16_mxfp4_hopper_correctness(
++    batch_size, hidden_size, num_experts, top_k, intermediate_size
++):
++    _run_w4a16_moe_hopper(
++        batch_size, hidden_size, num_experts, top_k, intermediate_size
++    )
++
++
++@pytest.mark.skipif(
++    not is_sm90a_supported(torch.device("cuda")),
++    reason="W4A16 MoE (Hopper mixed-input) requires SM90",
++)
++@pytest.mark.parametrize(
++    "batch_size,hidden_size,num_experts,top_k,intermediate_size",
++    W4A16_COVERAGE_CONFIGS,
++    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in W4A16_COVERAGE_CONFIGS],
++)
++def test_moe_bf16_mxfp4_hopper_coverage(
++    batch_size, hidden_size, num_experts, top_k, intermediate_size
++):
++    if top_k > num_experts:
++        pytest.skip(f"top_k ({top_k}) > num_experts ({num_experts})")
++    _run_w4a16_moe_hopper(
++        batch_size,
++        hidden_size,
++        num_experts,
++        top_k,
++        intermediate_size,
++        strict_correctness=False,
++    )
++
++
++@pytest.mark.skipif(
++    not is_sm90a_supported(torch.device("cuda")),
++    reason="W4A16 MoE (Hopper mixed-input) requires SM90",
++)
++@pytest.mark.parametrize(
++    "batch_size,hidden_size,num_experts,top_k,intermediate_size,alpha,beta,limit",
++    W4A16_ACTIVATION_CONFIGS,
++    ids=["swiglu_default", "alpha_0.5", "alpha_1.702"],
++)
++def test_moe_bf16_mxfp4_hopper_activations(
++    batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
++):
++    _run_w4a16_moe_hopper(
++        batch_size,
++        hidden_size,
++        num_experts,
++        top_k,
++        intermediate_size,
++        alpha,
++        beta,
++        limit,
++    )
++
++
++# W4A8 Hopper interleaved path.
++#
++# Strict-tolerance envelope: h == intermediate_size == 512 with e == 2 only.
++# Larger shapes exceed assert_close(rtol=1e-2, atol=1e-1) because of FP8 + INT4
++# accumulation noise — the upstream ``test_moe_w4a8`` above stays inside the
++# same envelope for the same reason (verified on H200: e=2/h=2048 and
++# e=8/h=512 both fail against a float32 PyTorch reference).
++W4A8_CORRECTNESS_CONFIGS = [
++    (1, 512, 2, 2, 512),
++    (4, 512, 2, 2, 512),
++]
++
++
++def _run_w4a8_moe_hopper(
++    batch_size,
++    hidden_size,
++    num_experts,
++    top_k,
++    intermediate_size,
++    dtype=torch.bfloat16,
++    use_autotune=False,
++):
++    torch.manual_seed(42)
++    group_size = 128
++    e, m, n, k = num_experts, batch_size, intermediate_size, hidden_size
++    affine_coeff = 0.005
++    device = torch.device("cuda")
++
++    x = torch.randn(m, k, dtype=dtype, device=device)
++    router_logits = torch.randn(m, e, dtype=dtype, device=device)
++    w1_weight = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device=device)
++    w2_weight = torch.randint(0, 256, (e, k, n // 2), dtype=torch.uint8, device=device)
++    w3_weight = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device=device)
++
++    w1_scale = (
++        torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
++    )
++    w2_scale = (
++        torch.randn(e, k, n // group_size, dtype=dtype, device=device) * affine_coeff
++    )
++    w3_scale = (
++        torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
++    )
++    w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
++    w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device=device) * 0.1 + 0.95
++    w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
++    input_scale = torch.rand(e, 1, dtype=torch.float32, device=device) * 0.2 + 0.1
++    weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device=device)
++
++    fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
++    fc2_weights = w2_weight
++    fc1_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        fc1_weights.contiguous().view(torch.uint8), "int4"
++    )
++    fc2_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
++        fc2_weights.contiguous().view(torch.uint8), "int4"
++    )
++
++    def _interleave_scales(w, dim):
++        factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
++        s = w.shape
++        return (
++            w.reshape(s[0], s[1], s[2] // factor, factor)
++            .permute(0, 2, 1, 3)
++            .reshape(s[0], s[2] // factor, s[1] * factor)
++            .contiguous()
++        )
++
++    w3_w1_scales_int = _interleave_scales(torch.cat([w3_scale, w1_scale], dim=1), k)
++    w2_scales_int = _interleave_scales(w2_scale, n)
++    # Weight scales: bf16 bit-pattern trick; act scales stay in native dtype.
++    w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
++    w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
++
++    w3_w1_input_scale_max = input_scale.max()
++    fc31_act_scale = (
++        torch.max(w1_pre_quant_scale, w3_pre_quant_scale) / w3_w1_input_scale_max
++    ).to(dtype)
++    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype).unsqueeze(-1)
++    fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
++    fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
++    zero_1 = torch.empty(0, dtype=dtype, device=device)
++    zero_2 = torch.empty(0, dtype=dtype, device=device)
++
++    quant_scales = (
++        w3_w1_scales_out,
++        w2_scales_out,
++        fc31_act_scale,
++        fc2_act_scale,
++        zero_1,
++        zero_2,
++        fc31_alpha,
++        fc2_alpha,
++    )
++
++    routing_weights, selected_experts = compute_routing(router_logits, top_k)
++    flash_output = torch.zeros_like(x)
++    with autotune(True) if use_autotune else nullcontext():
++        fused_moe.cutlass_fused_moe(
++            x,
++            selected_experts.to(torch.int32),
++            routing_weights,
++            fc1_weights_il,
++            fc2_weights_il,
++            dtype,
++            quant_scales=quant_scales,
++            use_w4_group_scaling=True,
++            output=flash_output,
++            use_packed_weights=True,
++        )
++
++    w31_list, w2_list = [], []
++    for e_idx in range(num_experts):
++        ws2 = weight_scale_2[e_idx]
++        w1_dq = dequantize_int4_to_dtype(
++            w1_weight[e_idx], w1_scale[e_idx], group_size, dtype, ws2
++        )
++        w3_dq = dequantize_int4_to_dtype(
++            w3_weight[e_idx], w3_scale[e_idx], group_size, dtype, ws2
++        )
++        w2_dq = dequantize_int4_to_dtype(
++            w2_weight[e_idx], w2_scale[e_idx], group_size, dtype, ws2
++        )
++        w31_list.append(torch.cat([w3_dq, w1_dq], dim=0))
++        w2_list.append(w2_dq)
++
++    # Broadcast max over experts; see comment on fc31_act_scale above.
++    fc1_input_scale_for_ref = torch.full_like(
++        input_scale.squeeze(-1), w3_w1_input_scale_max.item()
++    )
++    ref_output = torch_moe_w4a8(
++        num_experts,
++        x,
++        torch.stack(w31_list, dim=0),
++        torch.stack(w2_list, dim=0),
++        selected_experts,
++        routing_weights,
++        fc1_input_scale=fc1_input_scale_for_ref,
++        fc2_input_scale=input_scale.squeeze(-1),
++        fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
++        fc2_pre_quant_scale=w2_pre_quant_scale,
++        fc1_weight_scale_2=weight_scale_2.squeeze(-1),
++        fc2_weight_scale_2=weight_scale_2.squeeze(-1),
++    )
++    torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-1)
++
++
++@pytest.mark.skipif(
++    not is_sm90a_supported(torch.device("cuda")),
++    reason="W4A8 MoE (Hopper mixed-input) requires SM90",
++)
++@pytest.mark.parametrize(
++    "batch_size,hidden_size,num_experts,top_k,intermediate_size",
++    W4A8_CORRECTNESS_CONFIGS,
++    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A8_CORRECTNESS_CONFIGS],
++)
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
++def test_moe_w4a8_hopper_correctness(
++    batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype
++):
++    _run_w4a8_moe_hopper(
++        batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype=dtype
++    )
++
++
++@pytest.mark.skipif(
++    not is_sm90a_supported(torch.device("cuda")),
++    reason="W4A8 MoE (Hopper mixed-input) requires SM90",
++)
++def test_moe_w4a8_hopper_autotune():
++    _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])

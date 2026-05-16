@@ -1,0 +1,554 @@
+diff --git a/tensorrt_llm/_torch/attention_backend/flashinfer.py b/tensorrt_llm/_torch/attention_backend/flashinfer.py
+index 5edc65933bb7..cd9856c35367 100644
+--- a/tensorrt_llm/_torch/attention_backend/flashinfer.py
++++ b/tensorrt_llm/_torch/attention_backend/flashinfer.py
+@@ -2,7 +2,7 @@
+ import os
+ import weakref
+ from dataclasses import dataclass, field
+-from typing import Dict, Literal, Optional
++from typing import Any, Dict, Literal, Optional
+ 
+ import flashinfer
+ import torch
+@@ -12,6 +12,7 @@
+ from tensorrt_llm.functional import AttentionMaskType
+ from tensorrt_llm.models.modeling_utils import QuantConfig
+ 
++from ..metadata import KVCacheParams
+ from ..utils import get_global_attrs, get_model_extra_attrs
+ from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
+                         CustomAttentionMask, PredefinedAttentionMask)
+@@ -25,6 +26,8 @@
+     arch_list = f"{capability[0]}.{capability[1]}"
+     os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+ 
++from tensorrt_llm._utils import prefer_pinned
++
+ 
+ @dataclass(kw_only=True, frozen=True)
+ class PlanParams:
+@@ -46,10 +49,13 @@ class PlanParams:
+ 
+ @dataclass(kw_only=True)
+ class FlashInferWrappers:
+-    decode_wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper
+-    prefill_wrapper: Optional[flashinfer.BatchPrefillWithPagedKVCacheWrapper]
+-
+     is_planned: bool
++    decode_wrapper: Optional[
++        flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
++    prefill_wrapper: Optional[
++        flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
++    ragged_prefill_wrapper: Optional[
++        flashinfer.BatchPrefillWithRaggedKVCacheWrapper] = None
+ 
+ 
+ @dataclass(kw_only=True)
+@@ -94,6 +100,15 @@ def get_decode_wrapper(
+         result = self._plan_params_to_wrappers[plan_params].decode_wrapper
+         return result
+ 
++    def get_ragged_prefill_wrapper(
++        self, plan_params: PlanParams
++    ) -> flashinfer.BatchPrefillWithRaggedKVCacheWrapper:
++        assert plan_params in self._plan_params_to_wrappers, "Plan params not found, make sure to call plan()"
++        result = self._plan_params_to_wrappers[
++            plan_params].ragged_prefill_wrapper
++        assert result is not None, "Ragged prefill wrapper was not created in plan()"
++        return result
++
+     @property
+     def paged_kv_indices(self) -> torch.Tensor:
+         return self._paged_kv_indices[:self.num_generation_blocks +
+@@ -201,8 +216,81 @@ def page_size(self) -> int:
+         """
+         Number of tokens per cache page
+         """
++        assert self.kv_cache_manager is not None, (
++            "page_size is undefined without a KV cache manager; use the "
++            "ragged prefill path instead.")
+         return self.kv_cache_manager.tokens_per_block
+ 
++    def _plan_ragged_cudnn_no_kv(
++        self,
++        plan_params: PlanParams,
++        ragged_prefill_wrapper: Any,
++    ) -> None:
++        is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
++        if plan_params.attention_mask_data is not None:
++            window_left = -1
++        else:
++            window_left = plan_params.window_left
++
++        # Lengths are already on GPU via AttentionMetadata (seq_lens setter -> _seq_lens_cuda).
++        assert self.seq_lens_cuda is not None
++        assert self.seq_lens is not None
++
++        # NOTE: When kv_cache_manager is None (e.g. ViT), ragged prefill runs only for the context phase.
++        # Restrict seq_lens to the first num_contexts entries accordingly.
++        q_seqlens = self.seq_lens[:self.num_contexts]
++        kv_seqlens = q_seqlens
++
++        max_query_tokens_per_sequence = int(
++            self.seq_lens[:self.num_contexts].max().item())
++        max_key_value_tokens_per_sequence = max_query_tokens_per_sequence
++
++        # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
++        num_context_sequences = int(q_seqlens.shape[0])
++        query_output_element_indptr = torch.zeros(
++            num_context_sequences + 1,
++            dtype=torch.int32,
++            pin_memory=prefer_pinned(),
++        )
++        key_value_element_indptr = torch.zeros(
++            num_context_sequences + 1,
++            dtype=torch.int32,
++            pin_memory=prefer_pinned(),
++        )
++        if num_context_sequences > 0:
++            num_query_output_heads = plan_params.num_heads
++            num_key_value_heads = plan_params.num_kv_heads
++            attention_head_dim = plan_params.head_dim
++            query_output_element_indptr[1:].copy_(
++                torch.cumsum(q_seqlens, dim=0).mul_(num_query_output_heads *
++                                                    attention_head_dim))
++            key_value_element_indptr[1:].copy_(
++                torch.cumsum(kv_seqlens, dim=0).mul_(num_key_value_heads *
++                                                     attention_head_dim))
++
++        q_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
++        kv_seqlens_cuda = q_seqlens_cuda[:self.num_contexts]
++
++        ragged_prefill_wrapper.plan(
++            qo_indptr=query_output_element_indptr,
++            kv_indptr=key_value_element_indptr,
++            num_qo_heads=plan_params.num_heads,
++            num_kv_heads=plan_params.num_kv_heads,
++            head_dim_qk=plan_params.head_dim,
++            custom_mask=plan_params.attention_mask_data,
++            causal=is_causal,
++            sm_scale=plan_params.sm_scale,
++            window_left=window_left,
++            q_data_type=plan_params.q_dtype,
++            kv_data_type=plan_params.kv_dtype,
++            seq_lens=kv_seqlens_cuda,
++            seq_lens_q=q_seqlens_cuda,
++            max_token_per_sequence=max_query_tokens_per_sequence,
++            max_sequence_kv=max_key_value_tokens_per_sequence,
++            v_indptr=key_value_element_indptr,
++            o_indptr=query_output_element_indptr,
++        )
++
+     def prepare(self) -> None:
+         super().prepare()
+         extra_attrs = get_model_extra_attrs()
+@@ -214,6 +302,27 @@ def prepare(self) -> None:
+                      dtype=torch.int32,
+                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+ 
++        if self.kv_cache_manager is None:
++            assert self.request_ids is not None
++            assert self.num_generations == 0, (
++                "FlashInfer without a KV cache manager only supports context-only "
++                "batches (num_generations == 0) in TRT-LLM.")
++            if self.is_cross:
++                raise NotImplementedError(
++                    "FlashInfer without a KV cache manager is not tested for cross attention."
++                )
++            self.kv_cache_params = KVCacheParams(use_cache=False)
++            n = self.num_seqs
++            self._cached_token_lens[:n].zero_()
++            for plan_params in list(self._plan_params_to_wrappers.keys()):
++                if plan_params.attention_mask_data is None:
++                    self._plan_params_to_wrappers[
++                        plan_params].is_planned = False
++                    self._plan_with_params(plan_params)
++                else:
++                    del self._plan_params_to_wrappers[plan_params]
++            return
++
+         # indices of used cache blocks for each sequence
+         assert self.request_ids is not None
+         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+@@ -371,6 +480,33 @@ def _plan_with_params(self, plan_params: PlanParams) -> PlanParams:
+                 "Make sure you run a few warmup runs before capturing the graph!"
+             )
+ 
++        if self.kv_cache_manager is None:
++            if self.is_cuda_graph:
++                raise NotImplementedError(
++                    "FlashInfer without a KV cache manager does not support "
++                    "CUDA graph capture; use the TRTLLM attention backend.")
++            if plan_params in self._plan_params_to_wrappers:
++                ragged_prefill_wrapper = self._plan_params_to_wrappers[
++                    plan_params].ragged_prefill_wrapper
++            else:
++                ragged_prefill_wrapper = (
++                    flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
++                        self.workspace_buffer,
++                        self.kv_layout,
++                        backend="cudnn",
++                    ))
++            torch.cuda.current_stream().synchronize()
++            if self.num_contexts <= 0:
++                raise ValueError(
++                    "FlashInfer ragged prefill without KV cache requires "
++                    "num_contexts >= 1.")
++            self._plan_ragged_cudnn_no_kv(plan_params, ragged_prefill_wrapper)
++            self._plan_params_to_wrappers[plan_params] = FlashInferWrappers(
++                is_planned=True,
++                ragged_prefill_wrapper=ragged_prefill_wrapper,
++            )
++            return plan_params
++
+         if plan_params in self._plan_params_to_wrappers:
+             prefill_wrapper = self._plan_params_to_wrappers[
+                 plan_params].prefill_wrapper
+@@ -437,6 +573,7 @@ def decode_plan():
+                 dtype=torch.int32,
+                 dim=0,
+             )
++            assert decode_wrapper is not None
+             decode_wrapper.plan(
+                 paged_kv_indptr,
+                 self.paged_kv_indices[self.num_context_blocks:],
+@@ -511,6 +648,36 @@ def forward_impl(
+         # Query
+         q = q.view(-1, self.num_heads, self.head_dim)
+ 
++        if metadata.kv_cache_manager is None:
++            assert k is not None and v is not None, (
++                "FlashInfer without a KV cache manager requires key/value tensors."
++            )
++            if self.has_fp8_kv_cache:
++                raise NotImplementedError(
++                    "FP8 KV cache is not supported for FlashInfer without a "
++                    "KV cache manager.")
++            k = k.view(-1, self.num_kv_heads, self.head_dim)
++            v = v.view(-1, self.num_kv_heads, self.head_dim)
++            plan_params = metadata.plan(
++                self.num_heads,
++                self.num_kv_heads,
++                self.head_dim,
++                q_dtype=q.dtype,
++                kv_dtype=k.dtype,
++                q_scaling=self.q_scaling,
++                attention_window_size=attention_window_size,
++                attention_mask_type=attention_mask_type,
++                attention_mask_data=attention_mask_data,
++            )
++            wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
++            wrapper.run(
++                q,
++                k,
++                v,
++                out=output.view(-1, self.num_heads, self.head_dim),
++            )
++            return
++
+         # Key and Value
+         kv_cache = metadata.kv_cache_manager.get_buffers(
+             self.layer_idx, kv_layout=metadata.kv_layout)
+diff --git a/tensorrt_llm/_torch/attention_backend/interface.py b/tensorrt_llm/_torch/attention_backend/interface.py
+index 600f655bc517..24149a412dc1 100644
+--- a/tensorrt_llm/_torch/attention_backend/interface.py
++++ b/tensorrt_llm/_torch/attention_backend/interface.py
+@@ -65,9 +65,9 @@ class AttentionMetadata:
+     # The max number of sequences in a single batch.
+     max_num_sequences: Optional[int] = None
+     # The KV cache manager.
+-    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
++    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
+     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
+-    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
++    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
+     mapping: Optional[Mapping] = None
+ 
+     enable_flash_mla: bool = False
+diff --git a/tensorrt_llm/_torch/models/modeling_multimodal_utils.py b/tensorrt_llm/_torch/models/modeling_multimodal_utils.py
+index 1901fca54941..112dce1ca6f9 100644
+--- a/tensorrt_llm/_torch/models/modeling_multimodal_utils.py
++++ b/tensorrt_llm/_torch/models/modeling_multimodal_utils.py
+@@ -113,11 +113,11 @@ def _cache_multimodal_embeddings(
+ def get_multimodal_embeddings(
+     encoder_forward_fn: Callable[
+         [List[MultimodalParams]],
+-        Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]],
++        Union[torch.Tensor, Tuple[torch.Tensor, Any]],
+     ],
+     multimodal_params: List[MultimodalParams],
+     encoder_kwargs: Optional[Dict[str, Any]] = None,
+-) -> List[torch.Tensor]:
++) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], Any]]:
+     """
+     High-level utility to get multimodal embeddings from encoder or cached embeddings.
+ 
+@@ -130,11 +130,15 @@ def get_multimodal_embeddings(
+     Args:
+         encoder_forward_fn: Callable that performs encoder forward pass.
+                            Should accept List[MultimodalParams] and return List[torch.Tensor] or
+-                           Tuple[List[torch.Tensor], Dict[str, Any]] for models with auxiliary outputs.
++                           Tuple[List[torch.Tensor], aux_data] for models with auxiliary outputs.
++                           When returning a tuple, the first element must be a List[torch.Tensor]
++                           (one tensor per multimodal param), and aux_data is passed through to
++                           the caller unchanged.
+         multimodal_params: All multimodal parameters in the batch.
+         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
+     Returns:
+-        List of multimodal embeddings for all multimodal params in the batch.
++        List of multimodal embeddings for all multimodal params in the batch, or a
++        (List[torch.Tensor], aux_data) tuple if encoder_forward_fn returned auxiliary data.
+     """
+     if not multimodal_params:
+         return []
+@@ -143,11 +147,26 @@ def get_multimodal_embeddings(
+     uncached_multimodal_params = _get_uncached_multimodal_params(
+         multimodal_params)
+ 
++    aux_data = None
++
+     # Step 2: Run encoder forward only on uncached parameters
+     if uncached_multimodal_params:
+         kwargs = encoder_kwargs or {}
+-        encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
+-                                                **kwargs)
++        encoder_output = encoder_forward_fn(uncached_multimodal_params,
++                                            **kwargs)
++
++        # Handle encoder returning (embeddings, aux_data) tuple.
++        # In this case the first element is a List[torch.Tensor] with one tensor per
++        # multimodal param (not yet concatenated), which we concatenate before caching.
++        if isinstance(encoder_output, tuple):
++            encoder_embeddings, aux_data = encoder_output
++            # Concatenate per-param tensors into a single tensor for the caching path
++            if isinstance(encoder_embeddings,
++                          list) and encoder_embeddings and isinstance(
++                              encoder_embeddings[0], torch.Tensor):
++                encoder_embeddings = [torch.cat(encoder_embeddings, dim=0)]
++        else:
++            encoder_embeddings = encoder_output
+ 
+         # TODO: support multiple multimodal modalities per request
+         if len(encoder_embeddings) > 1:
+@@ -162,6 +181,8 @@ def get_multimodal_embeddings(
+             logger.warning(
+                 "Multimodal runtime data missing or incomplete, will not cache embeddings."
+             )
++            if aux_data is not None:
++                return encoder_embeddings, aux_data
+             return encoder_embeddings
+ 
+         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
+@@ -184,6 +205,8 @@ def get_multimodal_embeddings(
+         param.multimodal_data["multimodal_embedding"] for param in valid_params
+     ],
+                                dim=0)
++    if aux_data is not None:
++        return [all_embeddings], aux_data
+     return [all_embeddings]
+ 
+ 
+diff --git a/tensorrt_llm/_torch/models/modeling_nemotron_nano.py b/tensorrt_llm/_torch/models/modeling_nemotron_nano.py
+index 91973381b685..195b68647ba8 100644
+--- a/tensorrt_llm/_torch/models/modeling_nemotron_nano.py
++++ b/tensorrt_llm/_torch/models/modeling_nemotron_nano.py
+@@ -1622,11 +1622,13 @@ def __init__(self, model_config: ModelConfig):
+         super().__init__(config)
+ 
+         self.model_config = model_config
++        llm_model_config = copy.deepcopy(model_config)
++        vision_model_config = copy.deepcopy(model_config)
+         if hasattr(self, "llm"):
+             return
+ 
+         if not _is_disagg():
+-            self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
++            self.vision_encoder = NanoV2VLVisionEncoder(vision_model_config).eval()
+ 
+         self.sound_encoder: ProjectedParakeet | None = None
+         sound_config = getattr(config, "sound_config", None)
+@@ -1637,7 +1639,6 @@ def __init__(self, model_config: ModelConfig):
+                 dtype=getattr(config, "torch_dtype", torch.bfloat16),
+             ).eval()
+ 
+-        llm_model_config = copy.deepcopy(model_config)
+         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
+         self._update_config_for_quantization(llm_model_config)
+ 
+diff --git a/tensorrt_llm/_torch/models/modeling_radio.py b/tensorrt_llm/_torch/models/modeling_radio.py
+index e1050b6da901..6c030109c9eb 100644
+--- a/tensorrt_llm/_torch/models/modeling_radio.py
++++ b/tensorrt_llm/_torch/models/modeling_radio.py
+@@ -1,8 +1,9 @@
+-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+ # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
+ # TODO: Check and add more compatible logic for the full-series RADIO model.
+ 
+ import copy
++import dataclasses
+ import math
+ from collections import namedtuple
+ from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
+@@ -758,7 +759,7 @@ def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
+         """
+         prompt_lens = seq_lengths
+         seq_lens = torch.tensor(seq_lengths,
+-                                dtype=torch.int,
++                                dtype=torch.int32,
+                                 pin_memory=prefer_pinned())
+         request_ids = list(range(1, batch_size + 1))
+ 
+@@ -1008,12 +1009,14 @@ class RADIOVisionModel(PreTrainedModel):
+ 
+     def __init__(self,
+                  model_config: model_config_lib.ModelConfig,
+-                 disable_quantization: bool = True):
++                 disable_quantization: bool = True,
++                 vision_attn_backend: Optional[str] = "FLASHINFER"):
+         """
+         Args:
+             model_config: Model configuration.
+             disable_quantization: Disable quantization for RADIO model.
+                 Since the radio model is for vision only, we can disable quantization for it by default.
++            vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
+         """
+         config = model_config.pretrained_config
+         super().__init__(config)
+@@ -1026,6 +1029,9 @@ def __init__(self,
+                     kv_cache_quant_algo=self.model_config.quant_config.
+                     kv_cache_quant_algo)
+ 
++        self.model_config = dataclasses.replace(
++            self.model_config, attn_backend=vision_attn_backend)
++
+         self.config = config
+ 
+         RADIOArgs = namedtuple("RADIOArgs", config.args.keys())
+diff --git a/tests/unittest/_torch/attention/test_flashinfer_attention.py b/tests/unittest/_torch/attention/test_flashinfer_attention.py
+index 2cc9e28fa773..ef59b61c2d47 100644
+--- a/tests/unittest/_torch/attention/test_flashinfer_attention.py
++++ b/tests/unittest/_torch/attention/test_flashinfer_attention.py
+@@ -10,8 +10,11 @@
+ import tensorrt_llm
+ from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
+                                                    FlashInferAttentionMetadata)
++from tensorrt_llm._torch.attention_backend.interface import \
++    PredefinedAttentionMask
+ from tensorrt_llm._torch.metadata import KVCacheParams
+ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
++from tensorrt_llm._utils import prefer_pinned
+ from tensorrt_llm.bindings.executor import KvCacheConfig
+ from tensorrt_llm.mapping import Mapping
+ 
+@@ -570,3 +573,87 @@ def test_attention_with_cuda_graphs(
+                                        rtol=0)
+ 
+         kv_cache_manager.shutdown()
++
++    def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
++        """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""
++        if not torch.cuda.is_available():
++            self.skipTest("CUDA is required")
++
++        device = torch.device("cuda")
++        num_heads = 8
++        num_kv_heads = 8
++        head_dim = 80
++        hidden_size = num_heads * head_dim
++        dtype = torch.bfloat16
++        per_sequence_token_counts = [24, 56]
++        num_context_sequences = len(per_sequence_token_counts)
++        total_tokens = sum(per_sequence_token_counts)
++
++        attn_metadata = TestingFlashInferAttentionMetadata(
++            max_num_requests=max(num_context_sequences, 128),
++            max_num_tokens=max(total_tokens * 2, 8192),
++            kv_cache_manager=None,
++        )
++        attn_metadata.seq_lens = torch.tensor(
++            per_sequence_token_counts,
++            dtype=torch.int,
++            pin_memory=prefer_pinned(),
++        )
++        attn_metadata.num_contexts = num_context_sequences
++        attn_metadata.request_ids = list(range(1, num_context_sequences + 1))
++        attn_metadata.prompt_lens = list(per_sequence_token_counts)
++        attn_metadata.prepare()
++
++        layer = FlashInferAttention(
++            layer_idx=0,
++            num_heads=num_heads,
++            head_dim=head_dim,
++            num_kv_heads=num_kv_heads,
++        )
++
++        generator = torch.Generator(device=device)
++        generator.manual_seed(0)
++        query_states = torch.randn(
++            total_tokens,
++            hidden_size,
++            dtype=dtype,
++            device=device,
++            generator=generator,
++        )
++        key_states = torch.randn(
++            total_tokens,
++            num_kv_heads * head_dim,
++            dtype=dtype,
++            device=device,
++            generator=generator,
++        )
++        value_states = torch.randn(
++            total_tokens,
++            num_kv_heads * head_dim,
++            dtype=dtype,
++            device=device,
++            generator=generator,
++        )
++
++        attention_output = layer.forward(
++            query_states,
++            key_states,
++            value_states,
++            attn_metadata,
++            attention_mask=PredefinedAttentionMask.FULL,
++        )
++
++        self.assertEqual(attention_output.shape, (total_tokens, hidden_size))
++        self.assertGreaterEqual(len(attn_metadata._plan_params_to_wrappers), 1)
++        # FlashInfer stores the chosen implementation on the wrapper (see
++        # BatchPrefillWithRaggedKVCacheWrapper.__init__: self._backend = backend).
++        # TRT-LLM no-cache ragged path passes backend="cudnn" in flashinfer.py.
++        for flashinfer_wrappers in attn_metadata._plan_params_to_wrappers.values(
++        ):
++            ragged_wrapper = flashinfer_wrappers.ragged_prefill_wrapper
++            self.assertIsNotNone(ragged_wrapper)
++            self.assertEqual(
++                getattr(ragged_wrapper, "_backend", None),
++                "cudnn",
++                msg="No-KV ragged prefill should use FlashInfer's cudnn backend",
++            )
+diff --git a/tests/unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py b/tests/unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py
+index 081fea141f27..cc9f8781de3e 100644
+--- a/tests/unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py
++++ b/tests/unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py
+@@ -174,13 +174,13 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
+     reference_data_dict = {
+         "image": {
+             "single": torch.tensor(
+-                [-8.5795e-01, -1.5373e-01, -7.2846e-04, -6.3667e-01, -3.1307e-02]
++                [-8.9814e-01, -1.5258e-01, -7.6061e-04, -6.3735e-01, -3.1303e-02]
+             ),
+-            "multiple": torch.tensor([-0.5846, -0.6330, -0.0124, -0.1146, -0.0172]),
++            "multiple": torch.tensor([-0.4717, -0.7776, -0.0251, -1.2290, -1.0705]),
+         },
+         "video": {
+-            "single": torch.tensor([-0.5612, -0.0334, -0.8856, -0.4056, -0.6041]),
+-            "multiple": torch.tensor([-0.4943, -0.9333, -0.0096, -1.2496, -0.9441]),
++            "single": torch.tensor([-1.4745, -0.0674, -1.4121, -0.2152, -1.6297]),
++            "multiple": torch.tensor([-0.9425, -0.2328, -0.0083, -1.6257, -0.6572]),
+         },
+     }
+     prompts = data_dict_fixture[modality][condition]["prompts"]

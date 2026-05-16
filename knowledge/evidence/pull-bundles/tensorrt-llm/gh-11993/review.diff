@@ -1,0 +1,3158 @@
+diff --git a/examples/auto_deploy/model_registry/configs/qwen3.5_moe_35b.yaml b/examples/auto_deploy/model_registry/configs/qwen3.5_moe_35b.yaml
+index 0870b07a3e02..ed7f3d6e6a40 100644
+--- a/examples/auto_deploy/model_registry/configs/qwen3.5_moe_35b.yaml
++++ b/examples/auto_deploy/model_registry/configs/qwen3.5_moe_35b.yaml
+@@ -29,3 +29,5 @@ transforms:
+     enabled: true
+   gather_logits_before_lm_head:
+     enabled: true
++  compile_model:
++    piecewise_enabled: true
+diff --git a/examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml b/examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml
+index 49ced4dbc508..269cab8db9f4 100644
+--- a/examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml
++++ b/examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml
+@@ -29,3 +29,5 @@ transforms:
+     enabled: true
+   gather_logits_before_lm_head:
+     enabled: true
++  compile_model:
++    piecewise_enabled: true
+diff --git a/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py b/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
+index 5405a4a173c5..46b35cc7b211 100644
+--- a/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
++++ b/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
+@@ -10,8 +10,8 @@
+ """
+ 
+ import copy  # noqa: I001
+-import operator
+-from typing import Any, Callable, Dict, List, Optional, Tuple
++import gc
++from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+ 
+ import torch
+ import torch.nn as nn
+@@ -25,52 +25,15 @@
+ from ...utils.cuda_graph import CudaGraphWarmUpPhase
+ from ...utils.logger import ad_logger
+ from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
+-from ..piecewise_runner import ADPiecewiseRunner
+-from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops
+-
+-
+-# Trivial FX ops that are metadata-only or typically no-ops — used to identify
+-# static segments with no meaningful GPU compute (e.g., between adjacent dynamic ops).
+-# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
+-# tensors, dtype/device casts), but in practice these appear only as lightweight
+-# plumbing in empty partitions.
+-_TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
+-_TRIVIAL_CALL_METHODS = {
+-    "view",
+-    "reshape",
+-    "contiguous",
+-    "permute",
+-    "transpose",
+-    "unsqueeze",
+-    "squeeze",
+-    "expand",
+-    "size",
+-    "dim",
+-    "to",
+-}
+-
+-
+-def _submod_has_cuda_ops(submod: nn.Module) -> bool:
+-    """Check if a submodule has ops beyond those in _TRIVIAL_CALL_FUNCTIONS/METHODS."""
+-    if not isinstance(submod, GraphModule):
+-        return True  # Conservative: non-FX modules assumed to have GPU ops
+-
+-    for node in submod.graph.nodes:
+-        if node.op == "call_module":
+-            # nn.Module calls (Linear, LayerNorm, etc.) launch CUDA kernels
+-            return True
+-        if node.op == "call_function":
+-            if node.target in _TRIVIAL_CALL_FUNCTIONS:
+-                continue
+-            # Any non-trivial call_function is potentially a CUDA op
+-            return True
+-        if node.op == "call_method":
+-            if node.target in _TRIVIAL_CALL_METHODS:
+-                continue
+-            # Non-trivial method call — could launch a kernel
+-            return True
+-
+-    return False
++from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
++from ..piecewise_utils import (
++    SplitInfo,
++    is_dynamic_cached_op,
++    is_metadata_prep,
++    needs_out_buffer,
++    split_graph_at_dynamic_ops,
++    submod_has_cuda_ops,
++)
+ 
+ 
+ def _args_kwargs_flatten_spec(in_spec: TreeSpec, *args, **kwargs) -> List[Any]:
+@@ -85,6 +48,62 @@ def _args_kwargs_flatten(*args, **kwargs) -> Tuple[List[Any], TreeSpec]:
+     return tree_flatten(all_args)
+ 
+ 
++def _coalesce_output(
++    op_result: Optional[torch.Tensor], out: Optional[torch.Tensor]
++) -> torch.Tensor:
++    """Pick the pre-allocated ``out`` buffer when available, else the op's return."""
++    return out if out is not None else op_result
++
++
++def _inject_out_param(submod: GraphModule) -> None:
++    """Rewrite a dynamic submodule's FX graph to accept and forward an ``out`` kwarg.
++
++    Adds an ``out`` placeholder (default ``None``) and wires it as a kwarg to
++    the dynamic custom-op ``call_function`` node.  Because custom ops must not
++    return a tensor that aliases an input, the op returns a 0-element dummy
++    tensor when ``out`` is provided.  A ``_coalesce_output`` node is inserted
++    after the op call to select ``out`` (the mutated buffer) over the dummy.
++    """
++    graph = submod.graph
++
++    last_placeholder = None
++    for node in graph.nodes:
++        if node.op == "placeholder":
++            last_placeholder = node
++        else:
++            break
++
++    assert last_placeholder is not None, (
++        "_inject_out_param: no placeholder nodes found — dynamic partition should have inputs"
++    )
++
++    target_node = None
++    for node in graph.nodes:
++        if node.op == "call_function" and is_dynamic_cached_op(node):
++            target_node = node
++            break
++
++    assert target_node is not None, (
++        "_inject_out_param: no dynamic cached op found — partition was classified as dynamic"
++    )
++
++    with graph.inserting_after(last_placeholder):
++        out_placeholder = graph.placeholder("out", default_value=None)
++
++    target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
++
++    with graph.inserting_after(target_node):
++        coalesce_node = graph.call_function(_coalesce_output, args=(target_node, out_placeholder))
++
++    for user in list(target_node.users):
++        if user is not coalesce_node:
++            user.replace_input_with(target_node, coalesce_node)
++
++    # Validate graph structure, then regenerate forward() from the modified graph
++    graph.lint()
++    submod.recompile()
++
++
+ class CapturedGraph(nn.Module):
+     def __init__(
+         self,
+@@ -230,23 +249,32 @@ class PiecewiseCapturedGraph(nn.Module):
+ 
+     The model is split at dynamic op boundaries (attention, SSM, conv, delta).
+     Static segments are wrapped in ADPiecewiseRunner for CUDA graph capture.
+-    Dynamic segments run eagerly. The split_gm orchestrates the flow.
++    Non-inplace dynamic ops are wrapped in DynamicOpWrapper, which passes a
++    pre-allocated output buffer (out=) from the preceding static runner's graph pool.
++    Metadata-prep ops are wrapped in MetadataWrapper to keep their output
++    addresses stable across capture and replay (prevents CUDA graph crashes).
++    Inplace dynamic ops (see _INPLACE_DYNAMIC_OPS) run eagerly without wrapping.
+     """
+ 
+     def __init__(
+         self,
+         model: nn.Module,
+         piecewise_num_tokens: Optional[List[int]] = None,
++        capture_lm_head: bool = False,
++        max_batch_size: Optional[int] = None,
+     ):
+         super().__init__()
+         self.original_model = model
+         self.piecewise_num_tokens = piecewise_num_tokens or []
++        self.capture_lm_head = capture_lm_head
++        self.max_batch_size = max_batch_size
+         self.split_info: Optional[SplitInfo] = None
+         self.split_gm: Optional[GraphModule] = None
+         self._is_prepared = False
++        self._wrapped_dynamic_indices: Set[int] = set()
+ 
+     def prepare(self) -> None:
+-        """Prepare the piecewise graph: swap to inplace ops, split, wrap static segments."""
++        """Split the model, wrap static segments in runners, wrap Group 3 dynamic ops."""
+         if self._is_prepared:
+             return
+ 
+@@ -260,49 +288,173 @@ def prepare(self) -> None:
+             self._is_prepared = True
+             return
+ 
+-        # Create a new GraphModule that shares all parameters/buffers/submodules
+-        # with the original (zero-copy) but has its OWN copy of the FX graph
+-        # (so split_graph_at_dynamic_ops mutations don't affect the original).
+         gm = GraphModule(model, copy.deepcopy(model.graph))
+ 
+-        # Split graph at dynamic op boundaries
+         self.split_info = split_graph_at_dynamic_ops(gm)
+         self.split_gm = self.split_info.split_gm
+ 
+-        # Skip trivial submodules that have no CUDA ops (only contain getitem/reshape plumbing).
+-        # Capturing these as CUDA graphs produces empty graphs and triggers PyTorch warnings.
+-        # Create a shared pool upfront so all runners share memory allocations.
+         graph_pool = torch.cuda.graph_pool_handle()
+-        num_wrapped = 0
+-        num_skipped = 0
+-        for idx in self.split_info.static_submod_indices:
++        num_wrapped_static = 0
++        num_skipped_static = 0
++        num_wrapped_dynamic = 0
++
++        # Phase 1: wrap static segments in ADPiecewiseRunner
++        # Track which indices got a runner so we can link dynamic ops later.
++        #
++        # Optionally exclude the trailing static partition (final_norm + lm_head)
++        # from capture.  The lm_head produces a [num_tokens, vocab_size] output
++        # whose graph-pool cost is enormous (e.g. 4-6 GiB at nt=8192 for 256K
++        # vocab).  Excluding it lets that partition run eagerly, matching the
++        # PyTorch backend's piecewise behaviour.
++        static_indices = list(self.split_info.static_submod_indices)
++        if (
++            not self.capture_lm_head
++            and static_indices
++            and self.split_info.dynamic_submod_indices
++            and static_indices[-1] > max(self.split_info.dynamic_submod_indices)
++        ):
++            trailing_idx = static_indices.pop()
++            ad_logger.info(
++                "PiecewiseCapturedGraph: excluding trailing static submod_%d "
++                "(lm_head) from capture — will run eagerly",
++                trailing_idx,
++            )
++
++        runner_by_idx: Dict[int, ADPiecewiseRunner] = {}
++        for idx in static_indices:
+             submod_name = f"submod_{idx}"
+-            if hasattr(self.split_gm, submod_name):
+-                original_submod = getattr(self.split_gm, submod_name)
++            if not hasattr(self.split_gm, submod_name):
++                continue
++            original_submod = getattr(self.split_gm, submod_name)
+ 
+-                if not _submod_has_cuda_ops(original_submod):
+-                    ad_logger.info(
+-                        f"PiecewiseCapturedGraph: skipping {submod_name} "
+-                        f"(no CUDA ops, will run eagerly)"
+-                    )
+-                    num_skipped += 1
++            if not submod_has_cuda_ops(original_submod):
++                ad_logger.info(
++                    "PiecewiseCapturedGraph: skipping %s (no CUDA ops, will run eagerly)",
++                    submod_name,
++                )
++                num_skipped_static += 1
++                continue
++
++            runner = ADPiecewiseRunner(
++                submodule=original_submod,
++                graph_pool=graph_pool,
++            )
++            setattr(self.split_gm, submod_name, runner)
++            runner_by_idx[idx] = runner
++            num_wrapped_static += 1
++
++        # Phase 2: wrap dynamic ops.
++        # - Metadata-prep ops → MetadataWrapper (stable output addresses)
++        # - Attention/SSM/delta/logits → DynamicOpWrapper (out= pre-alloc)
++        # - Inplace ops (e.g. conv) → left unwrapped (mutate input, return None)
++        # Iterate over all actual submod indices in order (not range(N), because
++        # indices are partition IDs that may have gaps from empty partitions).
++        dynamic_set = set(self.split_info.dynamic_submod_indices)
++        all_submod_indices = sorted(
++            self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
++        )
++        current_static_runner: Optional[ADPiecewiseRunner] = None
++        num_metadata_wrapped = 0
++        for idx in all_submod_indices:
++            if idx in runner_by_idx:
++                current_static_runner = runner_by_idx[idx]
++            elif idx in dynamic_set:
++                submod_name = f"submod_{idx}"
++                if not hasattr(self.split_gm, submod_name):
++                    continue
++                submod = getattr(self.split_gm, submod_name)
++
++                if not needs_out_buffer(submod):
++                    if is_metadata_prep(submod):
++                        wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
++                        setattr(self.split_gm, submod_name, wrapper)
++                        num_metadata_wrapped += 1
++                        ad_logger.info(
++                            "PiecewiseCapturedGraph: wrapped %s in "
++                            "MetadataWrapper (stable output addresses)",
++                            submod_name,
++                        )
+                     continue
+ 
+-                runner = ADPiecewiseRunner(
+-                    submodule=original_submod,
+-                    piecewise_num_tokens=self.piecewise_num_tokens,
+-                    graph_pool=graph_pool,
++                assert current_static_runner is not None, (
++                    f"Dynamic {submod_name} has no preceding static runner — "
++                    f"cannot allocate out= buffer for stable output addresses"
+                 )
+-                setattr(self.split_gm, submod_name, runner)
+-                num_wrapped += 1
++
++                _inject_out_param(submod)
++                wrapper = DynamicOpWrapper(
++                    submod,
++                    preceding_runner=current_static_runner,
++                    dynamic_submod_id=idx,
++                )
++                setattr(self.split_gm, submod_name, wrapper)
++                self._wrapped_dynamic_indices.add(idx)
++                num_wrapped_dynamic += 1
+ 
+         self._is_prepared = True
+         ad_logger.info(
+-            f"PiecewiseCapturedGraph: prepared with "
+-            f"{self.split_info.num_submodules} submodules "
+-            f"({num_wrapped} wrapped for CUDA graph, {num_skipped} trivial skipped, "
+-            f"{len(self.split_info.dynamic_submod_indices)} dynamic eager), "
+-            f"piecewise_num_tokens={self.piecewise_num_tokens}"
++            "PiecewiseCapturedGraph: prepared with %d submodules "
++            "(%d static runners, %d trivial skipped, %d dynamic wrapped, "
++            "%d metadata wrapped, %d dynamic eager), piecewise_num_tokens=%s",
++            self.split_info.num_submodules,
++            num_wrapped_static,
++            num_skipped_static,
++            num_wrapped_dynamic,
++            num_metadata_wrapped,
++            len(self.split_info.dynamic_submod_indices)
++            - num_wrapped_dynamic
++            - num_metadata_wrapped,
++            self.piecewise_num_tokens,
++        )
++
++    def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
++        """Run one eager forward with hooks to discover output shapes of wrapped dynamic ops."""
++        discovered: Dict[int, OutputInfo] = {}
++
++        def _make_shape_hook(dynamic_idx: int):
++            def hook(module, hook_args, output):
++                if isinstance(output, torch.Tensor):
++                    discovered[dynamic_idx] = OutputInfo(
++                        shape=output.shape,
++                        dtype=output.dtype,
++                        device=output.device,
++                    )
++                else:
++                    ad_logger.warning(
++                        "Dynamic submod_%d returned %s (expected torch.Tensor), "
++                        "cannot pre-allocate output buffer",
++                        dynamic_idx,
++                        type(output).__name__,
++                    )
++
++            return hook
++
++        hooks: List[torch.utils.hooks.RemovableHandle] = []
++        for idx in self._wrapped_dynamic_indices:
++            wrapper = getattr(self.split_gm, f"submod_{idx}")
++            if isinstance(wrapper, DynamicOpWrapper):
++                h = wrapper.submodule.register_forward_hook(_make_shape_hook(idx))
++                hooks.append(h)
++
++        try:
++            self.split_gm(*args, **kwargs)
++        finally:
++            for h in hooks:
++                h.remove()
++
++        return discovered
++
++    def _set_dynamic_out_info_on_runners(self, discovered: Dict[int, OutputInfo]) -> None:
++        """Pass discovered output shapes to the preceding static runners."""
++        for dynamic_idx, info in discovered.items():
++            wrapper = getattr(self.split_gm, f"submod_{dynamic_idx}")
++            if isinstance(wrapper, DynamicOpWrapper):
++                wrapper.preceding_runner.set_dynamic_out_info(dynamic_idx, info)
++
++        missing = self._wrapped_dynamic_indices - set(discovered.keys())
++        assert not missing, (
++            f"Shape discovery did not capture outputs for dynamic submods: {sorted(missing)}. "
++            f"Cannot pre-allocate out= buffers — downstream static runners require stable addresses."
+         )
+ 
+     def warmup_and_capture(
+@@ -310,15 +462,17 @@ def warmup_and_capture(
+         get_args_kwargs: Callable[[int], Any],
+         warmup_iters: int = 3,
+     ) -> None:
+-        """Warmup and capture CUDA graphs for all configured num_tokens values.
+-
+-        Follows the same pattern as monolithic CapturedGraph._capture_one_graph:
+-        the orchestrator controls the warmup → capture transition explicitly.
+-
+-        Args:
+-            get_args_kwargs: Callable that takes num_tokens and returns (args, kwargs).
+-            warmup_iters: Number of eager warmup iterations before capture (default: 3,
+-                matching monolithic CapturedGraph._capture_one_graph).
++        """Warmup, discover dynamic output shapes, and capture CUDA graphs.
++
++        For each num_tokens bucket (largest first):
++          1. Warmup: run split_gm eagerly (warmup_iters - 1) times.
++          2. Shape discovery: on the LAST warmup iteration, install forward hooks
++             on wrapped dynamic ops to capture output shape/dtype.
++          3. Inform runners: pass discovered OutputInfo to each ADPiecewiseRunner
++             so it knows what to allocate inside its graph capture.
++          4. Capture: run split_gm once more; runners capture CUDA graphs and
++             allocate dynamic output buffers inside torch.cuda.graph().
++          5. Cleanup: gc.collect() + empty_cache() between buckets.
+         """
+         if not self._is_prepared:
+             self.prepare()
+@@ -326,54 +480,44 @@ def warmup_and_capture(
+         if self.split_gm is None:
+             return
+ 
+-        # Sort num_tokens in descending order (largest first for memory allocation)
+         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
+         for nt in num_tokens_list:
+-            ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
++            ad_logger.info("PiecewiseCapturedGraph: warming up for num_tokens=%d", nt)
+             args, kwargs = get_args_kwargs(nt)
+ 
+-            # Set the num_tokens context so ALL ADPiecewiseRunners use the correct value.
+-            # This is critical: in piecewise-split models, some submodules receive
+-            # intermediate tensors (SSM metadata, chunk indices) whose dim0 != num_tokens,
+-            # so inferring from arg shapes is unreliable.
+             ADPiecewiseRunner.set_current_num_tokens(nt)
+ 
+             with CudaGraphWarmUpPhase():
+                 ADPiecewiseRunner.set_current_phase("warmup")
+-                for _ in range(warmup_iters):
++                for _ in range(warmup_iters - 1):
+                     self.split_gm(*args, **kwargs)
+ 
+-                # Capture phase: capture CUDA graphs for all static segments
++                # Last warmup iteration: discover dynamic output shapes
++                if self._wrapped_dynamic_indices:
++                    discovered = self._discover_dynamic_output_shapes(args, kwargs)
++                    self._set_dynamic_out_info_on_runners(discovered)
++                else:
++                    self.split_gm(*args, **kwargs)
++
++                # Capture phase
+                 ADPiecewiseRunner.set_current_phase("capture")
+                 self.split_gm(*args, **kwargs)
+ 
+-            ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
++            ad_logger.info("PiecewiseCapturedGraph: captured graphs for num_tokens=%d", nt)
++
++            torch.cuda.synchronize()
++            gc.collect()
++            torch.cuda.empty_cache()
+ 
+-        # Clear contexts after warmup/capture phase
+         ADPiecewiseRunner.set_current_num_tokens(None)
+         ADPiecewiseRunner.set_current_phase("replay")
+ 
+     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
+-        """Forward pass through the piecewise graph.
+-
+-        Each submodule handles its own capture/replay:
+-        - Static submodules (ADPiecewiseRunner): replay CUDA graph if available
+-        - Dynamic submodules: run eagerly
+-
+-        Args:
+-            num_tokens: The total number of tokens in this batch. Must be provided
+-                by the caller (DualModeCapturedGraph) — we cannot reliably infer it
+-                from arg shapes because kwargs like input_ids may be [1, num_tokens]
+-                (shape[0]=1, not num_tokens) and the first kwarg might not be input_ids.
+-        """
++        """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
+         if self.split_gm is not None:
+-            # Set num_tokens context for all ADPiecewiseRunners.
+             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+-            result = self.split_gm(*args, **kwargs)
+-            return result
+-        else:
+-            # Fallback: model is not a GraphModule, run eagerly
+-            return self.original_model(*args, **kwargs)
++            return self.split_gm(*args, **kwargs)
++        return self.original_model(*args, **kwargs)
+ 
+ 
+ class DualModeCapturedGraph(nn.Module):
+@@ -454,6 +598,7 @@ def _find_nearest_bucket(self, num_tokens: int) -> Optional[int]:
+     def forward(self, *args, **kwargs) -> Any:
+         # NOTE: AD calls model(**named_args) so everything is in kwargs, args is empty
+         if self._is_decode_only(**kwargs):
++            ADPiecewiseRunner.set_current_num_tokens(None)
+             return self.monolithic(*args, **kwargs)
+ 
+         # ── PREFILL/MIXED PATH ──
+@@ -461,11 +606,13 @@ def forward(self, *args, **kwargs) -> Any:
+         bucket = self._find_nearest_bucket(num_tokens)
+         if bucket is not None:
+             result = self.piecewise(*args, num_tokens=bucket, **kwargs)
++            ADPiecewiseRunner.set_current_num_tokens(None)
+             if bucket > num_tokens:
+                 result = tuple(r[:, :num_tokens] if r.ndim >= 2 else r for r in result)
+             return result
+ 
+         # No bucket large enough -- eager fallback
++        ADPiecewiseRunner.set_current_num_tokens(None)
+         ad_logger.debug(
+             f"DualModeCapturedGraph: num_tokens={num_tokens} exceeds largest bucket "
+             f"{self._captured_num_tokens_sorted[-1] if self._captured_num_tokens_sorted else 'N/A'}"
+@@ -583,6 +730,11 @@ def get_args_kwargs_warmup(batch_size: int):
+             piecewise = PiecewiseCapturedGraph(
+                 model=self.model,
+                 piecewise_num_tokens=self.piecewise_num_tokens,
++                max_batch_size=(
++                    self.piecewise_seq_info.max_batch_size
++                    if self.piecewise_seq_info is not None
++                    else None
++                ),
+             )
+             piecewise.prepare()
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_runner.py b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_runner.py
+index 6540796a9d59..96ca79e0b9be 100644
+--- a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_runner.py
++++ b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_runner.py
+@@ -1,4 +1,19 @@
+-"""ADPiecewiseRunner: manages warmup → capture → replay for a single static CUDA graph segment.
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""ADPiecewiseRunner: manages warmup -> capture -> replay for a single static CUDA graph segment.
+ 
+ Each static submodule in a piecewise-split model is wrapped in an ADPiecewiseRunner.
+ The runner's behavior is controlled by two class-level contexts set by the orchestrator
+@@ -8,351 +23,447 @@
+   - `_current_num_tokens`: identifies which bucket entry to use
+ 
+ Phase semantics:
+-  1. WARMUP: Run the submodule eagerly. (Data-ptr tracking runs but is NOT relied on
+-     for correctness — see note on dynamic-index identification below.)
+-  2. CAPTURE: Capture the submodule as a CUDA graph. All non-weight tensor args are
+-     treated as dynamic. For those that came from a previous static runner (found in
+-     the _static_output_registry), we reuse the same buffer (zero-copy). Others
+-     (model inputs, dynamic-segment outputs) are referenced directly and refreshed
+-     via _prepare_replay_inputs during replay.
+-  3. REPLAY: Copy only dynamic inputs into the static buffers, then replay the
+-     captured graph.
+-
+-Dynamic-index identification:
+-  We do NOT rely on data_ptr() change detection during warmup, because PyTorch's
+-  caching allocator can reuse the same address for activation tensors across warmup
+-  iterations, making them falsely appear "static." Instead, we mark ALL non-weight
+-  tensor args as dynamic. Weights/buffers are identified by matching against
+-  data_ptrs collected from `submodule.parameters()` and `submodule.buffers()`.
+-
+-Each runner maintains entries keyed by `num_tokens`.
++  1. WARMUP: Run the submodule eagerly (multiple iterations to stabilize allocator state).
++  2. CAPTURE: Capture the submodule as a CUDA graph.  If this runner is linked to
++     following dynamic ops (via set_dynamic_out_info), also allocate each dynamic
++     op's output buffer *inside* the graph capture so it gets a deterministic
++     address from the shared graph pool.
++  3. REPLAY: Replay the captured CUDA graph.  Each DynamicOpWrapper retrieves its
++     own pre-allocated output buffer via get_dynamic_out_buf(nt, submod_id).
++
++MetadataWrapper: wraps metadata-prep dynamic ops whose outputs flow into
++  subsequent CUDA-graph-captured static segments.  These ops (e.g.
++  mamba_ssm_prepare_metadata) run eagerly every time and allocate fresh output
++  tensors.  After torch.cuda.empty_cache() between capture and runtime, the
++  allocator hands out different addresses, breaking the CUDA graph's recorded
++  pointers.  The wrapper clones outputs during capture and copy_()s new data
++  into those stable buffers on replay, preserving addresses at negligible cost
++  (metadata tensors are tiny, e.g. two int32 [1024] ≈ 8 KB).
++
++Memory:
++  All model-level inputs (input_ids, position_ids, etc.) come from SequenceInfo's
++  InputBuffer, which provides stable addresses across calls.  Dynamic op outputs are
++  pre-allocated inside graph captures from a shared pool, giving deterministic addresses.
++  Both static_output and dynamic_out_bufs are weak-ref'd via make_weak_ref, allowing the
++  graph pool to recycle memory across layers.  No copy-back mechanism needed.
+ """
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+ import torch
+ import torch.nn as nn
+-from torch.utils._pytree import tree_flatten, tree_unflatten
++from torch.utils._pytree import tree_flatten
++
++from tensorrt_llm._torch.utils import make_weak_ref
+ 
+ from ..utils.logger import ad_logger
+ 
+ 
++@dataclass
++class OutputInfo:
++    """Metadata about a dynamic op's output, discovered during warmup."""
++
++    shape: torch.Size
++    dtype: torch.dtype
++    device: torch.device
++
++
+ @dataclass
+ class SegmentEntry:
+     """State for a single (num_tokens) configuration of a segment."""
+ 
+     cuda_graph: Optional[torch.cuda.CUDAGraph] = None
+-    # Static input list — each element is a direct reference to a tensor at a fixed address.
+-    # During replay, _prepare_replay_inputs refreshes activation buffers as needed.
+-    #
+-    # Three categories:
+-    # - Weight tensors: referenced directly (already at fixed addresses, never change).
+-    # - Activation tensors from a previous static runner's output: reused from the
+-    #   static output registry. During replay the previous runner's CUDA graph writes to
+-    #   the same address, so _prepare_replay_inputs skips the copy (zero-copy).
+-    # - Activation tensors from model inputs or dynamic segment outputs: referenced
+-    #   directly from the capture iteration. During replay, the dynamic segment produces
+-    #   output at a new address, so _prepare_replay_inputs copies into this buffer.
+-    static_inputs: Optional[List[Any]] = None
+-    # Indices of dynamic (activation) tensor args that need copy during replay
+-    dynamic_indices: Optional[Set[int]] = None
+-    # Static output — the output tensor(s) produced during capture.
+-    # During replay, the CUDA graph writes to the same addresses, so returning
+-    # this object gives the caller the updated data.
+     static_output: Any = None
+-    # Tracks data_ptr() of tensor args during warmup to identify static vs dynamic
+-    _warmup_data_ptrs: Optional[List[Optional[int]]] = None
++    # Keyed by dynamic submodule index → pre-allocated output buffer
++    dynamic_out_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
++    input_addresses: List[Optional[int]] = field(default_factory=list)
++
++
++_METADATA_PAD_ALIGN = 64
++_MAMBA_METADATA_OP_NAME = "mamba_ssm_prepare_metadata"
++
++
++def _contains_mamba_metadata_prep(submodule: nn.Module) -> bool:
++    graph = getattr(submodule, "graph", None)
++    if graph is None:
++        return False
++    for node in graph.nodes:
++        if node.op != "call_function":
++            continue
++        target = node.target
++        name = target.name() if hasattr(target, "name") else str(target)
++        if _MAMBA_METADATA_OP_NAME in name:
++            return True
++    return False
++
++
++def _align_up(value: int, align: int) -> int:
++    if align <= 1:
++        return value
++    return ((value + align - 1) // align) * align
++
++
++def _alloc_stable_metadata_tensor(
++    tensor: torch.Tensor,
++    num_tokens: int,
++    max_batch_size: int,
++    pad_for_mamba_metadata: bool,
++) -> torch.Tensor:
++    """Allocate one stable metadata tensor with optional Mamba headroom."""
++    if tensor.ndim == 0:
++        return tensor.clone()
++
++    # Only Mamba metadata prep has known runtime growth beyond capture shape
++    # due to misaligned sequence boundaries.
++    extra = max(0, max_batch_size - 1) if pad_for_mamba_metadata else 0
++
++    if tensor.ndim == 1:
++        padded_len = _align_up(tensor.shape[0] + extra, _METADATA_PAD_ALIGN)
++        buf = torch.zeros((padded_len,), dtype=tensor.dtype, device=tensor.device)
++        buf[: tensor.shape[0]].copy_(tensor)
++        return buf
++
++    # Common metadata shape: [1, N] (e.g., seq_idx_prefill). Grow only token dim.
++    if tensor.ndim == 2 and tensor.shape[0] == 1:
++        padded_len = min(
++            _align_up(tensor.shape[1] + extra, _METADATA_PAD_ALIGN),
++            _align_up(max(num_tokens, tensor.shape[1]), _METADATA_PAD_ALIGN),
++        )
++        buf = torch.zeros((1, padded_len), dtype=tensor.dtype, device=tensor.device)
++        buf[:, : tensor.shape[1]].copy_(tensor)
++        return buf
++
++    # Fallback: only grow the leading dimension.
++    padded_shape = list(tensor.shape)
++    padded_shape[0] = _align_up(tensor.shape[0] + extra, _METADATA_PAD_ALIGN)
++    buf = torch.zeros(tuple(padded_shape), dtype=tensor.dtype, device=tensor.device)
++    slices = (slice(0, tensor.shape[0]),) + tuple(slice(None) for _ in range(tensor.ndim - 1))
++    buf[slices].copy_(tensor)
++    return buf
++
++
++def _alloc_stable_metadata_result(
++    result: Any,
++    num_tokens: int,
++    max_batch_size: int,
++    pad_for_mamba_metadata: bool,
++) -> Tuple[torch.Tensor, ...]:
++    if isinstance(result, torch.Tensor):
++        return (
++            _alloc_stable_metadata_tensor(
++                result, num_tokens, max_batch_size, pad_for_mamba_metadata
++            ),
++        )
++    if isinstance(result, (tuple, list)):
++        return tuple(
++            _alloc_stable_metadata_tensor(t, num_tokens, max_batch_size, pad_for_mamba_metadata)
++            if isinstance(t, torch.Tensor)
++            else t
++            for t in result
++        )
++    return ()
++
++
++class MetadataWrapper(nn.Module):
++    """Wraps a metadata-prep dynamic op to give its outputs stable addresses.
++
++    Metadata-prep ops (e.g. mamba_ssm_prepare_metadata) run eagerly and return
++    freshly allocated tensors.  After torch.cuda.empty_cache(), those addresses
++    change, which breaks any downstream CUDA graph that captured them.
++
++    Fix: on the capture pass we allocate stable buffers larger than the observed
++    capture output when wrapping Mamba metadata prep
++    (auto_deploy::mamba_ssm_prepare_metadata). For this op, runtime output can
++    exceed capture output by up to (max_batch_size - 1) due to extra logical
++    chunks from misaligned sequence boundaries in multi-sequence batches.
++    On replay we copy_() the real results into those stable buffers and return
++    the full padded tensors — same address and shape as capture time.
++    Downstream dynamic ops determine how much to read from batch metadata
++    (cu_seqlens, batch_info_host), so extra zeros are never accessed.
++    """
++
++    def __init__(self, submodule: nn.Module, max_batch_size: Optional[int] = None):
++        super().__init__()
++        self.submodule = submodule
++        self.max_batch_size = (
++            max_batch_size if max_batch_size is not None and max_batch_size > 0 else 1
++        )
++        self._pad_for_mamba_metadata = _contains_mamba_metadata_prep(submodule)
++        # {num_tokens: tuple of stable output tensors (sized to bucket upper bound)}
++        self._stable_outputs: Dict[int, Tuple[torch.Tensor, ...]] = {}
++
++    def forward(self, *args, **kwargs) -> Any:
++        nt = ADPiecewiseRunner._current_num_tokens
++        phase = ADPiecewiseRunner._current_phase
++
++        result = self.submodule(*args, **kwargs)
++
++        if nt is None or phase == "warmup":
++            return result
++
++        if phase == "capture":
++            padded = self._alloc_padded(result, nt)
++            self._stable_outputs[nt] = padded
++            return self._rebuild_result(result, padded)
++
++        # replay
++        saved = self._stable_outputs.get(nt)
++        if saved is None:
++            return result
++        self._copy_into_saved(result, saved)
++        return self._rebuild_result(result, saved)
++
++    def _alloc_padded(self, result: Any, num_tokens: int) -> Tuple[torch.Tensor, ...]:
++        return _alloc_stable_metadata_result(
++            result=result,
++            num_tokens=num_tokens,
++            max_batch_size=self.max_batch_size,
++            pad_for_mamba_metadata=self._pad_for_mamba_metadata,
++        )
++
++    @staticmethod
++    def _copy_into_saved(result: Any, saved: Tuple[torch.Tensor, ...]) -> None:
++        items = (result,) if isinstance(result, torch.Tensor) else result
++        for real, stable in zip(items, saved):
++            if not isinstance(real, torch.Tensor) or not isinstance(stable, torch.Tensor):
++                continue
++            if real.shape == stable.shape:
++                stable.copy_(real)
++            else:
++                stable.zero_()
++                slices = tuple(slice(0, s) for s in real.shape)
++                stable[slices].copy_(real)
++
++    @staticmethod
++    def _rebuild_result(original: Any, saved: Tuple[torch.Tensor, ...]) -> Any:
++        """Return saved tensors in the same container type as the original.
++
++        The saved tensors are returned at their full (padded) shape — no
++        truncation.  Downstream static CUDA graph segments record this padded
++        shape at capture time and replay with the same shape.  Dynamic ops
++        (SSM kernels) determine how much to read from batch_info / cu_seqlens,
++        so extra zero-padded elements are never accessed.
++        """
++        if isinstance(original, torch.Tensor):
++            return saved[0]
++        if isinstance(original, tuple):
++            return tuple(saved)
++        if isinstance(original, list):
++            return list(saved)
++        return saved
+ 
+ 
+ class ADPiecewiseRunner(nn.Module):
+     """Wraps a static submodule and manages its CUDA graph capture/replay.
+ 
+     Behavior is controlled by two class-level contexts set by the orchestrator:
+-      - `_current_phase`: "warmup" (eager + ptr tracking), "capture" (CUDA graph
+-        capture), or "replay" (graph replay / eager fallback at runtime)
++      - `_current_phase`: "warmup" (eager), "capture" (CUDA graph capture),
++        or "replay" (graph replay / eager fallback at runtime)
+       - `_current_num_tokens`: identifies which bucket entry to use
+ 
+-    If `num_tokens` doesn't match any pre-configured bucket, falls back to eager.
+-    Bucket resolution (nearest bucket >= real token count) is handled upstream by
+-    DualModeCapturedGraph, so the runner always sees an exact bucket value.
++    If `num_tokens` doesn't match any captured bucket, falls back to eager.
++
++    No copy-back is needed because:
++      - Model-level inputs come from InputBuffer (stable addresses).
++      - Dynamic op outputs are pre-allocated in the shared graph pool
++        (deterministic addresses on replay).
++      - Weights are inherently at fixed addresses.
+     """
+ 
+-    # Class-level contexts: the orchestrator sets these before each split_gm forward pass
+-    # so ALL runners in the graph use the same correct num_tokens and phase.
+     _current_num_tokens: Optional[int] = None
+-    _current_phase: str = "replay"  # "warmup", "capture", or "replay"
+-
+-    # Class-level registry of output tensors produced during CUDA graph capture.
+-    # Key: (num_tokens, data_ptr) -> output tensor at a fixed address.
+-    # During capture, a runner checks if any of its activation inputs match a
+-    # registered output (by data_ptr). If so, it references that buffer directly —
+-    # enabling zero-copy during replay (the producer's graph writes, the consumer's
+-    # graph reads, same address).
+-    # Note: runners capture in sequential order, so all registry entries are from
+-    # earlier runners — no need to track runner_id.
+-    _static_output_registry: Dict[Tuple[int, int], torch.Tensor] = {}
++    _current_phase: str = "replay"
+ 
+     @classmethod
+     def set_current_num_tokens(cls, num_tokens: Optional[int]) -> None:
+-        """Set the current num_tokens context for all runners.
+-
+-        Called by PiecewiseCapturedGraph before each forward pass through the split graph.
+-        """
+         cls._current_num_tokens = num_tokens
+ 
+     @classmethod
+     def set_current_phase(cls, phase: str) -> None:
+-        """Set the current execution phase for all runners.
+-
+-        Called by PiecewiseCapturedGraph to control warmup → capture → replay transitions.
+-        Valid phases: "warmup", "capture", "replay".
+-        """
+         assert phase in ("warmup", "capture", "replay"), f"Invalid phase: {phase}"
+         cls._current_phase = phase
+ 
+-    @classmethod
+-    def clear_static_output_registry(cls) -> None:
+-        """Clear the static output registry.
+-
+-        Called when switching between different graph configurations or resetting state.
+-        """
+-        cls._static_output_registry.clear()
+-
+     def __init__(
+         self,
+         submodule: nn.Module,
+-        piecewise_num_tokens: Optional[List[int]] = None,
+         graph_pool: Optional[Tuple[int, ...]] = None,
+     ):
+         super().__init__()
+         self.submodule = submodule
+         self._graph_pool = graph_pool
+ 
+-        # Collect data_ptrs of all parameters and buffers in this submodule.
+-        # These are weight tensors with stable addresses that NEVER need copying.
+-        # Everything else that appears in flat_args is a cross-partition activation
+-        # (from a previous static runner or a dynamic segment) and must be treated
+-        # as dynamic for correctness during CUDA graph replay.
+         self._weight_ptrs: Set[int] = set()
+         for p in submodule.parameters():
+             self._weight_ptrs.add(p.data_ptr())
+         for b in submodule.buffers():
+             self._weight_ptrs.add(b.data_ptr())
+ 
+-        # Pre-populate entries for each bucket size
+         self.entries: Dict[int, SegmentEntry] = {}
+-        if piecewise_num_tokens:
+-            for nt in piecewise_num_tokens:
+-                self.entries[nt] = SegmentEntry()
++        # Keyed by dynamic submodule index → OutputInfo discovered during warmup
++        self._next_dynamic_out_infos: Dict[int, OutputInfo] = {}
+ 
+-    def _find_entry(self, num_tokens: int) -> Optional[SegmentEntry]:
+-        """Find the SegmentEntry for the given num_tokens.
++    def set_dynamic_out_info(self, dynamic_submod_id: int, info: OutputInfo) -> None:
++        """Set the output shape/dtype for a dynamic op that follows this runner.
+ 
+-        Expects an exact match — bucket resolution (nearest bucket >= real token count)
+-        is handled upstream by DualModeCapturedGraph._find_nearest_bucket before
+-        num_tokens reaches the runner.
++        Called by the orchestrator after shape discovery.  The runner will allocate
++        a buffer of this shape inside torch.cuda.graph() during capture.
+ 
+-        Returns None if num_tokens doesn't match any pre-configured bucket (eager fallback).
++        Args:
++            dynamic_submod_id: Index of the dynamic submodule in the split graph.
++            info: Output metadata (shape, dtype, device) discovered during warmup.
+         """
+-        return self.entries.get(num_tokens)
++        self._next_dynamic_out_infos[dynamic_submod_id] = info
+ 
+-    def _track_warmup_ptrs(self, entry: SegmentEntry, flat_args: List[Any]) -> None:
+-        """Track data_ptr() during warmup to identify static (weight) vs dynamic (activation) args.
++    def get_dynamic_out_buf(
++        self, num_tokens: int, dynamic_submod_id: int
++    ) -> Optional[torch.Tensor]:
++        """Retrieve the pre-allocated output buffer for a linked dynamic op.
+ 
+-        On the first warmup call, record all data_ptrs. On subsequent calls, mark args whose
+-        data_ptr changed as "dynamic" (by setting their tracked ptr to None).
+-        """
+-        if entry._warmup_data_ptrs is None:
+-            # First warmup: record all data_ptrs
+-            entry._warmup_data_ptrs = [
+-                a.data_ptr() if isinstance(a, torch.Tensor) else None for a in flat_args
+-            ]
+-        else:
+-            # Subsequent warmup: check for changes
+-            for i, a in enumerate(flat_args):
+-                if isinstance(a, torch.Tensor):
+-                    if (
+-                        entry._warmup_data_ptrs[i] is not None
+-                        and a.data_ptr() != entry._warmup_data_ptrs[i]
+-                    ):
+-                        # data_ptr changed → this is a dynamic (activation) tensor
+-                        entry._warmup_data_ptrs[i] = None
+-
+-    def _identify_dynamic_indices(self, entry: SegmentEntry, flat_args: List[Any]) -> Set[int]:
+-        """Mark all non-weight tensor args as dynamic.
+-
+-        Weight/buffer tensors (matched via _weight_ptrs) are static.
+-        Everything else is dynamic — the capture code will further check
+-        _static_output_registry for zero-copy reuse where possible.
+-        """
+-        dynamic_indices: Set[int] = set()
+-        for i, a in enumerate(flat_args):
+-            if not isinstance(a, torch.Tensor):
+-                continue
+-            if a.data_ptr() in self._weight_ptrs:
+-                continue  # Weight/buffer — stable address, no copy needed
+-            dynamic_indices.add(i)
+-        return dynamic_indices
+-
+-    def _prepare_replay_inputs(self, entry: SegmentEntry, flat_inputs: List[Any]) -> None:
+-        """Refresh dynamic activation buffers before CUDA graph replay.
+-
+-        For each dynamic tensor input, this copies runtime data into the captured
+-        static buffer unless both tensors already share the same data_ptr() (no-copy
+-        fast path, common for static segment chaining).
++        Returns the weak-ref'd buffer allocated during graph capture, or None
++        if shape discovery failed or this runner has no linked dynamic op.
+ 
+-        When runtime input is smaller than the bucketed static buffer (padding case),
+-        copy the valid prefix and clear the padded tail. Clearing avoids stale values
+-        from prior warmup/capture executions leaking into downstream ops.
++        Args:
++            num_tokens: Bucket size identifying the SegmentEntry.
++            dynamic_submod_id: Index of the dynamic submodule whose buffer to retrieve.
+         """
+-        for idx in entry.dynamic_indices:
+-            new_inp = flat_inputs[idx]
+-            static_inp = entry.static_inputs[idx]
+-
+-            if not isinstance(new_inp, torch.Tensor) or not isinstance(static_inp, torch.Tensor):
+-                continue
+-
+-            # Fast path: no copy needed when producer already wrote into the
+-            # captured static buffer (segment N output -> segment N+1 input).
+-            if new_inp.data_ptr() == static_inp.data_ptr():
+-                continue
+-
+-            if static_inp.shape == new_inp.shape:
+-                static_inp.copy_(new_inp, non_blocking=True)
+-            elif (
+-                new_inp.shape[0] < static_inp.shape[0] and new_inp.shape[1:] == static_inp.shape[1:]
+-            ):
+-                # Padded case: runtime input is smaller along dim 0.
+-                n = new_inp.shape[0]
+-                static_inp[:n].copy_(new_inp, non_blocking=True)
+-                static_inp[n:].zero_()
+-            elif (
+-                new_inp.ndim >= 2
+-                and new_inp.shape[1] < static_inp.shape[1]
+-                and new_inp.shape[0] == static_inp.shape[0]
+-            ):
+-                # Padded case: runtime input is smaller along dim 1
+-                # (e.g., [1, real, D] vs [1, bucket, D]).
+-                n = new_inp.shape[1]
+-                static_inp[:, :n].copy_(new_inp, non_blocking=True)
+-                static_inp[:, n:].zero_()
+-            else:
+-                # Fallback: shapes are incompatible — this is a real error
+-                static_inp.copy_(new_inp, non_blocking=True)
++        entry = self.entries.get(num_tokens)
++        if entry is None:
++            ad_logger.warning(
++                "ADPiecewiseRunner.get_dynamic_out_buf: no entry for "
++                "num_tokens=%d, dynamic_submod_id=%d.",
++                num_tokens,
++                dynamic_submod_id,
++            )
++            return None
++        buf = entry.dynamic_out_bufs.get(dynamic_submod_id)
++        if buf is None:
++            ad_logger.warning(
++                "ADPiecewiseRunner.get_dynamic_out_buf: no buffer for "
++                "num_tokens=%d, dynamic_submod_id=%d. Shape discovery may "
++                "have failed or this runner has no linked dynamic op.",
++                num_tokens,
++                dynamic_submod_id,
++            )
++            return None
++        return buf
+ 
+     def forward(self, *args, **kwargs) -> Any:
+-        # Use the class-level contexts set by the orchestrator
+         num_tokens = ADPiecewiseRunner._current_num_tokens
+         phase = ADPiecewiseRunner._current_phase
+-        entry = self._find_entry(num_tokens) if num_tokens is not None else None
+ 
+-        if entry is None:
+-            # Unknown num_tokens or exceeds all buckets — fallback to eager
++        if num_tokens is None:
+             return self.submodule(*args, **kwargs)
+ 
+-        # Flatten inputs once (used by all phases)
+-        flat_args, args_spec = tree_flatten((args, kwargs))
+-
+-        # --- WARMUP PHASE ---
++        # --- WARMUP ---
+         if phase == "warmup":
+-            # Track data_ptr() to distinguish weights from activations
+-            self._track_warmup_ptrs(entry, flat_args)
+             return self.submodule(*args, **kwargs)
+ 
+-        # --- CAPTURE PHASE ---
++        entry = self.entries.get(num_tokens)
++        if entry is None:
++            entry = SegmentEntry()
++            self.entries[num_tokens] = entry
++
++        # --- CAPTURE ---
+         if phase == "capture":
+-            ad_logger.debug(f"ADPiecewiseRunner: capturing CUDA graph for num_tokens={num_tokens}")
+-
+-            # Identify which args are dynamic (activations) vs static (weights)
+-            entry.dynamic_indices = self._identify_dynamic_indices(entry, flat_args)
+-
+-            # Build static_inputs list for this entry. Every element is a direct
+-            # reference (no cloning) — we just need each tensor at a persistent address.
+-            #
+-            # For activation tensors, we check the static output registry to find
+-            # outputs from previous static runners. During replay, those runners'
+-            # CUDA graphs write to the same address, so _prepare_replay_inputs can skip the
+-            # copy (zero-copy). All other activation tensors (model inputs, dynamic
+-            # segment outputs) are referenced directly from this capture iteration;
+-            # _prepare_replay_inputs will copy new data into them during replay.
+-            entry.static_inputs = []
+-            num_reused = 0
+-            num_referenced = 0
+-            for i, a in enumerate(flat_args):
+-                if isinstance(a, torch.Tensor) and i in entry.dynamic_indices:
+-                    # Check if this activation is a previous static runner's output
+-                    # (if so, record the registry reference for zero-copy during replay)
+-                    prev_output = ADPiecewiseRunner._static_output_registry.get(
+-                        (num_tokens, a.data_ptr())
+-                    )
+-                    if prev_output is not None:
+-                        entry.static_inputs.append(prev_output)
+-                        num_reused += 1
+-                    else:
+-                        # Model input or dynamic segment output — reference directly.
+-                        # During replay, _prepare_replay_inputs will copy new data into this buffer.
+-                        entry.static_inputs.append(a)
+-                else:
+-                    # Weight tensor — reference directly (fixed address, never changes)
+-                    entry.static_inputs.append(a)
+-                    if isinstance(a, torch.Tensor):
+-                        num_referenced += 1
+-
+-            # Unflatten back to get the static args/kwargs
+-            static_args_kwargs = tree_unflatten(entry.static_inputs, args_spec)
+-            static_args, static_kwargs = static_args_kwargs
+-
+-            # Capture
+             torch.cuda.synchronize()
+             graph = torch.cuda.CUDAGraph()
++
++            dynamic_out_bufs: Dict[int, torch.Tensor] = {}
+             with torch.cuda.graph(graph, pool=self._graph_pool):
+-                output = self.submodule(*static_args, **static_kwargs)
++                output = self.submodule(*args, **kwargs)
++                for submod_id, info in self._next_dynamic_out_infos.items():
++                    dynamic_out_bufs[submod_id] = torch.empty(
++                        info.shape, dtype=info.dtype, device=info.device
++                    )
+ 
+             torch.cuda.synchronize()
+ 
+-            # Fallback: if no pool was provided at construction time, store the
+-            # auto-created pool so subsequent captures within this runner reuse it.
+             if self._graph_pool is None:
+                 self._graph_pool = graph.pool()
+ 
+             entry.cuda_graph = graph
+-            entry.static_output = output
+-
+-            # Register outputs in the static output registry so next runners can reuse them
+-            flat_output, _ = tree_flatten(output)
+-            for out_tensor in flat_output:
+-                if isinstance(out_tensor, torch.Tensor):
+-                    ADPiecewiseRunner._static_output_registry[
+-                        (num_tokens, out_tensor.data_ptr())
+-                    ] = out_tensor
+-
+-            num_dynamic = len(entry.dynamic_indices) - num_reused
+-            ad_logger.debug(
+-                f"ADPiecewiseRunner: captured graph for num_tokens={num_tokens} — "
+-                f"{num_dynamic} dynamic activation buffers, "
+-                f"{num_reused} reused from previous static segments, "
+-                f"{num_referenced} weight tensors (zero-copy)"
+-            )
++            entry.static_output = make_weak_ref(output)
++            for submod_id, buf in dynamic_out_bufs.items():
++                entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
++
++            # Debug: record input addresses for assertion in replay
++            flat_args, _ = tree_flatten((args, kwargs))
++            entry.input_addresses = [
++                a.data_ptr() if isinstance(a, torch.Tensor) else None for a in flat_args
++            ]
+ 
+             return output
+ 
+-        # --- REPLAY PHASE ---
+-        # Copy only dynamic inputs into static buffers.
+-        # _prepare_replay_inputs skips copy if input is already at static buffer address
+-        # (common case: segment N's output is segment N+1's input, so addresses match)
+-        self._prepare_replay_inputs(entry, flat_args)
++        # --- REPLAY ---
++        if entry.cuda_graph is None:
++            return self.submodule(*args, **kwargs)
+ 
+-        # Replay the captured graph
+-        entry.cuda_graph.replay()
++        if entry.input_addresses and not getattr(entry, "_address_verified", False):
++            flat_args, _ = tree_flatten((args, kwargs))
++            mismatches = []
++            for i, (cap, cur_arg) in enumerate(zip(entry.input_addresses, flat_args)):
++                cur = cur_arg.data_ptr() if isinstance(cur_arg, torch.Tensor) else None
++                if cap != cur:
++                    desc = (
++                        f"shape={cur_arg.shape}, dtype={cur_arg.dtype}"
++                        if isinstance(cur_arg, torch.Tensor)
++                        else type(cur_arg).__name__
++                    )
++                    mismatches.append(f"  arg[{i}]: captured=0x{cap:x}, runtime=0x{cur:x} ({desc})")
++            if mismatches:
++                ad_logger.error(
++                    "ADPiecewiseRunner ADDRESS MISMATCH for nt=%d! %d/%d inputs changed:\n%s",
++                    num_tokens,
++                    len(mismatches),
++                    len(entry.input_addresses),
++                    "\n".join(mismatches),
++                )
++            entry._address_verified = True
+ 
++        entry.cuda_graph.replay()
+         return entry.static_output
+ 
+     @property
+     def graph_pool(self):
+-        """Return the CUDA graph memory pool (for sharing across runners)."""
+         return self._graph_pool
+ 
+     @graph_pool.setter
+     def graph_pool(self, pool):
+         self._graph_pool = pool
++
++
++class DynamicOpWrapper(nn.Module):
++    """Wraps a non-inplace dynamic op to pass out= from the preceding runner's graph pool.
++
++    During warmup, forwards without out= (normal allocation).
++    During capture/replay, retrieves the pre-allocated buffer from the linked
++    ADPiecewiseRunner and passes it as the ``out`` kwarg.
++    """
++
++    def __init__(
++        self,
++        submodule: nn.Module,
++        preceding_runner: ADPiecewiseRunner,
++        dynamic_submod_id: int,
++    ):
++        super().__init__()
++        self.submodule = submodule
++        self.preceding_runner = preceding_runner
++        self.dynamic_submod_id = dynamic_submod_id
++
++    def forward(self, *args, **kwargs) -> Any:
++        phase = ADPiecewiseRunner._current_phase
++        if phase == "warmup":
++            return self.submodule(*args, **kwargs)
++
++        nt = ADPiecewiseRunner._current_num_tokens
++        if nt is not None:
++            out_buf = self.preceding_runner.get_dynamic_out_buf(nt, self.dynamic_submod_id)
++            assert out_buf is not None, (
++                f"DynamicOpWrapper(submod_{self.dynamic_submod_id}): "
++                f"no pre-allocated out buffer for nt={nt}. "
++                f"Shape discovery may have failed — downstream static runners "
++                f"require stable output addresses."
++            )
++            kwargs["out"] = out_buf
++        return self.submodule(*args, **kwargs)
+diff --git a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
+index c5370f0aab8f..e4784a381659 100644
+--- a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
++++ b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
+@@ -1,14 +1,17 @@
+-"""Utilities for piecewise CUDA graph: graph splitting at dynamic op boundaries.
++"""Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
+ 
+ This module provides the logic to:
+ 1. Identify dynamic (uncapturable) custom ops in the FX graph (attention, SSM, conv, delta).
+-2. Split the FX GraphModule at those boundaries using torch.fx.passes.split_module.
+-3. Return the split GraphModule and metadata about which submodules are dynamic vs static.
++2. Classify dynamic submodules by behaviour (inplace, metadata-prep, needs out= buffer).
++3. Split the FX GraphModule at dynamic op boundaries using torch.fx.passes.split_module.
++4. Return the split GraphModule and metadata about which submodules are dynamic vs static.
+ """
+ 
++import operator
+ from dataclasses import dataclass, field
+ from typing import Dict, List, Set
+ 
++import torch.nn as nn
+ from torch.fx import GraphModule, Node
+ from torch.fx.passes.split_module import split_module
+ 
+@@ -59,7 +62,25 @@
+ 
+ # Logits gather ops (CPU branching on host tensor + shape-dependent logic)
+ _LOGITS_GATHER_OPS = [
+-    "auto_deploy::gather_logits_before_lm_head",
++    "auto_deploy::gather_tokens",
++]
++
++# Persistent-buffer dynamic ops: these ops produce outputs in pre-allocated
++# persistent buffers with stable addresses.  They must run eagerly (cannot be
++# captured in CUDA graphs due to CPU control flow / dynamic kernel grids),
++# but they do NOT need MetadataWrapper (addresses are already stable) or
++# DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
++_PERSISTENT_BUFFER_OPS = [
++    "auto_deploy::trtllm_attention_prepare_metadata",
++]
++
++# Inplace dynamic ops: these ops mutate their input tensor and return None,
++# so they do NOT produce a new output tensor and do NOT need an out= buffer.
++# This is a semantic property separate from _CACHED_CONV_OPS (which classifies
++# ops as dynamic/uncapturable).  Keep this list in sync when adding new inplace ops.
++_INPLACE_DYNAMIC_OPS = [
++    "auto_deploy::triton_cached_causal_conv1d",
++    "auto_deploy::cuda_cached_causal_conv1d",
+ ]
+ 
+ 
+@@ -72,6 +93,7 @@ def _get_all_dynamic_op_names() -> Set[str]:
+         + _CACHED_DELTA_OPS
+         + _METADATA_PREP_OPS
+         + _LOGITS_GATHER_OPS
++        + _PERSISTENT_BUFFER_OPS
+     )
+ 
+ 
+@@ -108,6 +130,105 @@ def is_dynamic_cached_op(node: Node) -> bool:
+     return False
+ 
+ 
++# ---------------------------------------------------------------------------
++# Partition classification: these constants and functions classify submodules
++# produced by piecewise splitting (trivial vs non-trivial, inplace, metadata-prep,
++# needs out= buffer).
++# ---------------------------------------------------------------------------
++
++# Trivial FX ops that are metadata-only or typically no-ops — used to identify
++# static partitions with no meaningful GPU compute (e.g., between adjacent dynamic ops).
++# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
++# tensors, dtype/device casts), but in practice these appear only as lightweight
++# plumbing in empty partitions.
++_TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
++_TRIVIAL_CALL_METHODS = {
++    "view",
++    "reshape",
++    "contiguous",
++    "permute",
++    "transpose",
++    "unsqueeze",
++    "squeeze",
++    "expand",
++    "size",
++    "dim",
++    "to",
++}
++
++
++def submod_has_cuda_ops(submod: nn.Module) -> bool:
++    """Check if a submodule has ops beyond trivial metadata/reshape operations."""
++    if not isinstance(submod, GraphModule):
++        return True  # Conservative: non-FX modules assumed to have GPU ops
++
++    for node in submod.graph.nodes:
++        if node.op == "call_module":
++            return True
++        if node.op == "call_function":
++            if node.target in _TRIVIAL_CALL_FUNCTIONS:
++                continue
++            return True
++        if node.op == "call_method":
++            if node.target in _TRIVIAL_CALL_METHODS:
++                continue
++            return True
++
++    return False
++
++
++_SKIP_OUT_DYNAMIC_OPS: Set[str] = (
++    set(_INPLACE_DYNAMIC_OPS)
++    | set(_METADATA_PREP_OPS)
++    | set(_LOGITS_GATHER_OPS)
++    | set(_PERSISTENT_BUFFER_OPS)
++)
++
++
++def needs_out_buffer(submod: nn.Module) -> bool:
++    """Return True if this dynamic submodule produces a NEW output tensor.
++
++    Inplace ops (mutate input, return None) don't produce new tensors.
++    Metadata prep ops are handled by MetadataWrapper (stable output addresses).
++    Both are skipped — only attention/SSM/delta/logits ops need out= buffers.
++    """
++    if not isinstance(submod, GraphModule):
++        return True
++
++    for node in submod.graph.nodes:
++        if node.op == "call_function" and is_dynamic_cached_op(node):
++            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
++            for skip_op in _SKIP_OUT_DYNAMIC_OPS:
++                if skip_op in op_name:
++                    return False
++                base_name = skip_op.split("::")[-1] if "::" in skip_op else skip_op
++                if base_name in op_name:
++                    return False
++    return True
++
++
++def is_metadata_prep(submod: nn.Module) -> bool:
++    """Return True if this dynamic submodule contains a metadata-prep op."""
++    if not isinstance(submod, GraphModule):
++        return False
++
++    for node in submod.graph.nodes:
++        if node.op == "call_function" and is_dynamic_cached_op(node):
++            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
++            for prep_op in _METADATA_PREP_OPS:
++                if prep_op in op_name:
++                    return True
++                base_name = prep_op.split("::")[-1] if "::" in prep_op else prep_op
++                if base_name in op_name:
++                    return True
++    return False
++
++
++# ---------------------------------------------------------------------------
++# Graph splitting
++# ---------------------------------------------------------------------------
++
++
+ @dataclass
+ class SplitInfo:
+     """Metadata about a split GraphModule."""
+@@ -180,36 +301,28 @@ def partition_fn(node: Node) -> int:
+         keep_original_order=True,
+     )
+ 
+-    # Analyze the split result to identify dynamic vs static submodules
++    # Analyze the split result to identify dynamic vs static submodules.
++    # split_module names submodules "submod_{partition_id}", so the name suffix
++    # IS the partition ID.  We classify each submodule directly by checking its
++    # partition ID against dynamic_partitions.  This avoids fragile alignment
++    # between partition_ids_in_order and submod_names (they can diverge when
++    # get_attr-only partitions exist in the original graph but split_module
++    # does not create submodules for them).
+     submod_names = []
+     for name, _ in split_gm.named_children():
+         if name.startswith("submod_"):
+             submod_names.append(name)
+ 
+-    # Sort by index
+     submod_names.sort(key=lambda n: int(n.split("_")[1]))
+ 
+-    # Build a mapping from partition ID to submod index
+-    # The split_module assigns submod_N names in order of first-seen partition IDs
+-    partition_ids_in_order = []
+-    seen = set()
+-    for node in gm.graph.nodes:
+-        if node.op in ("placeholder", "output"):
+-            continue
+-        pid = node_to_partition.get(node, 0)
+-        if pid not in seen:
+-            seen.add(pid)
+-            partition_ids_in_order.append(pid)
+-
+     dynamic_indices = []
+     static_indices = []
+-    for idx, pid in enumerate(partition_ids_in_order):
+-        if idx >= len(submod_names):
+-            break
++    for name in submod_names:
++        pid = int(name.split("_")[1])
+         if pid in dynamic_partitions:
+-            dynamic_indices.append(idx)
++            dynamic_indices.append(pid)
+         else:
+-            static_indices.append(idx)
++            static_indices.append(pid)
+ 
+     ad_logger.info(
+         f"Piecewise split: {len(submod_names)} submodules "
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/flashinfer_attention.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/flashinfer_attention.py
+index c9a449b29a61..c935116f2ddf 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/flashinfer_attention.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/flashinfer_attention.py
+@@ -318,7 +318,9 @@ def prepare_flashinfer_metadata_host(
+         )
+ 
+ 
+-@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
++@torch.library.custom_op(
++    "auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("kv_cache",)
++)
+ def flashinfer_mha_with_cache(
+     # Q, K, V
+     q: torch.Tensor,
+@@ -342,6 +344,8 @@ def flashinfer_mha_with_cache(
+     scale: Optional[float],
+     k_scale: float,
+     v_scale: float,
++    # OPTIONAL PRE-ALLOCATED OUTPUT
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
+     head_dim = kv_cache.shape[-1]
+@@ -381,10 +385,12 @@ def flashinfer_mha_with_cache(
+         kv_layout=_GlobalFlashInferPlanner.kv_layout,
+     )
+ 
+-    # Pre-allocate output as zeros so padding positions are clean
+-    y = torch.zeros_like(q)
++    bs = b * s
++    if out is not None:
++        y = out.view(-1, n_heads, head_dim)
++    else:
++        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
+ 
+-    # now run split prefill, decode
+     if num_prefill > 0:
+         q_prefill = q[:num_prefill_tokens]
+ 
+@@ -408,14 +414,14 @@ def flashinfer_mha_with_cache(
+             plan_params=pp_prefill,
+         )
+ 
+-        y_prefill = wrapper_prefill.run(
++        wrapper_prefill.run(
+             q_prefill,
+             kv_cache,
+             k_scale=k_scale,
+             v_scale=v_scale,
+             enable_pdl=get_env_enable_pdl(),
++            out=y[:num_prefill_tokens],
+         )
+-        y[:num_prefill_tokens] = y_prefill
+ 
+     if num_decode > 0:
+         q_decode = q[num_prefill_tokens:num_total_tokens]
+@@ -431,7 +437,6 @@ def flashinfer_mha_with_cache(
+             sm_scale=scale,
+         )
+ 
+-        # run the flashinfer planner and obtain the correct wrapper
+         wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
+             kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
+             kv_page_indices=cache_loc,
+@@ -439,14 +444,21 @@ def flashinfer_mha_with_cache(
+             plan_params=pp_decode,
+         )
+ 
+-        y_decode = wrapper_decode.run(
++        wrapper_decode.run(
+             q_decode,
+             kv_cache,
+             k_scale=k_scale,
+             v_scale=v_scale,
+             enable_pdl=get_env_enable_pdl(),
++            out=y[num_prefill_tokens:num_total_tokens],
+         )
+-        y[num_prefill_tokens:num_total_tokens] = y_decode
++
++    if out is not None:
++        # out is reused across CUDA graph replays with varying num_total_tokens,
++        # so stale data from prior replays can linger in the padding region.
++        if num_total_tokens < bs:
++            y[num_total_tokens:].zero_()
++        return out.new_empty(0)
+ 
+     return y.view(q_shape_og)
+ 
+@@ -475,7 +487,11 @@ def flashinfer_mha_with_cache_fake(
+     scale: Optional[float],
+     k_scale: float,
+     v_scale: float,
++    # OPTIONAL PRE-ALLOCATED OUTPUT
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return torch.empty_like(q.contiguous())
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/torch_backend_attention.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/torch_backend_attention.py
+index b55f72f54ba1..ae816f753d4d 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/torch_backend_attention.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/torch_backend_attention.py
+@@ -285,7 +285,9 @@ def _torch_context_mha(
+         out.copy_(torch.cat(attn_outputs, dim=0))
+ 
+ 
+-@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
++@torch.library.custom_op(
++    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
++)
+ def torch_backend_mha_with_cache(
+     # Q, K, V
+     q: torch.Tensor,
+@@ -309,6 +311,7 @@ def torch_backend_mha_with_cache(
+     sinks: Optional[torch.Tensor] = None,
+     sliding_window_size: Optional[int] = None,
+     logit_cap: Optional[float] = None,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Torch backend MHA with cache that takes q, k, v in BSND layout."""
+     # Get dimensions
+@@ -343,8 +346,8 @@ def torch_backend_mha_with_cache(
+ 
+     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
+ 
+-    # Preallocate output tensor (zeros so padding positions are clean)
+-    y = q.new_zeros(*bs_view, num_heads, v_head_dim).contiguous()
++    # Preallocate output tensor
++    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
+ 
+     # Compute attention
+     if s == 1:
+@@ -382,6 +385,20 @@ def torch_backend_mha_with_cache(
+             sinks,
+         )
+ 
++    num_total_tokens = num_prefill_tokens + num_decode
++    bs = b * s
++
++    if out is not None:
++        out_flat = out.view(*bs_view, num_heads, v_head_dim)
++        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
++        if num_total_tokens < bs:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
++    # Zero padding positions so downstream ops don't see garbage (piecewise CG)
++    if num_total_tokens < bs:
++        y[num_total_tokens:].zero_()
++
+     return y.view(*output_shape)
+ 
+ 
+@@ -409,7 +426,10 @@ def torch_backend_mha_with_cache_fake(
+     sinks: Optional[torch.Tensor] = None,
+     sliding_window_size: Optional[int] = None,
+     logit_cap: Optional[float] = None,
+-):
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/triton_attention.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/triton_attention.py
+index d66f3b1e78d5..0670a5b9d779 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/triton_attention.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/triton_attention.py
+@@ -198,7 +198,10 @@ def _prefill_attention(
+     )
+ 
+ 
+-@torch.library.custom_op("auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=())
++@torch.library.custom_op(
++    "auto_deploy::triton_attention_flattened_mha_with_cache",
++    mutates_args=("k_cache", "v_cache"),
++)
+ def flattened_mha_with_cache(
+     # Q, K, V
+     q: torch.Tensor,
+@@ -221,6 +224,7 @@ def flattened_mha_with_cache(
+     scale: Optional[float],
+     sinks: Optional[torch.Tensor] = None,
+     sliding_window: Optional[int] = None,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Flattened MHA with cache that takes q, k, v in BSND layout.
+ 
+@@ -252,8 +256,8 @@ def flattened_mha_with_cache(
+     # Compute scale if not provided
+     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
+ 
+-    # Preallocate output tensor (zeros so padding positions are clean)
+-    y = q_flat.new_zeros(bs, num_heads, v_head_dim)
++    # Preallocate output tensor
++    y = q_flat.new_empty(bs, num_heads, v_head_dim)
+ 
+     # PREFILL: process context tokens with variable sequence lengths
+     if num_prefill > 0:
+@@ -289,6 +293,17 @@ def flattened_mha_with_cache(
+             sliding_window,
+         )
+ 
++    if out is not None:
++        out_flat = out.view(bs, num_heads, v_head_dim)
++        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
++        if num_total_tokens < bs:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
++    # Zero padding positions so downstream ops don't see garbage (piecewise CG)
++    if num_total_tokens < bs:
++        y[num_total_tokens:].zero_()
++
+     return y.view(*output_shape)
+ 
+ 
+@@ -315,7 +330,10 @@ def flattened_mha_fake(
+     scale: Optional[float],
+     sinks: Optional[torch.Tensor] = None,
+     sliding_window: Optional[int] = None,
+-):
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/trtllm_attention.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/trtllm_attention.py
+index 3f47f80ad065..d0c8a1dd8c0f 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/trtllm_attention.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/attention/trtllm_attention.py
+@@ -333,6 +333,7 @@ def trtllm_mha_with_cache(
+     kv_scale_orig_quant: float = 1.0,
+     kv_scale_quant_orig: float = 1.0,
+     out_scale: Optional[torch.Tensor] = None,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """TRT-LLM attention with paged KV cache for Auto-Deploy.
+ 
+@@ -384,13 +385,17 @@ def trtllm_mha_with_cache(
+     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+ 
+-    # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
++    # Prepare output: if caller provided an `out` buffer, write directly into it
+     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
+     # If out_scale is set, attention quantizes output to FP8.
+     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+-    output = torch.zeros(
+-        total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
+-    )
++    if out is not None:
++        out_flat = out.view(-1, num_heads * head_dim)
++        output = out_flat[:num_tokens]
++    else:
++        output = torch.zeros(
++            total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
++        )
+     # Map SequenceInfo fields to thop.attention args
+     sequence_length = seq_len_with_cache[:num_seq]  # device
+     context_lengths = seq_len[:num_seq]  # device
+@@ -497,6 +502,11 @@ def trtllm_mha_with_cache(
+         None,  # quant_q_buffer
+     )
+ 
++    if out is not None:
++        if total_padded_tokens > num_tokens:
++            out_flat[num_tokens:].zero_()
++        return out.new_empty(0)
++
+     return output.view(*q_shape_og)
+ 
+ 
+@@ -520,8 +530,11 @@ def trtllm_mha_with_cache_fake(
+     kv_scale_orig_quant: float = 1.0,
+     kv_scale_quant_orig: float = 1.0,
+     out_scale: Optional[torch.Tensor] = None,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Fake implementation for torch.compile tracing."""
++    if out is not None:
++        return out.new_empty(0)
+     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+     return torch.empty_like(q.contiguous(), dtype=out_dtype)
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_delta.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_delta.py
+index b1616717e3c8..197bac939d4d 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_delta.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_delta.py
+@@ -20,7 +20,7 @@
+ Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
+ """
+ 
+-from typing import List
++from typing import List, Optional
+ 
+ import torch
+ from torch._ops import OpOverloadPacket
+@@ -42,7 +42,7 @@
+ from .delta_rule.fused_recurrent import fused_recurrent_delta_rule_fwd
+ 
+ 
+-@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=())
++@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=("delta_cache",))
+ def fla_cached_delta_rule(
+     # INPUTS (dense but may be flattened across sequences)
+     q: torch.Tensor,
+@@ -61,6 +61,7 @@ def fla_cached_delta_rule(
+     delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
+     # CONSTANTS
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     b, s, num_heads, _ = q.shape
+ 
+@@ -77,6 +78,7 @@ def fla_cached_delta_rule(
+     batch_info = BatchInfo(batch_info_host)
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+     num_seq = num_prefill + num_decode
++    num_total_tokens = num_prefill_tokens + num_decode
+ 
+     # clean up metadata
+     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
+@@ -127,6 +129,13 @@ def fla_cached_delta_rule(
+ 
+         del y_decode, final_state
+ 
++    if out is not None:
++        out_flat = out.view(b * s, num_heads, -1)
++        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
++        if num_total_tokens < b * s:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
+     return y
+ 
+ 
+@@ -149,7 +158,10 @@ def fla_cached_delta_rule_fake(
+     delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
+     # CONSTANTS
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return torch.empty_like(v)
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_gated_delta.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_gated_delta.py
+index acc306226509..0842cafb2c12 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_gated_delta.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/fla_backend_gated_delta.py
+@@ -26,7 +26,7 @@
+   - Prefill: explicit repeat-interleave + chunk_gated_delta_rule(use_qk_l2norm_in_kernel=True)
+ """
+ 
+-from typing import List
++from typing import List, Optional
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -69,6 +69,7 @@ def fla_cached_gated_delta_rule(
+     delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
+     # CONSTANTS
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     bsz, s, H_k, K = q.shape
+     HV = v.shape[2]
+@@ -87,6 +88,7 @@ def fla_cached_gated_delta_rule(
+     batch_info = BatchInfo(batch_info_host)
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+     num_seq = num_prefill + num_decode
++    num_total_tokens = num_prefill_tokens + num_decode
+ 
+     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
+     slot_idx = slot_idx[:num_seq].to(torch.long)
+@@ -163,6 +165,13 @@ def fla_cached_gated_delta_rule(
+         y_flat[None, num_prefill_tokens:] = y_decode.to(y_flat.dtype)
+         del y_decode
+ 
++    if out is not None:
++        out_flat = out.view(bsz * s, HV, -1)
++        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
++        if num_total_tokens < bsz * s:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
+     return y
+ 
+ 
+@@ -182,7 +191,10 @@ def fla_cached_gated_delta_rule_fake(
+     any_prefill_use_initial_states_host: torch.Tensor,
+     delta_cache: torch.Tensor,
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return torch.empty_like(v)
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/torch_backend_gated_delta.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/torch_backend_gated_delta.py
+index 4dd52f8a1670..ddbe4b8ccc9b 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/torch_backend_gated_delta.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/fla/torch_backend_gated_delta.py
+@@ -32,7 +32,7 @@
+   - Gated Delta Networks paper: https://arxiv.org/abs/2412.06464
+ """
+ 
+-from typing import List, Tuple
++from typing import List, Optional, Tuple
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -219,6 +219,7 @@ def torch_cached_gated_delta_rule(
+     delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
+     # CONSTANTS
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Cached gated delta rule using pure-torch recurrence.
+ 
+@@ -233,6 +234,7 @@ def torch_cached_gated_delta_rule(
+     batch_info = BatchInfo(batch_info_host)
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+     num_seq = num_prefill + num_decode
++    num_total_tokens = num_prefill_tokens + num_decode
+ 
+     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
+     slot_idx = slot_idx[:num_seq].to(torch.long)
+@@ -323,6 +325,13 @@ def torch_cached_gated_delta_rule(
+             y_flat[token_idx] = o_tok.squeeze(0).to(y_flat.dtype)
+             delta_cache[slot] = new_state.squeeze(0).to(delta_cache.dtype)
+ 
++    if out is not None:
++        out_flat = out.reshape(bsz * s, HV, -1)
++        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
++        if num_total_tokens < bsz * s:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
+     return y
+ 
+ 
+@@ -341,7 +350,10 @@ def torch_cached_gated_delta_rule_fake(
+     use_initial_states: torch.Tensor,
+     delta_cache: torch.Tensor,
+     scale: float,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
++    if out is not None:
++        return out.new_empty(0)
+     return torch.empty_like(v)
+ 
+ 
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/flashinfer_backend_mamba.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/flashinfer_backend_mamba.py
+index 96a2f2d00384..c3e1a00c91c3 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/flashinfer_backend_mamba.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/flashinfer_backend_mamba.py
+@@ -13,7 +13,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from typing import List
++from typing import List, Optional
+ 
+ import torch
+ from torch.fx import Node
+@@ -28,7 +28,7 @@
+ )
+ 
+ 
+-@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args={})
++@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args=("ssm_state_cache",))
+ def _flashinfer_cached_ssm(
+     # INPUTS (dense but may be flattened across sequences)
+     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+@@ -53,6 +53,7 @@ def _flashinfer_cached_ssm(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
+         hidden_states, B, C, dt
+@@ -62,13 +63,14 @@ def _flashinfer_cached_ssm(
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+     num_seq = num_prefill + num_decode
+     num_total_tokens = num_prefill_tokens + num_decode
+-    # Preallocate output tensor (zeros so padding positions are clean)
+-    preallocated_ssm_out = torch.zeros(
+-        [bs, num_heads, head_dim],
+-        dtype=hidden_states.dtype,
+-        device=hidden_states.device,
+-    )
+-    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
++    if out is not None:
++        preallocated_ssm_out = out.view(bs, num_heads, head_dim)
++    else:
++        preallocated_ssm_out = torch.zeros(
++            [bs, num_heads, head_dim],
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
+ 
+     num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+         hs_flat,
+@@ -89,7 +91,7 @@ def _flashinfer_cached_ssm(
+         ssm_state_cache,
+         time_step_limit,
+         chunk_size,
+-        preallocated_ssm_out_p.unsqueeze(0),
++        preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
+     )
+ 
+     num_decode = num_total_tokens - num_prefill_tokens
+@@ -111,7 +113,6 @@ def _flashinfer_cached_ssm(
+         ssm_state_size,
+     )
+ 
+-    y_decode = None
+     if decode_inputs is not None:
+         (
+             slot_idx_decode,
+@@ -141,13 +142,15 @@ def _flashinfer_cached_ssm(
+             state_batch_indices=slot_idx_decode_i32,
+         )
+         preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
+-    if num_total_tokens > 0:
+-        # Cast to input dtype if needed (prefill may compute in higher precision)
+-        if preallocated_ssm_out.dtype != hidden_states.dtype:
+-            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
+-        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
+-    else:
+-        return torch.zeros_like(hidden_states)
++
++    if out is not None:
++        # out is reused across CUDA graph replays with varying num_total_tokens,
++        # so stale data from prior replays can linger in the padding region.
++        if num_total_tokens < bs:
++            preallocated_ssm_out[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
++    return preallocated_ssm_out.view(b, s, num_heads, head_dim)
+ 
+ 
+ @_flashinfer_cached_ssm.register_fake
+@@ -175,7 +178,10 @@ def _flashinfer_cached_ssm_fake(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ):
++    if out is not None:
++        return out.new_empty(0)
+     # Return a correctly-shaped tensor for tracing with fake tensors
+     return torch.empty_like(
+         hidden_states,
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/torch_backend_mamba.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/torch_backend_mamba.py
+index e8adcc52e59c..4be3e3a718c9 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/torch_backend_mamba.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/torch_backend_mamba.py
+@@ -21,7 +21,7 @@
+    indexed SSM state caches per the auto_deploy attention interface.
+ """
+ 
+-from typing import List, Tuple
++from typing import List, Optional, Tuple
+ 
+ import torch
+ from torch._ops import OpOverloadPacket
+@@ -125,7 +125,7 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
+ # ---------------------------------------------------------------
+ 
+ 
+-@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args={})
++@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args=("ssm_state_cache",))
+ def _torch_cached_ssm(
+     # INPUTS (dense but may be flattened across sequences)
+     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+@@ -148,6 +148,7 @@ def _torch_cached_ssm(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Flattened cached SSM transform op that respects slot-indexed state caches.
+ 
+@@ -162,6 +163,7 @@ def _torch_cached_ssm(
+     # get cleaned up metadata
+     batch_info = BatchInfo(batch_info_host)
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
++    num_total_tokens = num_prefill_tokens + num_decode
+     num_seq = num_prefill + num_decode
+     seq_len = seq_len[:num_seq]
+     seq_start = cu_seqlen[:num_seq]
+@@ -189,6 +191,16 @@ def _torch_cached_ssm(
+         # Scatter updated states back to global cache
+         ssm_state_cache.index_copy_(0, slot_idx_long, updated_state.to(ssm_state_cache.dtype))
+ 
++        if out is not None:
++            num_heads_out = hidden_states.shape[2]
++            head_dim_out = hidden_states.shape[3]
++            flat_out = out.view(b * s, num_heads_out, head_dim_out)
++            flat_y = y.view(b * s, num_heads_out, head_dim_out)
++            flat_out[:num_total_tokens].copy_(flat_y[:num_total_tokens].to(hidden_states.dtype))
++            if num_total_tokens < b * s:
++                flat_out[num_total_tokens:].zero_()
++            return out.new_empty(0)
++
+         # return in the same dtype as the input
+         return y.to(hidden_states.dtype)
+ 
+@@ -248,6 +260,13 @@ def _torch_cached_ssm(
+         slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
+         ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
+ 
++    if out is not None:
++        flat_out = out.view(b * s, *y.shape[2:])
++        flat_out[:num_total_tokens].copy_(y_flat[:num_total_tokens])
++        if num_total_tokens < b * s:
++            flat_out[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
+     return y
+ 
+ 
+@@ -274,7 +293,10 @@ def _torch_cached_ssm_fake(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ):
++    if out is not None:
++        return out.new_empty(0)
+     return torch.empty_like(
+         hidden_states,
+         memory_format=torch.contiguous_format,
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/triton_backend_mamba.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/triton_backend_mamba.py
+index b0e02a5f2e3f..27ea9e55d38a 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/triton_backend_mamba.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/mamba/triton_backend_mamba.py
+@@ -13,7 +13,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from typing import List
++from typing import List, Optional
+ 
+ import torch
+ 
+@@ -28,7 +28,7 @@
+ )
+ 
+ 
+-@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args={})
++@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args=("ssm_state_cache",))
+ def _triton_cached_ssm(
+     # INPUTS (dense but may be flattened across sequences)
+     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+@@ -53,23 +53,25 @@ def _triton_cached_ssm(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
+         hidden_states, B, C, dt
+     )
+     ssm_state_size = B.shape[3]
+-    # Preallocate output tensor (zeros so padding positions are clean)
+-    preallocated_ssm_out = torch.zeros(
+-        [bs, num_heads, head_dim],
+-        dtype=hidden_states.dtype,
+-        device=hidden_states.device,
+-    )
+     batch_info = BatchInfo(batch_info_host)
+     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+     num_seq = num_prefill + num_decode
+     num_total_tokens = num_prefill_tokens + num_decode
+-    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+-    preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
++
++    if out is not None:
++        preallocated_ssm_out = out.view(bs, num_heads, head_dim)
++    else:
++        preallocated_ssm_out = torch.zeros(
++            [bs, num_heads, head_dim],
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
+ 
+     num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+         hs_flat,
+@@ -90,7 +92,7 @@ def _triton_cached_ssm(
+         ssm_state_cache,
+         time_step_limit,
+         chunk_size,
+-        preallocated_ssm_out_p.unsqueeze(0),
++        preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
+     )
+ 
+     num_decode = num_total_tokens - num_prefill_tokens
+@@ -135,16 +137,17 @@ def _triton_cached_ssm(
+             dt_bias=dt_bias_hp,
+             dt_softplus=True,
+             state_batch_indices=slot_idx_decode,
+-            out=preallocated_ssm_out_d,
++            out=preallocated_ssm_out[num_prefill_tokens:num_total_tokens],
+         )
+ 
+-    if num_total_tokens > 0:
+-        # Cast to input dtype if needed (prefill may compute in higher precision)
+-        if preallocated_ssm_out.dtype != hidden_states.dtype:
+-            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
+-        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
+-    else:
+-        return torch.zeros_like(hidden_states)
++    if out is not None:
++        # out is reused across CUDA graph replays with varying num_total_tokens,
++        # so stale data from prior replays can linger in the padding region.
++        if num_total_tokens < bs:
++            preallocated_ssm_out[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
++    return preallocated_ssm_out.view(b, s, num_heads, head_dim)
+ 
+ 
+ @_triton_cached_ssm.register_fake
+@@ -172,7 +175,10 @@ def _triton_cached_ssm_fake(
+     # CONSTANTS
+     time_step_limit: List[float],
+     chunk_size: int,
++    out: Optional[torch.Tensor] = None,
+ ):
++    if out is not None:
++        return out.new_empty(0)
+     # Return a correctly-shaped tensor for tracing with fake tensors
+     return torch.empty_like(
+         hidden_states,
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/flashinfer_mla.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/flashinfer_mla.py
+index a5aa304d5512..bb816f487071 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/flashinfer_mla.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/flashinfer_mla.py
+@@ -448,7 +448,9 @@ def prepare_flashinfer_mla_metadata_host(
+         )
+ 
+ 
+-@torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=())
++@torch.library.custom_op(
++    "auto_deploy::flashinfer_mla_with_cache", mutates_args=("ckv_cache", "kpe_cache")
++)
+ def flashinfer_mla_with_cache(
+     # 5 tensor args (matching torch_mla source op)
+     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
+@@ -474,6 +476,7 @@ def flashinfer_mla_with_cache(
+     # Constants
+     scale: Optional[float],
+     kv_lora_rank: int,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """FlashInfer MLA attention with paged cache.
+ 
+@@ -549,8 +552,10 @@ def flashinfer_mla_with_cache(
+         last_page_len[:num_seq],
+     )
+ 
+-    # Pre-allocate output as zeros so padding positions are clean
+-    y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
++    if out is not None:
++        y = out.view(bs, num_heads, v_head_dim)
++    else:
++        y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
+ 
+     # =========================================================================
+     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
+@@ -752,6 +757,13 @@ def flashinfer_mla_with_cache(
+ 
+         y[num_prefill_tokens:num_total_tokens] = y_decode
+ 
++    if out is not None:
++        # out is reused across CUDA graph replays with varying num_total_tokens,
++        # so stale data from prior replays can linger in the padding region.
++        if num_total_tokens < bs:
++            y[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
+     return y.view(b, s, num_heads, v_head_dim)
+ 
+ 
+@@ -776,8 +788,12 @@ def flashinfer_mla_with_cache_fake(
+     kpe_cache: torch.Tensor,
+     scale: Optional[float],
+     kv_lora_rank: int,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Fake implementation for flashinfer_mla_with_cache."""
++    if out is not None:
++        return out.new_empty(0)
++
+     num_heads = q_nope.shape[2]
+     qk_nope_head_dim = q_nope.shape[-1]
+     out_features = kv_b_proj_weight.shape[0]
+diff --git a/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/torch_backend_mla.py b/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/torch_backend_mla.py
+index eae6469a4248..e3f5b0296251 100644
+--- a/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/torch_backend_mla.py
++++ b/tensorrt_llm/_torch/auto_deploy/custom_ops/mla/torch_backend_mla.py
+@@ -322,7 +322,7 @@ def _torch_mla_context_with_expansion(
+         out.copy_(torch.cat(attn_outputs, dim=0))
+ 
+ 
+-@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=())
++@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("mla_cache",))
+ def torch_backend_mla_with_cache(
+     # 5 tensor args (get_num_qkv_args = 5)
+     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
+@@ -341,6 +341,7 @@ def torch_backend_mla_with_cache(
+     # Constants
+     scale: Optional[float] = None,
+     kv_lora_rank: int = 512,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Torch backend MLA with FlashInfer-compatible compressed cache.
+ 
+@@ -380,6 +381,9 @@ def torch_backend_mla_with_cache(
+     # Define output shape: [B, S, N, v_head_dim]
+     output_shape = (b, s, num_heads, v_head_dim)
+ 
++    num_total_tokens = num_prefill_tokens + num_decode
++    bs = b * s
++
+     if s == 1:
+         # =====================================================================
+         # Generate phase: Use weight absorption
+@@ -402,13 +406,11 @@ def torch_backend_mla_with_cache(
+             v_head_dim,
+             y,
+         )
+-
+-        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
+     else:
+         # =====================================================================
+         # Context phase: Expand and compute normal attention
+         # =====================================================================
+-        bs_view = (b * s,)
++        bs_view = (bs,)
+ 
+         q_nope_flat = q_nope.contiguous().view(*bs_view, num_heads, qk_nope_head_dim)
+         q_pe_flat = q_pe.contiguous().view(*bs_view, num_heads, qk_rope_head_dim)
+@@ -436,7 +438,16 @@ def torch_backend_mla_with_cache(
+             y,
+         )
+ 
+-        return y.view(*output_shape)
++    if out is not None:
++        out_flat = out.view(bs, num_heads, v_head_dim)
++        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
++        if num_total_tokens < bs:
++            out_flat[num_total_tokens:].zero_()
++        return out.new_empty(0)
++
++    if s == 1:
++        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
++    return y.view(*output_shape)
+ 
+ 
+ @torch_backend_mla_with_cache.register_fake
+@@ -454,8 +465,12 @@ def torch_backend_mla_with_cache_fake(
+     mla_cache: torch.Tensor,
+     scale: Optional[float] = None,
+     kv_lora_rank: int = 512,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Fake implementation for torch_backend_mla_with_cache."""
++    if out is not None:
++        return out.new_empty(0)
++
+     num_heads = q_nope.shape[2]
+     qk_nope_head_dim = q_nope.shape[-1]
+     out_features = kv_b_proj_weight.shape[0]
+diff --git a/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py b/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py
+index 4009d8e5c612..62cc20035825 100644
+--- a/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py
++++ b/tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.py
+@@ -96,6 +96,10 @@ def _get_args_kwargs(bs: int) -> ArgsKwargs:
+             extra_kwargs["piecewise_seq_info"] = cm.info
+             extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
+ 
++            max_seq = cm.info.max_seq_len
++            max_batch = cm.info.max_batch_size
++            batch_capacity = (max_batch - 1) * max_seq + 1
++
+             # Auto-generate piecewise_num_tokens if not explicitly specified
+             if self.config.piecewise_num_tokens is None:
+                 max_num_tokens = cm.info.max_num_tokens
+@@ -116,6 +120,20 @@ def _get_args_kwargs(bs: int) -> ArgsKwargs:
+                     )
+                 config_overrides["piecewise_num_tokens"] = valid_buckets
+ 
++            # Filter out buckets that exceed the mixed-batch capacity
++            buckets = config_overrides.get(
++                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
++            )
++            over = [nt for nt in buckets if nt > batch_capacity]
++            if over:
++                buckets = [nt for nt in buckets if nt <= batch_capacity]
++                ad_logger.warning(
++                    f"Dropping piecewise buckets {over} that exceed mixed-batch capacity "
++                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode = {batch_capacity}). "
++                    f"Remaining: {buckets}"
++                )
++                config_overrides["piecewise_num_tokens"] = buckets
++
+         # Merge config with any overrides
+         config_dict = self.config.model_dump()
+         config_dict.update(config_overrides)
+diff --git a/tensorrt_llm/_torch/auto_deploy/transform/library/fusion.py b/tensorrt_llm/_torch/auto_deploy/transform/library/fusion.py
+index 63822eb06b9f..77dee1e06c22 100644
+--- a/tensorrt_llm/_torch/auto_deploy/transform/library/fusion.py
++++ b/tensorrt_llm/_torch/auto_deploy/transform/library/fusion.py
+@@ -422,7 +422,9 @@ def _apply(
+                 if len(lin_children) < 2:
+                     continue
+                 if is_linear_op(lin_children[0]):
+-                    if _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children):
++                    if _insert_fused_gemm(
++                        gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
++                    ):
+                         num_matches += 1
+                 else:
+                     fuser = _get_quant_fuser(op_key)
+@@ -432,7 +434,7 @@ def _apply(
+                         )
+                         continue
+                     if fuser._insert_fused_quant_gemm(
+-                        gm, idx := idx + 1, parent_node, lin_children
++                        gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
+                     ):
+                         num_matches += 1
+ 
+diff --git a/tests/unittest/auto_deploy/singlegpu/compile/test_captured_graph.py b/tests/unittest/auto_deploy/singlegpu/compile/test_captured_graph.py
+index 5f20c084cf02..b1c1e604e0fe 100644
+--- a/tests/unittest/auto_deploy/singlegpu/compile/test_captured_graph.py
++++ b/tests/unittest/auto_deploy/singlegpu/compile/test_captured_graph.py
+@@ -16,8 +16,8 @@
+     DualModeCapturedGraph,
+     PiecewiseCapturedGraph,
+     _args_kwargs_flatten_spec,
+-    _submod_has_cuda_ops,
+ )
++from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+ from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
+ from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
+@@ -173,7 +173,7 @@ def get_args_kwargs(bs):
+ 
+ 
+ # ============================================================================
+-# Helpers for piecewise / _submod_has_cuda_ops tests
++# Helpers for piecewise / submod_has_cuda_ops tests
+ # ============================================================================
+ 
+ 
+@@ -209,25 +209,25 @@ def forward(self, x):
+ 
+ 
+ # ============================================================================
+-# Tests for _submod_has_cuda_ops
++# Tests for submod_has_cuda_ops
+ # ============================================================================
+ 
+ 
+ class TestSubmodHasCudaOps:
+-    """Tests for _submod_has_cuda_ops."""
++    """Tests for submod_has_cuda_ops."""
+ 
+     def test_trivial_graphmodule_returns_false(self):
+         gm = _build_trivial_graphmodule()
+-        assert _submod_has_cuda_ops(gm) is False
++        assert submod_has_cuda_ops(gm) is False
+ 
+     def test_graphmodule_with_linear_returns_true(self):
+         gm = _build_graphmodule_with_linear()
+-        assert _submod_has_cuda_ops(gm) is True
++        assert submod_has_cuda_ops(gm) is True
+ 
+     def test_non_graphmodule_returns_true(self):
+         """Non-FX modules are conservatively treated as having CUDA ops."""
+         module = nn.Linear(4, 4)
+-        assert _submod_has_cuda_ops(module) is True
++        assert submod_has_cuda_ops(module) is True
+ 
+     def test_graphmodule_with_nontrivial_call_function(self):
+         """A graph with torch.add (non-trivial call_function) should return True."""
+@@ -236,7 +236,7 @@ def test_graphmodule_with_nontrivial_call_function(self):
+         y = graph.call_function(torch.add, args=(x, x))
+         graph.output(y)
+         gm = GraphModule(nn.Module(), graph)
+-        assert _submod_has_cuda_ops(gm) is True
++        assert submod_has_cuda_ops(gm) is True
+ 
+     def test_graphmodule_with_nontrivial_call_method(self):
+         """A graph with 'matmul' method call should return True."""
+@@ -245,7 +245,7 @@ def test_graphmodule_with_nontrivial_call_method(self):
+         y = graph.call_method("matmul", args=(x, x))
+         graph.output(y)
+         gm = GraphModule(nn.Module(), graph)
+-        assert _submod_has_cuda_ops(gm) is True
++        assert submod_has_cuda_ops(gm) is True
+ 
+     def test_graphmodule_with_only_trivial_methods(self):
+         """A graph with only trivial call_methods should return False."""
+@@ -255,7 +255,7 @@ def test_graphmodule_with_only_trivial_methods(self):
+         z = graph.call_method("contiguous", args=(y,))
+         graph.output(z)
+         gm = GraphModule(nn.Module(), graph)
+-        assert _submod_has_cuda_ops(gm) is False
++        assert submod_has_cuda_ops(gm) is False
+ 
+ 
+ # ============================================================================
+diff --git a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_runner.py b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_runner.py
+index 9f11a474ad78..35b8b5ee11bd 100644
+--- a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_runner.py
++++ b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_runner.py
+@@ -1,4 +1,4 @@
+-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -12,13 +12,17 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""Unit tests for piecewise_runner: ADPiecewiseRunner and SegmentEntry."""
++"""Unit tests for piecewise_runner: ADPiecewiseRunner, SegmentEntry, OutputInfo."""
+ 
+ import pytest
+ import torch
+ import torch.nn as nn
+ 
+-from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, SegmentEntry
++from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
++    ADPiecewiseRunner,
++    OutputInfo,
++    SegmentEntry,
++)
+ 
+ # ============================================================================
+ # Context management tests
+@@ -26,13 +30,9 @@
+ 
+ 
+ class TestADPiecewiseRunnerContextManagement:
+-    """Tests for class-level context management on ADPiecewiseRunner."""
+-
+     def setup_method(self):
+-        """Reset class-level state before each test."""
+         ADPiecewiseRunner._current_num_tokens = None
+         ADPiecewiseRunner._current_phase = "replay"
+-        ADPiecewiseRunner._static_output_registry.clear()
+ 
+     def test_set_current_num_tokens(self):
+         ADPiecewiseRunner.set_current_num_tokens(128)
+@@ -50,15 +50,6 @@ def test_set_current_phase_invalid_raises(self):
+         with pytest.raises(AssertionError, match="Invalid phase"):
+             ADPiecewiseRunner.set_current_phase("invalid_phase")
+ 
+-    def test_clear_static_output_registry(self):
+-        # Populate with some dummy data
+-        t = torch.tensor([1.0])
+-        ADPiecewiseRunner._static_output_registry[(8, 12345)] = t
+-        assert len(ADPiecewiseRunner._static_output_registry) == 1
+-
+-        ADPiecewiseRunner.clear_static_output_registry()
+-        assert len(ADPiecewiseRunner._static_output_registry) == 0
+-
+ 
+ # ============================================================================
+ # Initialization tests
+@@ -66,213 +57,66 @@ def test_clear_static_output_registry(self):
+ 
+ 
+ class TestADPiecewiseRunnerInit:
+-    """Tests for ADPiecewiseRunner initialization."""
+-
+-    def test_entries_pre_populated(self):
++    def test_entries_initially_empty(self):
+         submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8, 16, 32])
+-        assert set(runner.entries.keys()) == {8, 16, 32}
+-        for entry in runner.entries.values():
+-            assert isinstance(entry, SegmentEntry)
++        runner = ADPiecewiseRunner(submod)
++        assert len(runner.entries) == 0
+ 
+     def test_weight_ptrs_collected(self):
+         submod = nn.Linear(4, 4, bias=True)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        # Should have weight and bias data_ptrs
++        runner = ADPiecewiseRunner(submod)
+         assert submod.weight.data_ptr() in runner._weight_ptrs
+         assert submod.bias.data_ptr() in runner._weight_ptrs
+ 
+-    def test_no_piecewise_num_tokens(self):
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=None)
+-        assert len(runner.entries) == 0
+-
+-
+-# ============================================================================
+-# _find_entry tests
+-# ============================================================================
+-
+-
+-class TestADPiecewiseRunnerFindEntry:
+-    """Tests for _find_entry."""
+-
+-    def test_exact_match(self):
++    def test_no_dynamic_out_info_by_default(self):
+         submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8, 16])
+-        assert runner._find_entry(8) is not None
+-        assert runner._find_entry(16) is not None
+-
+-    def test_no_match_returns_none(self):
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8, 16])
+-        assert runner._find_entry(32) is None
+-        assert runner._find_entry(4) is None
++        runner = ADPiecewiseRunner(submod)
++        assert runner._next_dynamic_out_infos == {}
+ 
+ 
+ # ============================================================================
+-# _identify_dynamic_indices tests
++# OutputInfo and SegmentEntry tests
+ # ============================================================================
+ 
+ 
+-class TestIdentifyDynamicIndices:
+-    """Tests for _identify_dynamic_indices."""
+-
+-    def test_weight_tensors_excluded(self):
+-        submod = nn.Linear(4, 4, bias=False)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+-
+-        # flat_args: [weight_tensor, activation_tensor]
+-        weight = submod.weight
+-        activation = torch.randn(2, 4)
+-        flat_args = [weight, activation]
+-
+-        dynamic = runner._identify_dynamic_indices(entry, flat_args)
+-        assert 0 not in dynamic  # weight is not dynamic
+-        assert 1 in dynamic  # activation is dynamic
+-
+-    def test_non_tensor_args_ignored(self):
+-        submod = nn.Linear(4, 4, bias=False)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+-
+-        flat_args = [42, "hello", torch.randn(2, 4)]
+-        dynamic = runner._identify_dynamic_indices(entry, flat_args)
+-        # Only the tensor at index 2 should be dynamic
+-        assert dynamic == {2}
+-
+-    def test_all_activations_marked_dynamic(self):
+-        submod = nn.Linear(4, 4, bias=False)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+-
+-        act1 = torch.randn(2, 4)
+-        act2 = torch.randn(3, 4)
+-        flat_args = [act1, act2]
+-
+-        dynamic = runner._identify_dynamic_indices(entry, flat_args)
+-        assert dynamic == {0, 1}
+-
+-
+-# ============================================================================
+-# _track_warmup_ptrs tests
+-# ============================================================================
+-
+-
+-class TestTrackWarmupPtrs:
+-    """Tests for _track_warmup_ptrs."""
+-
+-    def test_first_call_records_ptrs(self):
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+-
+-        t1 = torch.randn(2, 4)
+-        t2 = torch.randn(3, 4)
+-        flat_args = [t1, t2]
+-
+-        runner._track_warmup_ptrs(entry, flat_args)
+-        assert entry._warmup_data_ptrs is not None
+-        assert len(entry._warmup_data_ptrs) == 2
+-        assert entry._warmup_data_ptrs[0] == t1.data_ptr()
+-        assert entry._warmup_data_ptrs[1] == t2.data_ptr()
+-
+-    def test_second_call_detects_ptr_change(self):
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+-
+-        t1 = torch.randn(2, 4)
+-        t2 = torch.randn(3, 4)
+-
+-        # First warmup
+-        runner._track_warmup_ptrs(entry, [t1, t2])
+-
+-        # Second warmup with a new tensor at index 0 (simulating changed activation)
+-        t1_new = torch.randn(2, 4)  # new tensor, different data_ptr
+-        runner._track_warmup_ptrs(entry, [t1_new, t2])
+-
+-        # Index 0 should be marked None (dynamic), index 1 unchanged
+-        assert entry._warmup_data_ptrs[0] is None
+-        assert entry._warmup_data_ptrs[1] == t2.data_ptr()
++class TestOutputInfo:
++    def test_creation(self):
++        info = OutputInfo(
++            shape=torch.Size([128, 32, 64]),
++            dtype=torch.float16,
++            device=torch.device("cuda"),
++        )
++        assert info.shape == torch.Size([128, 32, 64])
++        assert info.dtype == torch.float16
+ 
+-    def test_non_tensor_args_tracked_as_none(self):
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        entry = runner.entries[8]
+ 
+-        flat_args = [42, torch.randn(2, 4)]
+-        runner._track_warmup_ptrs(entry, flat_args)
+-        assert entry._warmup_data_ptrs[0] is None  # int -> None
+-        assert entry._warmup_data_ptrs[1] is not None  # tensor -> data_ptr
++class TestSegmentEntry:
++    def test_default_values(self):
++        entry = SegmentEntry()
++        assert entry.cuda_graph is None
++        assert entry.static_output is None
++        assert entry.dynamic_out_bufs == {}
++        assert entry.input_addresses == []
+ 
+ 
+ # ============================================================================
+-# _prepare_replay_inputs tests
++# set_dynamic_out_info / get_dynamic_out_buf tests
+ # ============================================================================
+ 
+ 
+-class TestPrepareReplayInputs:
+-    """Tests for _prepare_replay_inputs."""
+-
+-    def _make_entry_with_dynamic(self, static_inputs, dynamic_indices):
+-        entry = SegmentEntry()
+-        entry.static_inputs = static_inputs
+-        entry.dynamic_indices = dynamic_indices
+-        return entry
+-
+-    def test_same_shape_copy(self):
+-        """When shapes match, static buffer should be updated."""
+-        static_buf = torch.zeros(4, 8)
+-        new_inp = torch.ones(4, 8)
+-        entry = self._make_entry_with_dynamic([static_buf], {0})
+-
++class TestDynamicOutBuf:
++    def test_set_and_get_returns_none_before_capture(self):
+         submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        runner._prepare_replay_inputs(entry, [new_inp])
+-
+-        assert torch.equal(static_buf, new_inp)
+-
+-    def test_same_data_ptr_skips_copy(self):
+-        """When data_ptr matches (zero-copy path), no copy should happen."""
+-        shared_tensor = torch.zeros(4, 8)
+-        entry = self._make_entry_with_dynamic([shared_tensor], {0})
+-
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-
+-        # Pass the same tensor -- same data_ptr
+-        runner._prepare_replay_inputs(entry, [shared_tensor])
+-        # Should still be zeros (no copy from a different source)
+-        assert torch.equal(shared_tensor, torch.zeros(4, 8))
+-
+-    def test_padded_dim0(self):
+-        """When new_inp is smaller along dim 0, only prefix should be copied."""
+-        static_buf = torch.zeros(8, 4)
+-        new_inp = torch.ones(5, 4)
+-        entry = self._make_entry_with_dynamic([static_buf], {0})
+-
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        runner._prepare_replay_inputs(entry, [new_inp])
+-
+-        # First 5 rows should be ones, remaining 3 should be zeros
+-        assert torch.equal(static_buf[:5], torch.ones(5, 4))
+-        assert torch.equal(static_buf[5:], torch.zeros(3, 4))
+-
+-    def test_padded_dim1(self):
+-        """When new_inp is smaller along dim 1, only prefix columns should be copied."""
+-        static_buf = torch.zeros(1, 16, 4)
+-        new_inp = torch.ones(1, 10, 4)
+-        entry = self._make_entry_with_dynamic([static_buf], {0})
+-
+-        submod = nn.Linear(4, 4)
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8])
+-        runner._prepare_replay_inputs(entry, [new_inp])
+-
+-        # First 10 along dim 1 should be ones, rest zeros
+-        assert torch.equal(static_buf[:, :10, :], torch.ones(1, 10, 4))
+-        assert torch.equal(static_buf[:, 10:, :], torch.zeros(1, 6, 4))
++        runner = ADPiecewiseRunner(submod)
++        info = OutputInfo(
++            shape=torch.Size([8, 16]),
++            dtype=torch.float32,
++            device=torch.device("cuda"),
++        )
++        dynamic_id = 5
++        runner.set_dynamic_out_info(dynamic_id, info)
++        assert runner._next_dynamic_out_infos[dynamic_id] is info
++        assert runner.get_dynamic_out_buf(8, dynamic_id) is None
+ 
+ 
+ # ============================================================================
+@@ -282,124 +126,185 @@ def test_padded_dim1(self):
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+ class TestADPiecewiseRunnerFullCycle:
+-    """End-to-end warmup -> capture -> replay test on CUDA."""
+-
+     def setup_method(self):
+-        """Reset class-level state before each test."""
+         ADPiecewiseRunner._current_num_tokens = None
+         ADPiecewiseRunner._current_phase = "replay"
+-        ADPiecewiseRunner._static_output_registry.clear()
+ 
+-    def test_warmup_capture_replay_linear(self):
+-        """Full cycle: warmup -> capture -> replay with a simple Linear."""
++    def test_warmup_capture_replay_same_address(self):
++        """Replay with the same input tensor (addresses match -> graph replay)."""
+         device = "cuda"
+         submod = nn.Linear(16, 16, bias=True).to(device)
+         submod.eval()
+ 
+         num_tokens = 8
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[num_tokens], graph_pool=None).to(
+-            device
+-        )
++        runner = ADPiecewiseRunner(submod, graph_pool=None).to(device)
+ 
+-        # Fixed input for warmup/capture
+         x = torch.randn(num_tokens, 16, device=device)
+ 
+         with torch.inference_mode():
+-            # --- WARMUP ---
+             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+             ADPiecewiseRunner.set_current_phase("warmup")
+             for _ in range(3):
+                 _ = runner(x)
+ 
+-            # --- CAPTURE ---
+             ADPiecewiseRunner.set_current_phase("capture")
+             _ = runner(x)
+ 
+-            # --- REPLAY ---
+             ADPiecewiseRunner.set_current_phase("replay")
++            x.fill_(1.0)
++            replay_out = runner(x)
+ 
+-            # New input for replay
+-            x_new = torch.randn(num_tokens, 16, device=device)
+-            replay_out = runner(x_new)
+-
+-            # Compare with eager output
+-            eager_out = submod(x_new)
+-
++            eager_out = submod(x)
+             torch.cuda.synchronize()
+-            assert torch.allclose(replay_out, eager_out, atol=1e-5), (
+-                "Replay output should match eager output"
+-            )
++            assert torch.allclose(replay_out, eager_out, atol=1e-5)
+ 
+-    def test_eager_fallback_for_unknown_num_tokens(self):
+-        """Runner should fall back to eager for num_tokens not in entries."""
++    def test_input_addresses_recorded_during_capture(self):
+         device = "cuda"
+         submod = nn.Linear(16, 16).to(device)
+         submod.eval()
+ 
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8]).to(device)
+-
+-        x = torch.randn(4, 16, device=device)
++        num_tokens = 8
++        runner = ADPiecewiseRunner(submod).to(device)
++        x = torch.randn(num_tokens, 16, device=device)
+ 
+         with torch.inference_mode():
+-            # num_tokens=4 is not configured -- should fall back to eager
+-            ADPiecewiseRunner.set_current_num_tokens(4)
+-            ADPiecewiseRunner.set_current_phase("replay")
+-            out = runner(x)
++            ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+ 
+-            eager_out = submod(x)
+-            assert torch.allclose(out, eager_out, atol=1e-6)
++            ADPiecewiseRunner.set_current_phase("warmup")
++            for _ in range(3):
++                runner(x)
++
++            ADPiecewiseRunner.set_current_phase("capture")
++            runner(x)
++
++            entry = runner.entries[num_tokens]
++            assert len(entry.input_addresses) > 0
++            tensor_addrs = [a for a in entry.input_addresses if a is not None]
++            assert len(tensor_addrs) > 0
+ 
+     def test_eager_fallback_for_none_num_tokens(self):
+-        """Runner should fall back to eager when num_tokens is None."""
+         device = "cuda"
+         submod = nn.Linear(16, 16).to(device)
+         submod.eval()
+ 
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=[8]).to(device)
+-
++        runner = ADPiecewiseRunner(submod).to(device)
+         x = torch.randn(4, 16, device=device)
+ 
+         with torch.inference_mode():
+             ADPiecewiseRunner.set_current_num_tokens(None)
+             ADPiecewiseRunner.set_current_phase("replay")
+             out = runner(x)
+-
+             eager_out = submod(x)
+             assert torch.allclose(out, eager_out, atol=1e-6)
+ 
+-    def test_multiple_bucket_sizes(self):
+-        """Capture and replay with multiple bucket sizes."""
++    def test_static_output_is_weak_ref(self):
+         device = "cuda"
+         submod = nn.Linear(16, 16).to(device)
+         submod.eval()
+ 
+-        buckets = [4, 8, 16]
+-        runner = ADPiecewiseRunner(submod, piecewise_num_tokens=buckets).to(device)
++        num_tokens = 8
++        runner = ADPiecewiseRunner(submod).to(device)
++        x = torch.randn(num_tokens, 16, device=device)
++
++        with torch.inference_mode():
++            ADPiecewiseRunner.set_current_num_tokens(num_tokens)
++
++            ADPiecewiseRunner.set_current_phase("warmup")
++            for _ in range(3):
++                runner(x)
++
++            ADPiecewiseRunner.set_current_phase("capture")
++            capture_out = runner(x)
++
++            entry = runner.entries[num_tokens]
++            assert entry.static_output is not None
++            if isinstance(capture_out, torch.Tensor):
++                assert entry.static_output.data_ptr() == capture_out.data_ptr()
++
++    def test_dynamic_out_buf_allocated_during_capture(self):
++        """When set_dynamic_out_info is called, capture allocates a buffer."""
++        device = "cuda"
++        submod = nn.Linear(16, 16).to(device)
++        submod.eval()
++
++        num_tokens = 8
++        dynamic_id = 7
++        runner = ADPiecewiseRunner(submod).to(device)
++
++        info = OutputInfo(
++            shape=torch.Size([num_tokens, 32]),
++            dtype=torch.float16,
++            device=torch.device(device),
++        )
++        runner.set_dynamic_out_info(dynamic_id, info)
++
++        x = torch.randn(num_tokens, 16, device=device)
+ 
+         with torch.inference_mode():
+-            for nt in buckets:
+-                x = torch.randn(nt, 16, device=device)
++            ADPiecewiseRunner.set_current_num_tokens(num_tokens)
++
++            ADPiecewiseRunner.set_current_phase("warmup")
++            for _ in range(3):
++                runner(x)
++
++            ADPiecewiseRunner.set_current_phase("capture")
++            runner(x)
++
++            entry = runner.entries[num_tokens]
++            buf = entry.dynamic_out_bufs.get(dynamic_id)
++            assert buf is not None
++            assert buf.shape == torch.Size([num_tokens, 32])
++            assert buf.dtype == torch.float16
++
++    def test_get_dynamic_out_buf_after_capture(self):
++        """get_dynamic_out_buf should return the buffer after capture."""
++        device = "cuda"
++        submod = nn.Linear(16, 16).to(device)
++        submod.eval()
+ 
+-                ADPiecewiseRunner.set_current_num_tokens(nt)
++        num_tokens = 8
++        dynamic_id = 7
++        runner = ADPiecewiseRunner(submod).to(device)
+ 
+-                # Warmup
+-                ADPiecewiseRunner.set_current_phase("warmup")
+-                for _ in range(3):
+-                    runner(x)
++        info = OutputInfo(
++            shape=torch.Size([num_tokens, 32]),
++            dtype=torch.float16,
++            device=torch.device(device),
++        )
++        runner.set_dynamic_out_info(dynamic_id, info)
+ 
+-                # Capture
+-                ADPiecewiseRunner.set_current_phase("capture")
++        x = torch.randn(num_tokens, 16, device=device)
++
++        with torch.inference_mode():
++            ADPiecewiseRunner.set_current_num_tokens(num_tokens)
++
++            ADPiecewiseRunner.set_current_phase("warmup")
++            for _ in range(3):
+                 runner(x)
+ 
+-            # Replay each bucket
+-            ADPiecewiseRunner.set_current_phase("replay")
+-            for nt in buckets:
+-                x_new = torch.randn(nt, 16, device=device)
+-                ADPiecewiseRunner.set_current_num_tokens(nt)
+-                replay_out = runner(x_new)
+-                eager_out = submod(x_new)
+-
+-                torch.cuda.synchronize()
+-                assert torch.allclose(replay_out, eager_out, atol=1e-5), (
+-                    f"Replay mismatch for bucket {nt}"
+-                )
++            ADPiecewiseRunner.set_current_phase("capture")
++            runner(x)
++
++            buf = runner.get_dynamic_out_buf(num_tokens, dynamic_id)
++            assert buf is not None
++            assert buf.shape == torch.Size([num_tokens, 32])
++
++    def test_entries_created_on_demand(self):
++        """Entries are created during capture, not at init."""
++        device = "cuda"
++        submod = nn.Linear(16, 16).to(device)
++        submod.eval()
++
++        runner = ADPiecewiseRunner(submod).to(device)
++        assert len(runner.entries) == 0
++
++        x = torch.randn(8, 16, device=device)
++        with torch.inference_mode():
++            ADPiecewiseRunner.set_current_num_tokens(8)
++            ADPiecewiseRunner.set_current_phase("warmup")
++            runner(x)
++            assert 8 not in runner.entries
++
++            ADPiecewiseRunner.set_current_phase("capture")
++            runner(x)
++            assert 8 in runner.entries
+diff --git a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
+index f8e88f5895af..c9a9ac6eadeb 100644
+--- a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
++++ b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
+@@ -137,7 +137,7 @@ def test_known_metadata_prep_op_returns_true(self):
+         assert is_dynamic_cached_op(node) is True
+ 
+     def test_known_logits_gather_op_returns_true(self):
+-        target = _FakeOpOverload("auto_deploy::gather_logits_before_lm_head")
++        target = _FakeOpOverload("auto_deploy::gather_tokens")
+         node = _make_mock_node("call_function", target=target)
+         assert is_dynamic_cached_op(node) is True
+ 
+diff --git a/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemm_fusion.py b/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemm_fusion.py
+index cfa27178d84a..97eb0136bf25 100644
+--- a/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemm_fusion.py
++++ b/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemm_fusion.py
+@@ -1,5 +1,6 @@
+ """Tests for basic GEMM fusion."""
+ 
++import operator
+ from abc import abstractmethod
+ from typing import Callable, Tuple
+ 
+@@ -442,6 +443,23 @@ def forward(self, x):
+         return qkv.sum(-1, keepdim=True) + z.sum(-1).sum(-1, keepdim=True) + a.sum(-1, keepdim=True)
+ 
+ 
++def _count_split_output_views(gm) -> int:
++    """Count output split views produced by fusion (torch.narrow or split_output+getitem)."""
++    count = 0
++    for n in gm.graph.nodes:
++        if n.op == "call_function" and n.target is torch.narrow:
++            count += 1
++        elif (
++            n.op == "call_function"
++            and n.target is operator.getitem
++            and len(n.args) >= 1
++            and hasattr(n.args[0], "target")
++            and getattr(n.args[0].target, "__name__", "") == "split_output"
++        ):
++            count += 1
++    return count
++
++
+ @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+ @torch.inference_mode()
+ def test_fuse_gemms_mixed_children_mixed_quant():
+@@ -478,13 +496,9 @@ def test_fuse_gemms_mixed_children_mixed_quant():
+     assert num_fp8_after == 1, f"Expected 1 fused FP8 linear, got {num_fp8_after}"
+     assert num_bf16_after == 1, f"Expected 1 fused bf16 linear, got {num_bf16_after}"
+ 
+-    # Verify 4 narrow nodes (2 from FP8 group + 2 from bf16 group)
+-    narrow_count = sum(
+-        1
+-        for n in gm_transformed.graph.nodes
+-        if n.op == "call_function" and n.target is torch.narrow
+-    )
+-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
++    # Verify 4 split output views (2 from FP8 group + 2 from bf16 group)
++    split_view_count = _count_split_output_views(gm_transformed)
++    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
+ 
+     # Numerical correctness
+     y_transformed = gm_transformed(x)
+@@ -530,13 +544,9 @@ def test_fuse_gemms_mixed_children_qwen35_like(dtype: str):
+         test_load_hook=False,
+     )
+ 
+-    # Verify narrow nodes exist (zero-copy view splitting)
+-    narrow_count = sum(
+-        1
+-        for n in gm_transformed.graph.nodes
+-        if n.op == "call_function" and n.target is torch.narrow
+-    )
+-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
++    # Verify split output views exist (contiguous splitting)
++    split_view_count = _count_split_output_views(gm_transformed)
++    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
+ 
+     reset_parameters(gm_transformed)
+     y_random = gm_transformed(x)
+@@ -578,13 +588,9 @@ def test_fuse_gemms_mixed_children(dtype: str):
+         test_load_hook=False,
+     )
+ 
+-    # Verify narrow nodes exist (zero-copy view splitting)
+-    narrow_count = sum(
+-        1
+-        for n in gm_transformed.graph.nodes
+-        if n.op == "call_function" and n.target is torch.narrow
+-    )
+-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
++    # Verify split output views exist (contiguous splitting)
++    split_view_count = _count_split_output_views(gm_transformed)
++    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
+ 
+     reset_parameters(gm_transformed)
+     y_random = gm_transformed(x)

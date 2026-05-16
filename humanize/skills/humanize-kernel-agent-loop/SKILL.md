@@ -1,6 +1,6 @@
 ---
 name: humanize-kernel-agent-loop
-description: "Run an end-to-end Humanize Kernel Agent Loop for GPU kernel optimization: plan, refine, create a clean standalone repo, use kernel-knowledge, benchmark, profile with Nsight Compute, maintain lineage/ledgers, and start RLCR."
+description: "Run an end-to-end Humanize Kernel Agent Loop for GPU kernel optimization: plan, refine, create a clean standalone repo, use kernel-knowledge, benchmark, profile with ncu-report/Nsight Compute, maintain lineage/ledgers, and start RLCR."
 type: flow
 ---
 
@@ -10,6 +10,27 @@ Use this flow when the user wants a CUDA kernel optimization loop, not a
 general software feature loop. This is a kernel-specialized wrapper around
 Humanize RLCR.
 
+## Algorithm Mapping
+
+This skill follows the Humanize kernel loop architecture without pinning the
+writer agent or review model:
+
+- Planning: the current writer agent turns the one-sentence kernel goal into a
+  kernel-specific plan, refines it, and records acceptance criteria.
+- Execution: the current writer agent edits the standalone repo, compiles,
+  tests, benchmarks, profiles with `ncu-report`, and queries `kernel-knowledge`
+  when useful.
+- Review: Humanize's native Stop hook uses the configured review backend and
+  model to review evidence; after implementation is accepted, the review phase
+  runs the configured branch-diff review.
+- Feedback loop: if review blocks exit, the current writer agent applies the
+  feedback and reruns the inspect/edit/compile/test/benchmark/profile loop.
+
+In diagrams or papers that say "Claude executes, Codex reviews", read "Claude"
+as "the current writer agent". In a Claude Code session that may be Claude; in
+a Codex session that may be Codex. The review model is controlled by Humanize
+configuration or CLI flags, not by this skill.
+
 The installer hydrates these paths:
 
 ```text
@@ -18,7 +39,7 @@ KernelPilot root: {{KERNELPILOT_ROOT}}
 ```
 
 If `{{KERNELPILOT_ROOT}}` was not hydrated, locate a repository containing
-`knowledge/index.json` and `references/kernel-source-catalog.md`.
+`knowledge/SKILL.md` and `knowledge/evidence/pull-bundles/`.
 
 ## Contract
 
@@ -47,7 +68,7 @@ missing and cannot be inferred.
 - The baseline kernel can be the starting point. You may copy or adapt baseline
   code into the standalone repo when license and attribution allow.
   Record the exact source path/URL, commit, license/notice, and delta in the
-  source ledger and lineage.
+  attempt ledger or lineage.
 - If the user explicitly asks for a from-scratch kernel or says not to use the
   baseline implementation, do not copy, adapt, or pattern-match the baseline
   kernel code. Use that baseline only for correctness, benchmark, profiler, and
@@ -60,12 +81,12 @@ missing and cannot be inferred.
   artifacts.
 - Every correct candidate attempt gets an attempt-ledger row. Only correct
   candidates that improve performance get an optimization-ledger row.
-- Collect one baseline Nsight Compute digest for a representative case after
-  baseline correctness/benchmark succeeds. Skip it only when NCU cannot run, and
-  record the reason.
-- Use NCU again for regressions, plateaus, surprising wins, or profile-driven
-  edits. Do not run full NCU for every tiny iteration unless the benchmark
-  result is hard to explain.
+- Collect one baseline `ncu-report` digest for a representative case after
+  baseline correctness/benchmark succeeds. Skip it only when Nsight Compute
+  cannot run, and record the reason.
+- Use `ncu-report` again for regressions, plateaus, surprising wins, or
+  profile-driven edits. Do not run full NCU for every tiny iteration unless the
+  benchmark result is hard to explain.
 - Do not declare the loop complete while relevant NCU/profile acceptance
   criteria are unmet.
 
@@ -78,77 +99,91 @@ Create these before starting RLCR, then keep them updated during the loop:
 .humanize/kernel-agent/refined-plan.md
 README.md
 src/<task_name>/
+bindings/
 tests/
 benchmarks/
-artifacts/attempt-ledger.md
-artifacts/optimization-ledger.md
-artifacts/source-idea-ledger.md
-artifacts/lineage.jsonl
-artifacts/profile-digests/README.md
+ledgers/attempt-ledger.md
+ledgers/optimization-ledger.md
+ledgers/lineage.jsonl
+profile-artifacts/README.md
 ```
 
 The plan file may stay gitignored under `.humanize/` so RLCR can start without
 tracking local loop state.
 
-## Knowledge Pass
+## Knowledge Evidence
 
-Before writing the plan or choosing any optimization direction:
+KernelPilot provides a PR-driven evidence corpus, and Humanize owns when, how,
+and how much to use it. Knowledge lookup is part of the autonomous optimization
+loop: the writer agent queries PR artifacts whenever they help the current
+plan, implementation choice, benchmark result, profile digest,
+plateau/regression explanation, reviewer question, or next kernel edit.
+PR diffs and materialized source snapshots are the primary evidence, while
+wiki syntheses, docs, blogs, contest notes, and query indices are supporting
+knowledge that Humanize may use whenever they clarify hardware behavior,
+techniques, profile interpretation, or implementation choices.
 
-1. Read `{{KERNELPILOT_ROOT}}/knowledge/README.md`.
-2. Read `{{KERNELPILOT_ROOT}}/knowledge/routing/topics/index.md`.
-3. Read `{{KERNELPILOT_ROOT}}/knowledge/references/index.md`.
-4. Read relevant topic pages, usually one or more of:
-   - `knowledge/routing/topics/matmul-gemm.md`
-   - `knowledge/routing/topics/attention.md`
-   - `knowledge/routing/topics/normalization.md`
-   - `knowledge/routing/topics/activation-fusion.md`
-   - `knowledge/routing/topics/quantization-fp8.md`
-5. Read relevant framework pages, usually:
-   - `knowledge/routing/frameworks/sglang.md`
-   - plus `cutlass.md`, `deepgemm.md`, `vllm.md`, `flashinfer.md`,
-     `flash-attention.md`, `triton.md`, `tilelang.md`, `cute-dsl.md`,
-     `quack.md`, `tilekernels.md`, `thunderkittens.md`,
-     `veitner-blog.md`, `colfax-research.md`, `cuda-blog-kernels.md`, or
-     `pytorch.md` as appropriate.
-6. Read the matching deep source guide under
-   `knowledge/references/source-guides/`.
-7. For PR-driven production repositories, read the matching PR guide under
-   `knowledge/references/prs/` in the same knowledge pass. Treat PR diffs,
-   changed kernel files, linked tests, benchmark files, review-linked issues,
-   source guide paths, and direct source scans as the paired kernel-knowledge
-   evidence layer. Do not query PRs for source-only repositories such as
-   PyTorch, DeepSeek TileKernels, CUDA sample repos, blog/code companion repos,
-   puzzle repos, source catalogs, and repositories with fewer than 10 selected
-   CUDA optimization PRs; inspect their source guide and current code directly
-   instead.
-8. PR pages keep filtered CUDA optimization PRs rather than a small curated
-   top-N. Each entry must have CUDA/NVIDIA target evidence, a real kernel/source
-   change, and an optimization/performance mechanism. Search both the PR page,
-   when applicable, and source guide for kernel family, dtype, architecture,
-   backend, and bottleneck terms before choosing an edit.
-9. If the bottleneck is known but the best source repository is unclear, read
-   `knowledge/references/prs/by-topic/index.md` and the matching topic page.
-10. Read `knowledge/references/prs/open-watchlist.md` only for volatile current
-   ideas, and re-check linked GitHub PRs before using code or benchmark claims.
-11. Read `{{KERNELPILOT_ROOT}}/references/kernel-source-catalog.md`.
-12. For plateau research or blog-driven source ideas, read
-   `knowledge/references/blogs/index.md` and the matching blog page before
-   opening companion code.
+Useful entry points from `{{KERNELPILOT_ROOT}}/knowledge`:
 
-Keep the first pass scoped: one topic page, one framework page, one source
-guide, and one PR page when the repository is PR-driven. Do not scan the whole
-knowledge tree up front.
+```bash
+cd {{KERNELPILOT_ROOT}}/knowledge
+python3 scripts/query.py "tcgen05" --architecture B200 --limit 10
+python3 scripts/query.py --repo pytorch/pytorch --compact
+python3 scripts/get_page.py pr-pytorch-157241 --follow-sources
+```
 
-Pair production PRs with current source code, tests, and benchmarks before blogs
-or articles when the repository is PR-driven. For source-only repositories such
-as PyTorch, blog/code companion repos, and repositories with fewer than 10
-selected CUDA optimization PRs, skip PR lookup and use source guides plus direct
-source scans. During plateau expansion, use merged repository PR pages plus
-matching source guides for PR-driven repos, then cross-repository by-topic PR
-pages plus relevant source guides, then the open PR watchlist plus current
-source scan, then blog/code references. External kernels may be used as
-baselines, starting candidates, or prior art when their license/attribution
-allows it.
+Useful wiki/doc/blog entry points:
+
+```bash
+cd {{KERNELPILOT_ROOT}}/knowledge
+
+# Synthesized wiki pages: hardware, techniques, patterns, languages, kernels.
+python3 scripts/query.py "Blackwell memory hierarchy" --type hardware --limit 10
+python3 scripts/query.py --type technique --tag pipeline-stages --compact
+python3 scripts/query.py "tail effect persistent scheduling" --type pattern --compact
+python3 scripts/query.py "PTX cache policy" --type language --compact
+python3 scripts/get_page.py technique-profiling-debugging-loop --follow-sources
+
+# Source docs and blogs. Source pages use source_category values as --type.
+python3 scripts/query.py "tcgen05 tmem tuning guide" --type official-doc --limit 10
+python3 scripts/query.py "Blackwell microbenchmark tensor memory" --type benchmark-blog --limit 10
+python3 scripts/query.py "CuTe DSL TMA swizzle" --type community-note --limit 10
+python3 scripts/get_page.py doc-nvidia-tuning-guide --body-only
+python3 scripts/get_page.py blog-blackwell-microbenchmarking --body-only
+
+# Regex search: wiki-only for synthesized pages, sources-only for docs/blogs.
+python3 scripts/grep_wiki.py "tcgen05\\.fence" --only wiki
+python3 scripts/grep_wiki.py "long scoreboard" "prefetch" --only sources --any
+```
+
+Prefer materialized bundles under:
+
+```text
+knowledge/evidence/pull-bundles/<repo-id>/gh-<number>/
+```
+
+Each bundle should contain `review.diff`, `ORIGIN.yaml`, `upstream.json`,
+and key changed source/test/benchmark files under `source-snapshot/`.
+
+Autonomous query order:
+
+1. Use `scripts/query.py` for broad routing by architecture, repo, tag,
+   operator, bottleneck, or exact instruction/feature term.
+2. Use `scripts/get_page.py --follow-sources` to expand a promising wiki or PR
+   page into its cited evidence.
+3. Open the materialized `review.diff`, `ORIGIN.yaml`, `upstream.json`, and
+   `source-snapshot/` files for the PR before borrowing any idea.
+4. Use `scripts/grep_wiki.py` for exact terms such as instruction mnemonics,
+   CuTe atoms, profiler counters, dtype names, and memory/cache policy names.
+5. Use wiki syntheses to choose techniques and interpret profiler symptoms; use
+   docs/blogs to understand hardware contracts, DSL semantics, and public
+   performance claims; then ground implementation choices back in PR/source
+   evidence when code is borrowed or adapted.
+
+Knowledge lookup should remain autonomous. Do not create a separate reading
+ledger just to prove that pages were opened. When a source directly affects
+code, record the actionable provenance in the relevant attempt row, lineage
+entry, or profile digest.
 
 ## Plan Requirements
 
@@ -169,44 +204,37 @@ use the Humanize gen-plan schema and include these acceptance criteria:
   baseline parity.
 - Benchmark harness records per-shape timing, geomean, best/worst cases, and
   environment metadata.
-- A baseline Nsight Compute profile is captured for one representative
+- A baseline `ncu-report` profile is captured for one representative
   bottleneck case after baseline benchmark succeeds and before the first
   profile-driven edit.
-- Later Nsight Compute profiles are captured for regressions, plateaus,
-  surprising wins, or reviewer-requested evidence, then converted into Profile
-  Evidence Digests.
+- Later `ncu-report` profiles are captured for regressions, plateaus, surprising
+  wins, or reviewer-requested evidence, then converted into NCU Report Digests.
 - Attempt ledger records every version, including failed correctness,
   regressions, plateaus, and abandoned ideas.
 - Optimization ledger records only correct versions with measured improvement.
-- Lineage records parent version, mutation/motivation, source idea keys, result,
-  and selected/rejected status.
-- Source idea ledger records both PR provenance, when available, and source-code
-  provenance: repo, path, symbol/function, opened tests or benchmarks,
-  hypothesis, result, and do-not-reread key.
-- After two consecutive weak rounds with less than 1% geomean improvement over
-  the prior best, perform research expansion before editing again: read at
-  least 50 new code-first sources before prose sources, prioritize unread PR
-  diffs, current source files, symbols, and changed kernel/test/benchmark
-  files, log paired source provenance, and avoid re-reading by checking
-  `artifacts/source-idea-ledger.md`.
-- Stop only when all ACs are met, or when profile evidence shows the kernel is
+- Lineage records parent version, mutation/motivation, influential source or PR
+  evidence when it directly affects code, result, and selected/rejected status.
+- When progress stalls, Humanize expands PR research autonomously. Prefer unread
+  PR bundles, changed kernel files, linked tests, benchmarks, and profiler
+  notes, guided by the current task context and existing attempt/lineage notes.
+- Stop only when all ACs are met, or when `ncu-report` evidence shows the kernel is
   already beyond 85% of the relevant peak and no low-effort implementation edit
   remains.
 
-## Profile Evidence
+## NCU Report Evidence
 
-Invoke profile-evidence rules whenever any of these hold:
+Invoke the `ncu-report` skill whenever any of these hold:
 
-- Baseline benchmark has passed and no baseline Profile Evidence Digest exists.
+- Baseline benchmark has passed and no baseline NCU Report Digest exists.
 - A correct candidate is within +/-2% of baseline across configured cases.
 - A correct candidate regresses on one or more configured cases.
-- Two consecutive iterations show less than 1% geomean improvement over the
-  prior best.
+- The benchmark has plateaued or weakly improved and the next edit is unclear.
 - A candidate is much faster than expected and needs explanation.
-- A reviewer asks for a Profile Evidence Digest.
+- A reviewer asks for an NCU Report Digest.
 
-Persist both `.ncu-rep` and CSV export paths in the digest. Each digest must end
-with one concrete next edit.
+Persist `.ncu-rep`, raw CSV, source export, PM-sampling export when available,
+and comparison paths in the digest. Each digest must end with one concrete next
+kernel edit.
 
 ## RLCR Startup
 
@@ -218,6 +246,9 @@ from inside the standalone repo:
 ```
 
 If setup exits non-zero, stop and report the error. Do not bypass the gate.
+The loop uses Humanize's configured review model and default max iteration
+limit unless the caller explicitly passes overrides such as `--max` or a model
+flag. The current default max iteration limit is 84 rounds.
 
 After setup succeeds:
 
