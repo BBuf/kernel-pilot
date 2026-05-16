@@ -1,0 +1,311 @@
+diff --git a/include/triton/Tools/Sys/GetEnv.h b/include/triton/Tools/Sys/GetEnv.h
+index d9fc2b5fcfb7..7586d71994aa 100644
+--- a/include/triton/Tools/Sys/GetEnv.h
++++ b/include/triton/Tools/Sys/GetEnv.h
+@@ -46,6 +46,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
+     "TRITON_F32_DEFAULT",
+     "TRITON_PREFER_TMEM_16x256_LAYOUT",
+     "TRITON_ENABLE_EXPERIMENTAL_CONSAN",
++    "TRITON_CONSAN_INIT_ALLOCATIONS",
+     "TRITON_PLUGIN_PATHS",
+     "TRITON_PLUGIN_VERSION_CHECK",
+     "TRITON_PARTITION_SCHEDULING_ENABLE_DUMP_DOT",
+diff --git a/lib/Dialect/TritonInstrument/Transforms/ConcurrencySanitizer.cpp b/lib/Dialect/TritonInstrument/Transforms/ConcurrencySanitizer.cpp
+index 5a304cfc15a6..20680e5ea520 100644
+--- a/lib/Dialect/TritonInstrument/Transforms/ConcurrencySanitizer.cpp
++++ b/lib/Dialect/TritonInstrument/Transforms/ConcurrencySanitizer.cpp
+@@ -8,8 +8,7 @@
+ #include "triton/Dialect/TritonInstrument/IR/Utility.h"
+ #include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
+ #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+-#include "llvm/ADT/StringMap.h"
+-#include "llvm/Support/ErrorHandling.h"
++#include "triton/Tools/Sys/GetEnv.h"
+ 
+ namespace mlir {
+ namespace triton {
+@@ -153,6 +152,119 @@ Value allCTAsMask(ImplicitLocOpBuilder &b) {
+   return arith::ConstantIntOp::create(b, (1u << numCTAs) - 1, 32);
+ }
+ 
++bool shouldInitializeAllocations() {
++  std::string envValue = tt::tools::getStrEnv("TRITON_CONSAN_INIT_ALLOCATIONS");
++  if (envValue.empty())
++    return true;
++  if (auto enabled = tt::tools::isEnvValueBool(envValue))
++    return *enabled;
++  llvm::report_fatal_error("TRITON_CONSAN_INIT_ALLOCATIONS must be a boolean");
++}
++
++llvm::APInt getIntegerNaNPattern(unsigned bitWidth) {
++  switch (bitWidth) {
++  case 16:
++    // 0x7FC0 is a NaN in both bfloat16 and float16 interpretations.
++    return llvm::APInt(16, 0x7FC0);
++  case 32:
++    return llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()).bitcastToAPInt();
++  case 64:
++    return llvm::APFloat::getNaN(llvm::APFloat::IEEEdouble()).bitcastToAPInt();
++  default:
++    return llvm::APInt::getAllOnes(bitWidth);
++  }
++}
++
++Value createPoisonTensor(ImplicitLocOpBuilder &b,
++                         ttg::MemDescType memDescType) {
++  auto region = b.getInsertionBlock()->getParent();
++  Type elementType = memDescType.getElementType();
++  RankedTensorType poisonType;
++  if (isa<ttng::TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
++    auto encoding = ttng::getDefaultLayoutForTmemLdSt(
++        memDescType, ttg::lookupNumWarps(region));
++    poisonType =
++        RankedTensorType::get(memDescType.getShape(), elementType, encoding);
++  } else {
++    auto encoding = ttg::getDefaultBlockedEncoding(
++        b.getContext(), memDescType.getShape(), ttg::lookupNumWarps(region),
++        ttg::lookupThreadsPerWarp(b), ttg::lookupNumCTAs(b));
++    encoding = ttg::BlockedEncodingAttr::get(
++        b.getContext(), encoding.getSizePerThread(),
++        encoding.getThreadsPerWarp(), encoding.getWarpsPerCTA(),
++        encoding.getOrder(), ttg::getCGALayout(memDescType.getEncoding()));
++    poisonType =
++        RankedTensorType::get(memDescType.getShape(), elementType, encoding);
++  }
++
++  DenseElementsAttr poison;
++  if (auto floatType = dyn_cast<FloatType>(elementType)) {
++    poison = DenseElementsAttr::get(
++        poisonType, llvm::APFloat::getNaN(floatType.getFloatSemantics()));
++  } else if (auto integerType = dyn_cast<IntegerType>(elementType)) {
++    poison = DenseElementsAttr::get(
++        poisonType, getIntegerNaNPattern(integerType.getWidth()));
++  } else {
++    llvm::report_fatal_error(
++        "ConSan allocation initialization expects integer or float elements");
++  }
++  return arith::ConstantOp::create(b, b.getLoc(), poisonType, poison);
++}
++
++Value createSingleBufferView(ImplicitLocOpBuilder &b, Value alloc,
++                             int64_t buffer) {
++  auto allocType = cast<ttg::MemDescType>(alloc.getType());
++  SmallVector<int64_t> shape(allocType.getShape().begin() + 1,
++                             allocType.getShape().end());
++  auto viewType = ttg::MemDescType::get(
++      shape, allocType.getElementType(), allocType.getEncoding(),
++      allocType.getMemorySpace(), allocType.getMutableMemory());
++  Value index = arith::ConstantIntOp::create(b, buffer, 32);
++  return ttg::MemDescIndexOp::create(b, b.getLoc(), viewType, alloc, index);
++}
++
++void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
++  auto allocType = cast<ttg::MemDescType>(alloc.getType());
++  SmallVector<Value> leaves;
++  unsigned storeRank = allocType.getRank();
++  if (isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace())) {
++    storeRank = 2;
++  } else {
++    auto encoding = dyn_cast<ttg::LayoutEncodingTrait>(allocType.getEncoding());
++    assert(encoding && "shared allocation must have a layout encoding");
++    storeRank = encoding.getRank();
++  }
++
++  if (allocType.getRank() == storeRank) {
++    leaves.push_back(alloc);
++  } else {
++    assert(allocType.getRank() == storeRank + 1 &&
++           "only single-dimension multibuffer allocations are supported");
++    for (int64_t buffer = 0; buffer < allocType.getDimSize(0); ++buffer)
++      leaves.push_back(createSingleBufferView(b, alloc, buffer));
++  }
++
++  for (Value leaf : leaves) {
++    Value poison =
++        createPoisonTensor(b, cast<ttg::MemDescType>(leaf.getType()));
++    if (isa<ttng::TensorMemorySpaceAttr>(
++            cast<ttg::MemDescType>(leaf.getType()).getMemorySpace())) {
++      Value pred = arith::ConstantIntOp::create(b, 1, 1);
++      ttng::TMEMStoreOp::create(b, leaf, poison, pred);
++    } else {
++      ttg::LocalStoreOp::create(b, poison, leaf);
++    }
++  }
++}
++
++bool canInitializeAllocation(Value alloc) {
++  auto allocType = cast<ttg::MemDescType>(alloc.getType());
++  if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
++    return true;
++  unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
++  return numWarps % 4 == 0;
++}
++
+ uint16_t getBlockBroadcastMask(Value alloc) {
+   auto allocTy = cast<ttg::MemDescType>(alloc.getType());
+   auto kBlock = StringAttr::get(alloc.getContext(), "block");
+@@ -297,10 +409,36 @@ class ConcurrencySanitizerImpl {
+     ImplicitLocOpBuilder b(entryPoint.getLoc(), entryPoint);
+     b.setInsertionPointToStart(&entryPoint.getBody().front());
+     instrumentMemoryOperations(b, funcBuilder);
++    initializeAllocations();
+     return success();
+   }
+ 
+ private:
++  void initializeAllocations() {
++    if (!shouldInitializeAllocations())
++      return;
++
++    SmallVector<Operation *> allocationsToInitialize;
++    module.walk([&](Operation *op) {
++      if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
++        if (!alloc.getSrc())
++          allocationsToInitialize.push_back(op);
++      }
++      if (auto alloc = dyn_cast<ttng::TMEMAllocOp>(op)) {
++        if (!alloc.getSrc())
++          allocationsToInitialize.push_back(op);
++      }
++    });
++
++    for (Operation *op : allocationsToInitialize) {
++      ImplicitLocOpBuilder b(op->getLoc(), op);
++      b.setInsertionPointAfter(op);
++      Value alloc = op->getResult(0);
++      if (canInitializeAllocation(alloc))
++        initializeAllocation(b, alloc);
++    }
++  }
++
+   void instrumentMemoryOperations(ImplicitLocOpBuilder &b,
+                                   tti::FunctionBuilder &funcBuilder) {
+     module.walk([&](Operation *op) {
+diff --git a/python/test/gluon/test_consan.py b/python/test/gluon/test_consan.py
+index 59a79bce069f..9482fe102a2d 100644
+--- a/python/test/gluon/test_consan.py
++++ b/python/test/gluon/test_consan.py
+@@ -156,6 +156,37 @@ def test_consan_uses_profile_scratch(device, fresh_knobs, num_ctas):
+         assert compiled.metadata.global_scratch_size == 0
+ 
+ 
++@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 10, reason="Requires blackwell or newer")
++@pytest.mark.parametrize("MEMORY_KIND", ["shared", "tensor"])
++def test_consan_initializes_allocations_with_nan(MEMORY_KIND, device, fresh_knobs, num_ctas):
++    fresh_knobs.compilation.instrumentation_mode = "consan"
++
++    @gluon.jit
++    def kernel(output, MEMORY_KIND: ttgl.constexpr):
++        block_m: ttgl.constexpr = XBLOCK * ttgl.num_ctas()
++        cga_layout: ttgl.constexpr = default_cga_layout(ttgl.num_ctas(), 2)
++        reg_layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, XBLOCK], threads_per_warp=[32, 1],
++                                                        warps_per_cta=[4, 1], order=[0, 1], cga_layout=cga_layout)
++        offs_m = ttgl.arange(0, block_m, ttgl.SliceLayout(1, reg_layout))[:, None]
++        offs_n = ttgl.arange(0, XBLOCK, ttgl.SliceLayout(0, reg_layout))[None, :]
++        offs = offs_m * XBLOCK + offs_n
++        if MEMORY_KIND == "shared":
++            memory_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2,
++                                                                   cga_layout=cga_layout)
++            alloc = ttgl.allocate_shared_memory(ttgl.float32, [block_m, XBLOCK], memory_layout)
++            value = alloc.load(reg_layout)
++        else:
++            memory_layout: ttgl.constexpr = blackwell.TensorMemoryLayout((XBLOCK, XBLOCK), col_stride=1,
++                                                                         cga_layout=cga_layout)
++            alloc = blackwell.allocate_tensor_memory(ttgl.float32, [block_m, XBLOCK], memory_layout)
++            value = alloc.load(reg_layout)
++        ttgl.store(output + offs, value)
++
++    output = torch.empty((XBLOCK.value * num_ctas, XBLOCK.value), device=device, dtype=torch.float32)
++    kernel[(1, )](output, MEMORY_KIND=MEMORY_KIND, num_warps=4, num_ctas=num_ctas)
++    assert torch.isnan(output).all()
++
++
+ @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper or newer")
+ @pytest.mark.parametrize("FAILURE", [True, False])
+ def test_async_tma_kernel(FAILURE, device, run_wrapper, monkeypatch, num_ctas):
+diff --git a/test/TritonGPU/consan.mlir b/test/TritonGPU/consan.mlir
+index 76d4eafeceaa..e4e812713e74 100644
+--- a/test/TritonGPU/consan.mlir
++++ b/test/TritonGPU/consan.mlir
+@@ -1,4 +1,5 @@
+ // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritoninstrument-prepare-consan-captures="target=nvidia" -tritoninstrument-concurrency-sanitizer | FileCheck %s
++// RUN: env TRITON_CONSAN_INIT_ALLOCATIONS=0 triton-opt %s -split-input-file -allow-unregistered-dialect -tritoninstrument-prepare-consan-captures="target=nvidia" -tritoninstrument-concurrency-sanitizer | FileCheck %s --check-prefix=NO-INIT
+ 
+ #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+ #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+@@ -1565,3 +1566,75 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
+     tt.return
+   }
+ }
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
++#smem = #ttg.shared_memory
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
++  // CHECK-LABEL: @initialize_uninitialized_allocs
++  // NO-INIT-LABEL: @initialize_uninitialized_allocs
++  tt.func public @initialize_uninitialized_allocs() {
++    // CHECK: %[[SMEM:.*]] = ttg.local_alloc
++    // CHECK: %[[SMEM_POISON:.*]] = arith.constant dense<0x7FC00000> : tensor<128x128xf32
++    // CHECK: ttg.local_store %[[SMEM_POISON]], %[[SMEM]]
++    // CHECK: %[[TMEM:.*]] = ttng.tmem_alloc
++    // CHECK: %[[TMEM_POISON:.*]] = arith.constant dense<0x7FC00000> : tensor<128x128xf32
++    // CHECK: %[[TRUE:.*]] = arith.constant true
++    // CHECK: ttng.tmem_store %[[TMEM_POISON]], %[[TMEM]], %[[TRUE]]
++    // NO-INIT-NOT: ttg.local_store
++    // NO-INIT-NOT: ttng.tmem_store
++    %smem = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #shared, #smem, mutable>
++    %tmem = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++    // NO-INIT: tt.return
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
++#smem = #ttg.shared_memory
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 256 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
++  // CHECK-LABEL: @initialize_multibuffer_allocs
++  tt.func public @initialize_multibuffer_allocs() {
++    // CHECK: %[[SMEM:.*]] = ttg.local_alloc
++    // CHECK: %[[SMEM_0:.*]] = ttg.memdesc_index %[[SMEM]]
++    // CHECK: %[[SMEM_1:.*]] = ttg.memdesc_index %[[SMEM]]
++    // CHECK: ttg.local_store {{.*}}, %[[SMEM_0]]
++    // CHECK: ttg.local_store {{.*}}, %[[SMEM_1]]
++    // CHECK: %[[TMEM:.*]] = ttng.tmem_alloc
++    // CHECK: %[[TMEM_0:.*]] = ttg.memdesc_index %[[TMEM]]
++    // CHECK: %[[TMEM_1:.*]] = ttg.memdesc_index %[[TMEM]]
++    // CHECK: ttng.tmem_store {{.*}}, %[[TMEM_0]],
++    // CHECK: ttng.tmem_store {{.*}}, %[[TMEM_1]],
++    %smem = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #shared, #smem, mutable>
++    %tmem = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
++#smem = #ttg.shared_memory
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
++  // CHECK-LABEL: @skip_source_backed_allocs
++  tt.func public @skip_source_backed_allocs(%src: tensor<128x128xf32, #blocked>) {
++    // CHECK: ttg.local_alloc %{{.*}}
++    // CHECK-NOT: ttg.local_store
++    // CHECK: ttng.tmem_alloc %{{.*}}
++    // CHECK-NOT: ttng.tmem_store
++    %smem = ttg.local_alloc %src {allocation.offset = 0 : i32} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #shared, #smem, mutable>
++    %tmem = ttng.tmem_alloc %src {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
++    tt.return
++  }
++}

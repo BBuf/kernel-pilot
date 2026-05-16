@@ -1,0 +1,774 @@
+diff --git a/cpp/tensorrt_llm/kernels/fusedCatFp8.cu b/cpp/tensorrt_llm/kernels/fusedCatFp8.cu
+new file mode 100644
+index 000000000000..98dacf65f0ba
+--- /dev/null
++++ b/cpp/tensorrt_llm/kernels/fusedCatFp8.cu
+@@ -0,0 +1,224 @@
++/*
++ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "fusedCatFp8.h"
++#include "tensorrt_llm/common/assert.h"
++#include "tensorrt_llm/common/config.h"
++#include "tensorrt_llm/common/cudaUtils.h"
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++#include <cfloat>
++#include <cmath>
++#include <cstdint>
++
++TRTLLM_NAMESPACE_BEGIN
++
++namespace kernels
++{
++
++namespace
++{
++
++// Constants
++constexpr int HEAD_DIM = 128;       // Fixed for DSV3.2 indexer
++constexpr int WARP_SIZE = 32;       // One warp per row
++constexpr int ELEMS_PER_THREAD = 4; // 128 / 32 = 4 elements per thread
++constexpr int ROWS_PER_BLOCK = 8;   // Process 8 rows per block for occupancy
++constexpr float INV_FP8_E4M3_MAX = 1.0f / 448.0f;
++constexpr float MIN_AMAX = 1.0e-12f;
++
++/// Warp-wide max reduction
++__device__ __forceinline__ float warpReduceMax(float val)
++{
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
++    {
++        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
++    }
++    return val;
++}
++
++/// Helper union for vectorized BF16 loads (4 BF16 values = 8 bytes).
++union BF16x4
++{
++    int2 vec;
++    __nv_bfloat162 bf16x2[2];
++};
++
++/// Helper union for vectorized FP8 stores (4 FP8 values = 4 bytes).
++union FP8x4
++{
++    uint32_t u32;
++    __nv_fp8_e4m3 fp8[4];
++};
++
++/// Fused kernel: cat + FP8 quantization.
++///
++/// Grid: (ceil(M / ROWS_PER_BLOCK),)
++/// Block: (WARP_SIZE * ROWS_PER_BLOCK,)   i.e., (256,)
++///
++/// Each warp handles one row. Within a warp:
++///   - Thread t handles elements [4t, 4t+1, 4t+2, 4t+3] of the 128-dim row.
++///   - Loads from pe or nope based on element index (vectorized 8-byte loads).
++///   - FP8 quantizes with per-row scale (vectorized 4-byte stores).
++///
++/// Templated on UseUe8m0 to eliminate branch divergence.
++template <bool UseUe8m0>
++__global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out,
++    float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope,
++    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride)
++{
++    int warp_in_block = threadIdx.x / WARP_SIZE;
++    int lane = threadIdx.x % WARP_SIZE;
++    int row = blockIdx.x * ROWS_PER_BLOCK + warp_in_block;
++
++    if (row >= M)
++    {
++        return;
++    }
++
++    // ---- Stage 1: Load + Concat (vectorized 8-byte loads) ----
++    // pe_dim is guaranteed to be a multiple of ELEMS_PER_THREAD by the host check,
++    // so each thread's 4 elements come entirely from pe or entirely from nope.
++    // Use branchless pointer selection (compiles to SELP) to avoid warp divergence.
++    float v0, v1, v2, v3;
++    {
++        int base = lane * ELEMS_PER_THREAD;
++        __nv_bfloat16 const* pe_row = pe + static_cast<int64_t>(row) * pe_row_stride;
++        __nv_bfloat16 const* nope_row = nope + static_cast<int64_t>(row) * nope_row_stride;
++
++        bool from_pe = (base < pe_dim);
++        __nv_bfloat16 const* src = from_pe ? pe_row : nope_row;
++        int col = from_pe ? base : (base - pe_dim);
++
++        BF16x4 loaded;
++        loaded.vec = *reinterpret_cast<int2 const*>(src + col);
++
++        float2 f0 = __bfloat1622float2(loaded.bf16x2[0]);
++        float2 f1 = __bfloat1622float2(loaded.bf16x2[1]);
++        v0 = f0.x;
++        v1 = f0.y;
++        v2 = f1.x;
++        v3 = f1.y;
++    }
++
++    // ---- Stage 2: FP8 Quantization (1x128 block = entire row) ----
++    float local_max = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
++    float amax = warpReduceMax(local_max);
++    amax = fmaxf(amax, MIN_AMAX);
++
++    float scale;
++    if constexpr (UseUe8m0)
++    {
++        // UE8M0: scale = 2^ceil(log2(amax / FP8_MAX)) via IEEE 754 bit manipulation.
++        // This replaces ceilf(log2f(...)) + exp2f(...) with integer ops.
++        float ratio = amax * INV_FP8_E4M3_MAX;
++        uint32_t bits = __float_as_uint(ratio);
++        uint32_t mantissa = bits & 0x007FFFFFu;
++        uint32_t exp_bits = bits & 0x7F800000u;
++        // If mantissa is non-zero, round exponent up to next power of 2
++        if (mantissa != 0u)
++        {
++            exp_bits += 0x00800000u;
++        }
++        scale = __uint_as_float(exp_bits);
++    }
++    else
++    {
++        scale = amax * INV_FP8_E4M3_MAX;
++    }
++
++    // Use hardware approximate reciprocal (MUFU.RCP, ~2^-23 relative error).
++    // This is more than sufficient for FP8 E4M3 quantization (3 mantissa bits).
++    // Avoids the expensive Newton-Raphson refinement of __frcp_rn.
++    float inv_scale;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale));
++
++    // Quantize to FP8 — clamp is mathematically redundant since
++    // |val/scale| <= amax/scale <= FP8_MAX by construction, but kept
++    // for safety against floating-point rounding edge cases.
++    auto quantize = [&](float val) -> __nv_fp8_e4m3
++    {
++        float scaled = val * inv_scale;
++        return __nv_fp8_e4m3(scaled);
++    };
++
++    // ---- Stage 3: Store (vectorized 4-byte FP8 store) ----
++    FP8x4 packed;
++    packed.fp8[0] = quantize(v0);
++    packed.fp8[1] = quantize(v1);
++    packed.fp8[2] = quantize(v2);
++    packed.fp8[3] = quantize(v3);
++
++    int base_out = row * HEAD_DIM + lane * ELEMS_PER_THREAD;
++    *reinterpret_cast<uint32_t*>(fp8_out + base_out) = packed.u32;
++
++    if (lane == 0)
++    {
++        scale_out[row] = scale;
++    }
++}
++
++} // anonymous namespace
++
++void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe, __nv_bfloat16 const* nope,
++    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride,
++    bool use_ue8m0, cudaStream_t stream)
++{
++    if (M == 0)
++    {
++        return;
++    }
++
++    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp8: head_dim must be 128, got %d", head_dim);
++    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp8: pe_dim (%d) + nope_dim (%d) != head_dim (%d)",
++        pe_dim, nope_dim, head_dim);
++    TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatFp8: head_dim must be power of 2");
++    TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
++        "fusedCatFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
++    TLLM_CHECK_WITH_INFO(
++        pe_row_stride >= pe_dim, "fusedCatFp8: pe_row_stride (%d) must be >= pe_dim (%d)", pe_row_stride, pe_dim);
++    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp8: nope_row_stride (%d) must be >= nope_dim (%d)",
++        nope_row_stride, nope_dim);
++    TLLM_CHECK_WITH_INFO(pe_row_stride % ELEMS_PER_THREAD == 0,
++        "fusedCatFp8: pe_row_stride (%d) must be a multiple of %d for aligned vectorized access", pe_row_stride,
++        ELEMS_PER_THREAD);
++    TLLM_CHECK_WITH_INFO(nope_row_stride % ELEMS_PER_THREAD == 0,
++        "fusedCatFp8: nope_row_stride (%d) must be a multiple of %d for aligned vectorized access", nope_row_stride,
++        ELEMS_PER_THREAD);
++
++    int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
++    dim3 grid(num_blocks);
++    dim3 block(WARP_SIZE * ROWS_PER_BLOCK); // 256 threads per block
++
++    if (use_ue8m0)
++    {
++        fusedCatFp8Kernel<true><<<grid, block, 0, stream>>>(
++            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
++    }
++    else
++    {
++        fusedCatFp8Kernel<false><<<grid, block, 0, stream>>>(
++            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
++    }
++
++    TLLM_CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace kernels
++
++TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/kernels/fusedCatFp8.h b/cpp/tensorrt_llm/kernels/fusedCatFp8.h
+new file mode 100644
+index 000000000000..5118fc494de2
+--- /dev/null
++++ b/cpp/tensorrt_llm/kernels/fusedCatFp8.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "tensorrt_llm/common/config.h"
++#include "tensorrt_llm/common/cudaUtils.h"
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++
++TRTLLM_NAMESPACE_BEGIN
++
++namespace kernels
++{
++
++/// Fused concat + FP8 1x128 quantization.
++///
++/// Given two BF16 input matrices `pe` [M, pe_dim] and `nope` [M, nope_dim],
++/// this kernel concatenates them along the last dimension (pe first, nope second),
++/// then quantizes each row to FP8 E4M3 with one scale factor per row.
++///
++/// Inputs need not be fully contiguous — only the innermost dimension must be
++/// contiguous (stride 1).  The row stride for each input is provided explicitly
++/// via pe_row_stride / nope_row_stride, which allows processing non-contiguous
++/// views (e.g. from torch.split()) without a prior contiguous copy.
++///
++/// @param fp8_out         Output FP8 data [M, head_dim], row-major.
++/// @param scale_out       Output scales [M, 1], float32.  When use_ue8m0 is true,
++///                        the scale is stored as UE8M0 (power-of-two) in float bits.
++/// @param pe              Input PE part, BF16. Each row has pe_dim contiguous elements.
++/// @param nope            Input non-PE part, BF16. Each row has nope_dim contiguous elements.
++/// @param M               Number of rows (product of all dims except the last).
++/// @param pe_dim          Dimension of PE input (must satisfy pe_dim + nope_dim == head_dim).
++/// @param nope_dim        Dimension of non-PE input.
++/// @param head_dim        Total head dimension (must be 128, power of 2).
++/// @param pe_row_stride   Stride (in elements) between consecutive rows of pe.
++///                        For contiguous layout this equals pe_dim; for non-contiguous
++///                        views (e.g. from torch.split) it may be larger.
++/// @param nope_row_stride Stride (in elements) between consecutive rows of nope.
++/// @param use_ue8m0       If true, use UE8M0 (power-of-two) scale format.
++/// @param stream          CUDA stream.
++void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe, __nv_bfloat16 const* nope,
++    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride,
++    bool use_ue8m0, cudaStream_t stream = 0);
++
++} // namespace kernels
++
++TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/thop/CMakeLists.txt b/cpp/tensorrt_llm/thop/CMakeLists.txt
+index fd95805f6cbf..7eef7d370b65 100644
+--- a/cpp/tensorrt_llm/thop/CMakeLists.txt
++++ b/cpp/tensorrt_llm/thop/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
+ # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License"); you may not
+@@ -88,6 +88,7 @@ add_library(
+   fp8PerTensorScaleMoe.cpp
+   fp4BlockScaleMoe.cpp
+   noAuxTcOp.cpp
++  fusedCatFp8Op.cpp
+   IndexerKCacheScatterOp.cpp
+   IndexerTopKOp.cpp
+   ncclCommunicatorOp.cpp
+diff --git a/cpp/tensorrt_llm/thop/fusedCatFp8Op.cpp b/cpp/tensorrt_llm/thop/fusedCatFp8Op.cpp
+new file mode 100644
+index 000000000000..e4e0de19c5a6
+--- /dev/null
++++ b/cpp/tensorrt_llm/thop/fusedCatFp8Op.cpp
+@@ -0,0 +1,87 @@
++/*
++ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "tensorrt_llm/kernels/fusedCatFp8.h"
++#include "tensorrt_llm/thop/thUtils.h"
++
++#include <ATen/cuda/EmptyTensor.h>
++
++TRTLLM_NAMESPACE_BEGIN
++
++namespace torch_ext
++{
++
++std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0)
++{
++    CHECK_TH_CUDA(pe);
++    CHECK_TH_CUDA(nope);
++
++    TORCH_CHECK(pe.scalar_type() == at::ScalarType::BFloat16, "pe must be BF16, got ", pe.scalar_type());
++    TORCH_CHECK(nope.scalar_type() == at::ScalarType::BFloat16, "nope must be BF16, got ", nope.scalar_type());
++    TORCH_CHECK(pe.dim() >= 2, "pe must be >= 2D, got ", pe.dim(), "D");
++    TORCH_CHECK(nope.dim() >= 2, "nope must be >= 2D, got ", nope.dim(), "D");
++
++    // Innermost dimension must be contiguous for vectorized loads.
++    TORCH_CHECK(pe.stride(-1) == 1, "pe must have contiguous innermost dim (stride(-1)==1), got ", pe.stride(-1));
++    TORCH_CHECK(nope.stride(-1) == 1, "nope must have contiguous innermost dim (stride(-1)==1), got ", nope.stride(-1));
++
++    auto const pe_dim = static_cast<int32_t>(pe.size(-1));
++    auto const nope_dim = static_cast<int32_t>(nope.size(-1));
++    auto const head_dim = pe_dim + nope_dim;
++
++    TORCH_CHECK(head_dim == 128, "head_dim (pe_dim + nope_dim) must be 128, got ", head_dim);
++
++    // M = product of all dimensions except the last (handles 2D, 3D, etc.)
++    auto const pe_M = pe.numel() / pe_dim;
++    auto const nope_M = nope.numel() / nope_dim;
++    TORCH_CHECK(pe_M == nope_M, "pe and nope must have same number of rows. pe: ", pe_M, ", nope: ", nope_M);
++    auto const M = static_cast<int32_t>(pe_M);
++
++    // Extract row strides — stride of the second-to-last dimension.
++    // For contiguous [M, pe_dim], stride(-2) == pe_dim (same as before).
++    // For non-contiguous views from split(), stride(-2) may be larger (e.g. head_dim).
++    auto const pe_row_stride = static_cast<int32_t>(pe.stride(-2));
++    auto const nope_row_stride = static_cast<int32_t>(nope.stride(-2));
++
++    // Allocate output tensors
++    at::Tensor fp8_out
++        = at::detail::empty_cuda({M, head_dim}, at::ScalarType::Float8_e4m3fn, pe.device(), /* stride */ std::nullopt);
++    at::Tensor scale_out
++        = at::detail::empty_cuda({M, 1}, at::ScalarType::Float, pe.device(), /* stride */ std::nullopt);
++
++    auto stream = at::cuda::getCurrentCUDAStream(pe.get_device());
++
++    tensorrt_llm::kernels::invokeFusedCatFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
++        reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),
++        reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()), M, pe_dim, nope_dim, head_dim, pe_row_stride,
++        nope_row_stride, use_ue8m0, stream);
++
++    return {fp8_out, scale_out};
++}
++
++} // namespace torch_ext
++
++TRTLLM_NAMESPACE_END
++
++TORCH_LIBRARY_FRAGMENT(trtllm, m)
++{
++    m.def("fused_cat_fp8(Tensor pe, Tensor nope, bool use_ue8m0=False) -> (Tensor, Tensor)");
++}
++
++TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
++{
++    m.impl("fused_cat_fp8", &tensorrt_llm::torch_ext::fused_cat_fp8);
++}
+diff --git a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+index 0c561fedd266..b38e6ad7d4e0 100644
+--- a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
++++ b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+@@ -17,7 +17,7 @@
+     maybe_execute_in_parallel
+ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+-from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
++from tensorrt_llm._torch.utils import maybe_compile
+ from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
+ from tensorrt_llm.bindings import DataType
+ from tensorrt_llm.bindings.executor import KvCacheConfig
+@@ -29,7 +29,6 @@
+ from tensorrt_llm.logger import logger
+ from tensorrt_llm.mapping import Mapping
+ from tensorrt_llm.models.modeling_utils import QuantConfig
+-from tensorrt_llm.quantization.utils import fp8_utils
+ 
+ from .kernel import triton_convert_req_index_to_global_index
+ 
+@@ -1555,13 +1554,10 @@ def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
+         return q_pe, q_nope, k_pe, k_nope
+ 
+     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
+-        """Concatenate, rotate, and FP8 quantize for Q or K"""
+-        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
+-        q_or_k = rotate_activation(q_or_k)
+-        q_or_k = q_or_k.view(-1, self.head_dim)
+-        q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+-            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+-        return q_or_k
++        """Concatenate and FP8 quantize for Q or K via fused kernel."""
++        fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
++            qk_pe, qk_nope, self.scale_fmt == "ue8m0")
++        return fp8_out, scale
+ 
+     @torch.inference_mode()
+     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+diff --git a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+index 524a64c4cfcf..7ee2bd7eec5f 100644
+--- a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+@@ -544,6 +544,16 @@ def _(input: torch.Tensor, use_ue8m0: bool = False):
+                                 dtype=torch.float8_e4m3fn), input.new_empty(
+                                     sz, dtype=torch.float)
+ 
++    @torch.library.register_fake("trtllm::fused_cat_fp8")
++    def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
++        pe_dim = pe.shape[-1]
++        nope_dim = nope.shape[-1]
++        head_dim = pe_dim + nope_dim
++        M = pe.numel() // pe_dim
++        fp8_out = pe.new_empty((M, head_dim), dtype=torch.float8_e4m3fn)
++        scale_out = pe.new_empty((M, 1), dtype=torch.float32)
++        return fp8_out, scale_out
++
+     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+     def _(
+         x: torch.Tensor,
+diff --git a/tests/unittest/_torch/thop/serial/test_fused_cat_fp8.py b/tests/unittest/_torch/thop/serial/test_fused_cat_fp8.py
+new file mode 100644
+index 000000000000..59d0877265d1
+--- /dev/null
++++ b/tests/unittest/_torch/thop/serial/test_fused_cat_fp8.py
+@@ -0,0 +1,298 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Unit tests for fused_cat_fp8 custom op.
++
++Compares the fused kernel output against a sequential reference implementation
++(torch.cat → fp8_quantize_1x128) for numerical correctness.
++
++Note on tolerances: the fused kernel and the reference (fp8_quantize_1x128)
++compute amax at different precisions — the fused kernel uses fp32 throughout,
++while the reference truncates amax to bf16 before the warp reduction. This
++causes scale differences of up to ~0.8% (bf16 mantissa precision), which in
++turn causes a fraction of FP8 values to differ by 1 ULP. Tests therefore
++compare dequantized outputs (fp8 * scale) with tolerances appropriate for
++FP8 E4M3 quantization noise.
++"""
++
++import os
++import sys
++
++import pytest
++import torch
++
++sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
++from utils.util import getSMVersion
++
++# Import tensorrt_llm to load custom CUDA operators
++import tensorrt_llm  # noqa: F401
++
++
++def _reference_cat_fp8(pe, nope, use_ue8m0=False):
++    """Sequential reference: cat → fp8_quantize_1x128_sf_transpose."""
++    from tensorrt_llm.quantization.utils import fp8_utils
++
++    # Cat
++    combined = torch.cat([pe, nope], dim=-1)
++
++    # FP8 quantize
++    head_dim = combined.shape[-1]
++    combined_2d = combined.view(-1, head_dim)
++    fp8_out, scale = fp8_utils.fp8_quantize_1x128_sf_transpose(combined_2d, use_ue8m0=use_ue8m0)
++
++    return fp8_out, scale
++
++
++def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label="", use_ue8m0=False):
++    """Assert that two FP8-quantized tensors represent similar values.
++
++    Compares dequantized outputs (fp8 * scale) using tolerances appropriate
++    for FP8 E4M3 quantization noise. FP8 E4M3 has 3 mantissa bits, so
++    quantization noise is ~6.25% relative. With different amax precision
++    (fp32 vs bf16) between the two kernels, we allow slightly more.
++    """
++    prefix = f"{label}: " if label else ""
++
++    # Shape sanity
++    assert fused_fp8.shape == ref_fp8.shape, (
++        f"{prefix}FP8 shape mismatch: fused={fused_fp8.shape}, ref={ref_fp8.shape}"
++    )
++    fused_scale_flat = fused_scale.view(-1)
++    ref_scale_flat = ref_scale.view(-1)
++    assert fused_scale_flat.shape == ref_scale_flat.shape, (
++        f"{prefix}Scale shape mismatch: fused={fused_scale_flat.shape}, ref={ref_scale_flat.shape}"
++    )
++
++    # Scales: For UE8M0, scales are powers of 2 so they either match exactly
++    # or differ by 2x at boundary cases — rtol=1.0 covers the worst case.
++    # For non-UE8M0, scales are continuous floats — allow ~2% from bf16 vs
++    # fp32 amax precision difference.
++    scale_rtol = 1.0 if use_ue8m0 else 0.02
++    torch.testing.assert_close(
++        fused_scale_flat,
++        ref_scale_flat,
++        rtol=scale_rtol,
++        atol=1e-6,
++        msg=lambda msg: f"{prefix}Scale mismatch: {msg}",
++    )
++
++    # Dequantized values: the ground truth comparison. Both implementations
++    # should produce similar dequantized outputs despite different internals.
++    fused_deq = fused_fp8.float() * fused_scale
++    ref_deq = ref_fp8.float() * ref_scale
++
++    # Use allclose with tolerances for FP8 quantization noise.
++    # FP8 E4M3 has ~6.25% quantization noise; we allow 10% to account for
++    # different amax precision between the two kernels.
++    abs_err = (fused_deq - ref_deq).abs()
++    magnitude = ref_deq.abs().clamp(min=1e-6)
++    rel_err = abs_err / magnitude
++
++    mean_rel_err = rel_err.mean().item()
++    assert mean_rel_err < 0.1, (
++        f"{prefix}Mean relative dequantized error too high: {mean_rel_err:.4f} (expected < 0.1)"
++    )
++
++    # Most values should be very close (within 2% relative)
++    close_rate = (rel_err < 0.02).float().mean().item()
++    assert close_rate > 0.90, (
++        f"{prefix}Only {close_rate:.2%} of values within 2% relative error (expected > 90%)"
++    )
++
++
++# DSV3.2 indexer config: pe_dim=64, nope_dim=64, head_dim=128
++@pytest.mark.parametrize("M", [1, 3, 7, 9, 32, 64, 1024, 65536])
++@pytest.mark.parametrize("pe_dim,nope_dim", [(64, 64)])
++@pytest.mark.parametrize("use_ue8m0", [True, False])
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
++    """Test that fused kernel matches sequential reference (cat + fp8 quantize)."""
++    torch.manual_seed(42)
++    device = torch.device("cuda")
++
++    pe = torch.randn(M, pe_dim, dtype=torch.bfloat16, device=device)
++    nope = torch.randn(M, nope_dim, dtype=torch.bfloat16, device=device)
++
++    # Fused kernel
++    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
++
++    # Reference
++    ref_fp8, ref_scale = _reference_cat_fp8(pe, nope, use_ue8m0)
++
++    _assert_fp8_close(
++        fused_fp8,
++        fused_scale,
++        ref_fp8,
++        ref_scale,
++        label=f"M={M}, use_ue8m0={use_ue8m0}",
++        use_ue8m0=use_ue8m0,
++    )
++
++
++@pytest.mark.parametrize("M", [1, 256])
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_output_shape(M):
++    """Test that output shapes are correct."""
++    pe_dim, nope_dim = 64, 64
++    head_dim = pe_dim + nope_dim
++    device = torch.device("cuda")
++
++    pe = torch.randn(M, pe_dim, dtype=torch.bfloat16, device=device)
++    nope = torch.randn(M, nope_dim, dtype=torch.bfloat16, device=device)
++
++    fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, True)
++
++    assert fp8_out.shape == (M, head_dim), f"fp8_out shape: {fp8_out.shape}"
++    assert fp8_out.dtype == torch.float8_e4m3fn
++    assert scale.shape == (M, 1), f"scale shape: {scale.shape}"
++    assert scale.dtype == torch.float32
++
++
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_zero_input():
++    """Test with zero inputs — scales should be minimal, FP8 values should be zero."""
++    M = 64
++    pe_dim, nope_dim = 64, 64
++    device = torch.device("cuda")
++
++    pe = torch.zeros(M, pe_dim, dtype=torch.bfloat16, device=device)
++    nope = torch.zeros(M, nope_dim, dtype=torch.bfloat16, device=device)
++
++    fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, True)
++
++    # All values should be zero
++    assert (fp8_out.float() == 0).all(), "Expected all zero FP8 output for zero input"
++
++
++@pytest.mark.parametrize("M", [64, 1024])
++@pytest.mark.parametrize("use_ue8m0", [True, False])
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_noncontiguous_input(M, use_ue8m0):
++    """Test with non-contiguous inputs (simulates torch.split in DSA indexer).
++
++    In the real DSA forward path, pe/nope come from torch.split() on a
++    [M, head_dim] tensor, producing non-contiguous views with stride
++    [head_dim, 1] instead of [pe_dim, 1]. The thop must handle this.
++    """
++    pe_dim, nope_dim = 64, 64
++    head_dim = pe_dim + nope_dim
++    device = torch.device("cuda")
++
++    torch.manual_seed(42)
++    combined = torch.randn(M, head_dim, dtype=torch.bfloat16, device=device)
++    pe, nope = combined.split([pe_dim, nope_dim], dim=-1)
++
++    # Verify inputs are indeed non-contiguous
++    assert not pe.is_contiguous(), "pe should be non-contiguous from split"
++    assert not nope.is_contiguous(), "nope should be non-contiguous from split"
++
++    # Fused kernel should handle non-contiguous inputs
++    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
++
++    # Reference with contiguous copies
++    ref_fp8, ref_scale = _reference_cat_fp8(pe.contiguous(), nope.contiguous(), use_ue8m0=use_ue8m0)
++
++    _assert_fp8_close(
++        fused_fp8,
++        fused_scale,
++        ref_fp8,
++        ref_scale,
++        label=f"Non-contiguous M={M}",
++        use_ue8m0=use_ue8m0,
++    )
++
++
++@pytest.mark.parametrize("M", [1, 16, 64])
++@pytest.mark.parametrize("n_heads", [64])
++@pytest.mark.parametrize("use_ue8m0", [True, False])
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_3d_input(M, n_heads, use_ue8m0):
++    """Test with 3D inputs matching Q path: [M, n_heads, dim] from split.
++
++    In the DSA indexer, Q tensors are [M, n_heads, head_dim] split into
++    [M, n_heads, pe_dim] and [M, n_heads, nope_dim]. The kernel should handle
++    these 3D non-contiguous views directly without needing reshape.
++    """
++    pe_dim, nope_dim = 64, 64
++    head_dim = pe_dim + nope_dim
++    device = torch.device("cuda")
++
++    torch.manual_seed(42)
++    # Simulate q.view(-1, n_heads, head_dim).split([pe_dim, nope_dim], dim=-1)
++    q = torch.randn(M, n_heads, head_dim, dtype=torch.bfloat16, device=device)
++    pe, nope = q.split([pe_dim, nope_dim], dim=-1)
++
++    assert pe.shape == (M, n_heads, pe_dim)
++    assert nope.shape == (M, n_heads, nope_dim)
++    assert not nope.is_contiguous()
++
++    # Fused kernel with 3D input (no reshape)
++    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
++
++    # Expected M for kernel: M * n_heads
++    total_rows = M * n_heads
++    assert fused_fp8.shape == (total_rows, head_dim)
++    assert fused_scale.shape == (total_rows, 1)
++
++    # Reference with explicit reshape (old behavior)
++    ref_fp8, ref_scale = _reference_cat_fp8(
++        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=use_ue8m0
++    )
++
++    _assert_fp8_close(
++        fused_fp8,
++        fused_scale,
++        ref_fp8,
++        ref_scale,
++        label=f"3D M={M}, n_heads={n_heads}",
++        use_ue8m0=use_ue8m0,
++    )
++
++
++@pytest.mark.parametrize("M", [1, 16])
++@pytest.mark.parametrize("use_ue8m0", [True, False])
++@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
++def test_fused_cat_fp8_mixed_contiguity(M, use_ue8m0):
++    """Test where pe is contiguous but nope is non-contiguous.
++
++    This matches the non-flashinfer Q path where pe comes from rotary_emb
++    (contiguous) but nope remains the non-contiguous split view.
++    """
++    pe_dim, nope_dim, n_heads = 64, 64, 64
++    head_dim = pe_dim + nope_dim
++    device = torch.device("cuda")
++
++    torch.manual_seed(42)
++    # pe is contiguous (simulates post-RoPE output)
++    pe = torch.randn(M, n_heads, pe_dim, dtype=torch.bfloat16, device=device)
++    # nope is non-contiguous (from split on [M, n_heads, head_dim])
++    full = torch.randn(M, n_heads, head_dim, dtype=torch.bfloat16, device=device)
++    _, nope = full.split([pe_dim, nope_dim], dim=-1)
++
++    assert pe.is_contiguous()
++    assert not nope.is_contiguous()
++
++    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
++    ref_fp8, ref_scale = _reference_cat_fp8(
++        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=use_ue8m0
++    )
++
++    _assert_fp8_close(
++        fused_fp8,
++        fused_scale,
++        ref_fp8,
++        ref_scale,
++        label=f"Mixed contiguity M={M}",
++        use_ue8m0=use_ue8m0,
++    )

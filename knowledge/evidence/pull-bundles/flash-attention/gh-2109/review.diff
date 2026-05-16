@@ -1,0 +1,1349 @@
+diff --git a/flash_attn/cute/benchmark_flash_attention_fp8.py b/flash_attn/cute/benchmark_flash_attention_fp8.py
+new file mode 100644
+index 00000000000..c79e7687237
+--- /dev/null
++++ b/flash_attn/cute/benchmark_flash_attention_fp8.py
+@@ -0,0 +1,434 @@
++# Benchmark FP8 attention for FA4 (CuTe-DSL) on SM100.
++#
++# Run (recommended):
++#   python -m flash_attn.cute.benchmark_flash_attention_fp8
++#
++# Notes:
++# - This is intended to be used while bringing up FP8 support for SM100.
++# - FP8 correctness depends on descales + max-offset scaling being implemented in the SM100 kernel.
++#   This script optionally checks output vs a BF16 PyTorch baseline on dequantized FP8 inputs.
++#
++# Adapted from: `hopper/benchmark_flash_attention_fp8.py`
++
++from __future__ import annotations
++
++import argparse
++import inspect
++import math
++import time
++from typing import Iterable
++
++import torch
++from einops import rearrange
++
++from flash_attn.cute.benchmark import benchmark_forward
++from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
++
++try:
++    import cudnn
++except ImportError:
++    cudnn = None
++
++
++def _torch_float8_dtype(name: str) -> torch.dtype:
++    if name in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
++        return torch.float8_e4m3fn
++    if name in ("fp8_e5m2", "fp8_e5m2fn"):
++        return torch.float8_e5m2
++    raise ValueError(f"Unsupported fp8 dtype name: {name}")
++
++
++def _parse_int_list(csv: str) -> list[int]:
++    out: list[int] = []
++    for part in csv.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        out.append(int(part))
++    return out
++
++
++def attention_pytorch(qkv: torch.Tensor, causal: bool) -> torch.Tensor:
++    """
++    qkv: (batch, seqlen, 3, nheads, headdim)
++    out: (batch, seqlen, nheads, headdim)
++    """
++    batch_size, seqlen, _, nheads, d = qkv.shape
++    q, k, v = qkv.unbind(dim=2)
++    q = rearrange(q, "b t h d -> (b h) t d")
++    k = rearrange(k, "b s h d -> (b h) d s")
++    softmax_scale = 1.0 / math.sqrt(d)
++    scores = torch.empty(batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device)
++    scores = rearrange(
++        torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale), "(b h) t s -> b h t s", h=nheads
++    )
++    if causal:
++        causal_mask = torch.triu(torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1)
++        scores = scores + causal_mask.to(dtype=scores.dtype)
++    attention = torch.softmax(scores, dim=-1)
++    output = torch.einsum("bhts,bshd->bthd", attention, v)
++    return output.to(dtype=qkv.dtype)
++
++
++def flops(batch: int, seqlen: int, headdim: int, nheads: int, causal: bool) -> int:
++    # Matches the hopper benchmark’s convention.
++    return 4 * batch * seqlen**2 * nheads * headdim // (2 if causal else 1)
++
++
++def efficiency(flop: int, seconds: float) -> float:
++    return (flop / seconds / 1e12) if not math.isnan(seconds) else 0.0
++
++
++def time_fwd(fn, *args, repeats: int, **kwargs) -> float:
++    time.sleep(1)  # reduce residual throttling effects between benchmarks
++    _, m = benchmark_forward(fn, *args, repeats=repeats, verbose=False, **kwargs)
++    return float(m.mean)
++
++
++def convert_to_cudnn_type(torch_type):
++    if torch_type == torch.float16:
++        return cudnn.data_type.HALF
++    if torch_type == torch.bfloat16:
++        return cudnn.data_type.BFLOAT16
++    if torch_type == torch.float32:
++        return cudnn.data_type.FLOAT
++    if torch_type == torch.int32:
++        return cudnn.data_type.INT32
++    if torch_type == torch.int64:
++        return cudnn.data_type.INT64
++    if torch_type == torch.float8_e4m3fn:
++        return cudnn.data_type.FP8_E4M3
++    if torch_type == torch.float8_e5m2:
++        return cudnn.data_type.FP8_E5M2
++    raise ValueError("Unsupported tensor data type.")
++
++
++def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal: bool):
++    """Minimal cudnn.fp8 sdpa runner (optional)."""
++    assert cudnn is not None, "cudnn python bindings not available"
++    b, _, _, nheads, headdim = qkv.shape
++    o_gpu = torch.zeros(b, seqlen_q, nheads, headdim, dtype=qkv.dtype, device=qkv.device)
++    o_gpu_transposed = torch.as_strided(
++        o_gpu,
++        [b, nheads, seqlen_q, headdim],
++        [nheads * seqlen_q * headdim, headdim, nheads * headdim, 1],
++    )
++    amax_s_gpu = torch.empty(1, 1, 1, 1, dtype=torch.float32, device=qkv.device)
++    amax_o_gpu = torch.empty(1, 1, 1, 1, dtype=torch.float32, device=qkv.device)
++
++    graph = cudnn.pygraph(
++        io_data_type=convert_to_cudnn_type(qkv.dtype),
++        intermediate_data_type=cudnn.data_type.FLOAT,
++        compute_data_type=cudnn.data_type.FLOAT,
++    )
++
++    new_q = torch.as_strided(
++        qkv,
++        [b, nheads, seqlen_q, headdim],
++        [seqlen_q * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
++        storage_offset=0,
++    )
++    q = graph.tensor(
++        name="Q",
++        dim=list(new_q.shape),
++        stride=list(new_q.stride()),
++        data_type=convert_to_cudnn_type(qkv.dtype),
++    )
++
++    new_k = torch.as_strided(
++        qkv,
++        [b, nheads, seqlen_k, headdim],
++        [seqlen_k * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
++        storage_offset=nheads * headdim,
++    )
++    k = graph.tensor(
++        name="K",
++        dim=list(new_k.shape),
++        stride=list(new_k.stride()),
++        data_type=convert_to_cudnn_type(qkv.dtype),
++    )
++
++    new_v = torch.as_strided(
++        qkv,
++        [b, nheads, seqlen_k, headdim],
++        [seqlen_k * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
++        storage_offset=nheads * headdim * 2,
++    )
++    v = graph.tensor(
++        name="V",
++        dim=list(new_v.shape),
++        stride=list(new_v.stride()),
++        data_type=convert_to_cudnn_type(qkv.dtype),
++    )
++
++    def _scale_tensor():
++        return graph.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
++
++    default_scale_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float32, device="cuda")
++    descale_q = _scale_tensor()
++    descale_k = _scale_tensor()
++    descale_v = _scale_tensor()
++    descale_s = _scale_tensor()
++    scale_s = _scale_tensor()
++    scale_o = _scale_tensor()
++
++    o, _, amax_s, amax_o = graph.sdpa_fp8(
++        q=q,
++        k=k,
++        v=v,
++        descale_q=descale_q,
++        descale_k=descale_k,
++        descale_v=descale_v,
++        descale_s=descale_s,
++        scale_s=scale_s,
++        scale_o=scale_o,
++        is_inference=True,
++        attn_scale=1.0 / math.sqrt(headdim),
++        use_causal_mask=causal,
++        name="sdpa",
++    )
++    o.set_output(True).set_dim(o_gpu_transposed.shape).set_stride(o_gpu_transposed.stride())
++    amax_s.set_output(False).set_dim(amax_s_gpu.shape).set_stride(amax_s_gpu.stride())
++    amax_o.set_output(False).set_dim(amax_o_gpu.shape).set_stride(amax_o_gpu.stride())
++
++    graph.validate()
++    graph.build_operation_graph()
++    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
++    graph.check_support()
++    graph.build_plans()
++
++    variant_pack = {
++        q: new_q,
++        k: new_k,
++        v: new_v,
++        descale_q: default_scale_gpu,
++        descale_k: default_scale_gpu,
++        descale_v: default_scale_gpu,
++        descale_s: default_scale_gpu,
++        scale_s: default_scale_gpu,
++        scale_o: default_scale_gpu,
++        o: o_gpu_transposed,
++        amax_s: amax_s_gpu,
++        amax_o: amax_o_gpu,
++    }
++    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
++
++    def run():
++        graph.execute(variant_pack, workspace)
++        return o_gpu
++
++    return run
++
++
++def _maybe_pass_descales(callable_, **kwargs):
++    sig = inspect.signature(callable_)
++    return {k: v for k, v in kwargs.items() if k in sig.parameters}
++
++
++def main(argv: Iterable[str] | None = None) -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--repeats", type=int, default=30)
++    parser.add_argument("--dim", type=int, default=2048)
++    parser.add_argument("--headdims", default="64,128")
++    parser.add_argument("--dtype", default="fp8_e4m3fn")
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument(
++        "--check",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Enable correctness checks vs BF16 PyTorch baseline.",
++    )
++    parser.add_argument(
++        "--check-quantization-only",
++        action="store_true",
++        help="Check FP8 kernel vs dequantized-FP8 baseline (quantization error only).",
++    )
++    parser.add_argument("--atol-bf16", type=float, default=0.10)
++    parser.add_argument("--rtol-bf16", type=float, default=0.10)
++    parser.add_argument("--atol-fp8", type=float, default=0.50)
++    parser.add_argument("--rtol-fp8", type=float, default=0.50)
++    parser.add_argument("--run-cudnn", action="store_true")
++    args = parser.parse_args(list(argv) if argv is not None else None)
++
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA is required")
++    major, minor = torch.cuda.get_device_capability()
++    if major != 10:
++        raise RuntimeError(
++            f"This benchmark is for SM100 (compute capability 10.x). Got {major}.{minor}."
++        )
++
++    torch.manual_seed(args.seed)
++    device = "cuda"
++    fp8_dtype = _torch_float8_dtype(args.dtype)
++    headdim_vals = _parse_int_list(args.headdims)
++    bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
++
++    methods = ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"] + (
++        ["cuDNN-FP8"] if args.run_cudnn and cudnn is not None else []
++    )
++
++    fp8_failures = []
++
++    for headdim in headdim_vals:
++        for causal in (False, True):
++            for batch, seqlen in bs_seqlen_vals:
++                torch.cuda.empty_cache()
++                nheads = args.dim // headdim
++                if args.dim % headdim != 0:
++                    raise ValueError(f"--dim must be divisible by headdim ({args.dim=} {headdim=})")
++
++                q_bf16 = torch.randn(
++                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
++                )
++                k_bf16 = torch.randn(
++                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
++                )
++                v_bf16 = torch.randn(
++                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
++                )
++                qkv_bf16 = torch.stack([q_bf16, k_bf16, v_bf16], dim=2)
++
++                times = {}
++                speeds = {}
++
++                out_ref_bf16 = None
++                try:
++                    out_ref_bf16 = attention_pytorch(qkv_bf16, causal=causal)  # warmup / reference
++                    t = time_fwd(attention_pytorch, qkv_bf16, causal=causal, repeats=args.repeats)
++                    times["Pytorch"] = t
++                except RuntimeError as e:
++                    if "out of memory" in str(e).lower():
++                        times["Pytorch"] = float("nan")
++                        out_ref_bf16 = None
++                    else:
++                        raise
++
++                # FA4 / CuTe BF16 baseline
++                try:
++                    softmax_scale = headdim**-0.5
++                    out_fa4_bf16, _ = flash_attn_cute_fwd(
++                        q_bf16, k_bf16, v_bf16, softmax_scale=softmax_scale, causal=causal
++                    )  # warmup / compile
++                    t = time_fwd(
++                        flash_attn_cute_fwd,
++                        q_bf16,
++                        k_bf16,
++                        v_bf16,
++                        softmax_scale=softmax_scale,
++                        causal=causal,
++                        repeats=args.repeats,
++                    )
++                    times["FA4-CuTe-BF16"] = t
++                    if args.check and out_ref_bf16 is not None:
++                        torch.testing.assert_close(
++                            out_fa4_bf16,
++                            out_ref_bf16,
++                            atol=args.atol_bf16,
++                            rtol=args.rtol_bf16,
++                        )
++                except Exception as e:
++                    # Treat as fatal: BF16 kernel should be usable for basic sanity checking.
++                    raise RuntimeError("FA4-CuTe BF16 baseline failed") from e
++
++                # FA4 / CuTe FP8
++                q_fp8 = q_bf16.to(fp8_dtype)
++                k_fp8 = k_bf16.to(fp8_dtype)
++                v_fp8 = v_bf16.to(fp8_dtype)
++
++                # Placeholder descales (FA3-style: per-(batch, kv_head)).
++                q_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
++                k_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
++                v_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
++
++                # Optional: FP8 reference baseline (dequantized FP8 -> PyTorch) for quantization-error-only checks
++                out_ref_fp8 = None
++                if args.check and args.check_quantization_only:
++                    try:
++                        # Dequantize FP8 inputs back to BF16 (applying descales)
++                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(
++                            torch.bfloat16
++                        )
++                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(
++                            torch.bfloat16
++                        )
++                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(
++                            torch.bfloat16
++                        )
++                        qkv_ref_fp8 = torch.stack([q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2)
++                        out_ref_fp8 = attention_pytorch(qkv_ref_fp8, causal=causal)
++                    except RuntimeError as e:
++                        if "out of memory" in str(e).lower():
++                            out_ref_fp8 = None
++                        else:
++                            raise
++
++                fa4_kwargs = dict(softmax_scale=softmax_scale, causal=causal)
++                fa4_kwargs.update(
++                    _maybe_pass_descales(
++                        flash_attn_cute_fwd,
++                        q_descale=q_descale,
++                        k_descale=k_descale,
++                        v_descale=v_descale,
++                    )
++                )
++
++                try:
++                    # Warmup/compile (will raise until FP8 is implemented)
++                    out_fa4_fp8, _ = flash_attn_cute_fwd(q_fp8, k_fp8, v_fp8, **fa4_kwargs)
++                    t = time_fwd(
++                        flash_attn_cute_fwd,
++                        q_fp8,
++                        k_fp8,
++                        v_fp8,
++                        repeats=args.repeats,
++                        **fa4_kwargs,
++                    )
++                    times["FA4-CuTe-FP8"] = t
++                    if args.check:
++                        # Choose baseline: quantization-only (dequantized FP8) or full (BF16)
++                        if args.check_quantization_only:
++                            ref_baseline = out_ref_fp8
++                        else:
++                            ref_baseline = out_ref_bf16
++
++                        if ref_baseline is not None:
++                            torch.testing.assert_close(
++                                out_fa4_fp8,
++                                ref_baseline,
++                                atol=args.atol_fp8,
++                                rtol=args.rtol_fp8,
++                            )
++                except Exception as e:
++                    fp8_failures.append((causal, headdim, batch, seqlen, repr(e)))
++                    times["FA4-CuTe-FP8"] = float("nan")
++
++                if args.run_cudnn and cudnn is not None:
++                    qkv_fp8 = qkv_bf16.to(fp8_dtype)
++                    runner = cudnn_sdpa_fp8_setup(qkv_fp8, seqlen, seqlen, causal=causal)
++                    _ = runner()  # warmup
++                    t = time_fwd(lambda: runner(), repeats=args.repeats)
++                    times["cuDNN-FP8"] = t
++
++                print(f"### causal={causal}, headdim={headdim}, batch={batch}, seqlen={seqlen} ###")
++                for method in methods:
++                    t = times.get(method, float("nan"))
++                    speeds[method] = efficiency(flops(batch, seqlen, headdim, nheads, causal), t)
++                    if math.isnan(t):
++                        print(f"{method} fwd: (skipped)")
++                    else:
++                        print(f"{method} fwd: {speeds[method]:.2f} TFLOPs/s, {t * 1e3:.3f} ms")
++                if math.isnan(times.get("FA4-CuTe-FP8", float("nan"))):
++                    print("FA4-CuTe-FP8 status: FAILED")
++
++    if fp8_failures:
++        print(f"\nFP8 failures: {len(fp8_failures)} (showing first 5)")
++        for causal, headdim, batch, seqlen, err in fp8_failures[:5]:
++            print(f"- causal={causal} headdim={headdim} batch={batch} seqlen={seqlen}: {err}")
++        return 1
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/flash_attn/cute/blackwell_helpers.py b/flash_attn/cute/blackwell_helpers.py
+index 720778027b2..4caadce864a 100644
+--- a/flash_attn/cute/blackwell_helpers.py
++++ b/flash_attn/cute/blackwell_helpers.py
+@@ -10,6 +10,24 @@
+ import flash_attn.cute.mma_sm100_desc as sm100_desc
+ 
+ 
++def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
++    if isinstance(op, tcgen05.mma.MmaF16BF16Op):
++        return "f16"
++    if isinstance(op, tcgen05.mma.MmaTF32Op):
++        return "tf32"
++    if isinstance(op, tcgen05.mma.MmaI8Op):
++        return "i8"
++    if isinstance(op, tcgen05.mma.MmaFP8Op):
++        return "f8f6f4"
++    if isinstance(op, tcgen05.mma.MmaMXF8Op):
++        return "mxf8f6f4"
++    if isinstance(op, tcgen05.mma.MmaMXF4Op):
++        return "mxf4"
++    if isinstance(op, tcgen05.mma.MmaMXF4NVF4Op):
++        return "mxf4nvf4"
++    raise TypeError(f"Unsupported tcgen05 MMA op kind: {type(op).__name__}")
++
++
+ @cute.jit
+ def gemm_w_idx(
+     tiled_mma: cute.TiledMma,
+@@ -108,6 +126,7 @@ def gemm_ptx(
+     sA_layout = sA.layout if sA is not None else None
+     sB_layout = sB.layout
+     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
++    kind = _tcgen05_mma_kind(op)
+     if const_expr(not is_ts):
+         sA_swizzle = sA.iterator.type.swizzle_type
+         smem_desc_base_a: int = const_expr(
+@@ -177,7 +196,7 @@ def gemm_ptx(
+                     f"mov.b64 smem_desc_a, {{$1, {hex(smem_desc_a_hi)}}};\n\t"
+                     f"mov.b64 smem_desc_b, {{$2, {hex(smem_desc_b_hi)}}};\n\t"
+                     "setp.ne.b32 p, $3, 0;\n\t"
+-                    f"tcgen05.mma.cta_group::1.kind::f16 [$0], smem_desc_a, smem_desc_b, idesc, p;\n\t"
++                    f"tcgen05.mma.cta_group::1.kind::{kind} [$0], smem_desc_a, smem_desc_b, idesc, p;\n\t"
+                     "}\n",
+                     "r,r,r,r",
+                     has_side_effects=True,
+@@ -198,7 +217,7 @@ def gemm_ptx(
+                     ".reg .b64 smem_desc_b;\n\t"
+                     f"mov.b64 smem_desc_b, {{$2, {hex(smem_desc_b_hi)}}};\n\t"
+                     "setp.ne.b32 p, $3, 0;\n\t"
+-                    f"tcgen05.mma.cta_group::1.kind::f16 [$0], [$1], smem_desc_b, {hex(idesc)}, p;\n\t"
++                    f"tcgen05.mma.cta_group::1.kind::{kind} [$0], [$1], smem_desc_b, {hex(idesc)}, p;\n\t"
+                     "}\n",
+                     "r,r,r,r",
+                     has_side_effects=True,
+@@ -223,6 +242,7 @@ def gemm_ptx_loop(
+     sA_layout = sA.layout if sA is not None else tCrA.layout
+     sB_layout = sB.layout
+     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
++    kind = _tcgen05_mma_kind(op)
+     if const_expr(not is_ts):
+         sA_swizzle = sA.iterator.type.swizzle_type
+         smem_desc_base_a: int = const_expr(
+@@ -310,14 +330,14 @@ def gemm_ptx_loop(
+             f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $3, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in cutlass.range_constexpr(1, cute.size(tCrA.shape[2]))
+             )
+@@ -351,14 +371,14 @@ def gemm_ptx_loop(
+             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $3, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], [tmem_a], smem_desc_b, idesc, 1;\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in cutlass.range_constexpr(1, cute.size(tCrA.shape[2]))
+             )
+@@ -394,6 +414,7 @@ def gemm_ptx_partial(
+     sA_layout = sA.layout if sA is not None else tCrA.layout
+     sB_layout = sB.layout
+     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
++    kind = _tcgen05_mma_kind(op)
+     if const_expr(not is_ts):
+         sA_swizzle = sA.iterator.type.swizzle_type
+         smem_desc_base_a: int = const_expr(
+@@ -477,7 +498,7 @@ def gemm_ptx_partial(
+             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $2, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+@@ -486,7 +507,7 @@ def gemm_ptx_partial(
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in range(1, cute.size(tCrA.shape[2]))
+             )
+@@ -554,7 +575,7 @@ def gemm_ptx_partial(
+             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $2, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+@@ -562,7 +583,7 @@ def gemm_ptx_partial(
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in range(
+                     1,
+@@ -575,7 +596,7 @@ def gemm_ptx_partial(
+                     (
+                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
++                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                     )
+                     for k in range(split_arrive_idx, cute.size(tCrA.shape[2]))
+                 )
+@@ -613,6 +634,7 @@ def gemm_ptx_partial1(
+         assert sA_layout is not None, "sA_layout must be provided when a_src is not TMEM"
+         assert sA_swizzle is not None, "sA_swizzle must be provided when a_src is not TMEM"
+     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
++    kind = _tcgen05_mma_kind(op)
+     if const_expr(not is_ts):
+         smem_desc_base_a: int = const_expr(
+             sm100_desc.make_smem_desc_base(
+@@ -706,14 +728,14 @@ def gemm_ptx_partial1(
+             f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $4, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$5, $6, $7, $8}}, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$5, $6, $7, $8}}, {pred_str};\n\t"
+             + "".join(
+                 (
+                     f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$5, $6, $7, $8}}, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$5, $6, $7, $8}}, 1;\n\t"
+                 )
+                 for k in range(1, cute.size(tCrA.shape[2]))
+             )
+@@ -751,13 +773,13 @@ def gemm_ptx_partial1(
+             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $3, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], [tmem_a], smem_desc_b, idesc, {{$4, $5, $6, $7}}, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], [tmem_a], smem_desc_b, idesc, {{$4, $5, $6, $7}}, {pred_str};\n\t"
+             + "".join(
+                 (
+                     f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [$0], [tmem_a], smem_desc_b, idesc, {{$4, $5, $6, $7}}, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [$0], [tmem_a], smem_desc_b, idesc, {{$4, $5, $6, $7}}, 1;\n\t"
+                 )
+                 for k in range(1, cute.size(tCrA.shape[2]))
+             )
+@@ -783,6 +805,7 @@ def gemm_ptx_precomputed(
+     mbar_phase: Optional[Int32] = None,
+     zero_init: bool | Boolean = False,
+     cta_group: int = 1,
++    kind: str = "f16",
+ ) -> None:
+     # acc_tmem_addr += acc_offset
+     is_ts = const_expr(smem_desc_base_a is None)
+@@ -842,7 +865,7 @@ def gemm_ptx_precomputed(
+             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $2, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+@@ -851,7 +874,7 @@ def gemm_ptx_precomputed(
+                     f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in range(1, num_k_tile)
+             )
+@@ -911,7 +934,7 @@ def gemm_ptx_precomputed(
+             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+             "setp.ne.b32 p, $2, 0;\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+@@ -919,7 +942,7 @@ def gemm_ptx_precomputed(
+                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                 )
+                 for k in range(
+                     1,
+@@ -933,7 +956,7 @@ def gemm_ptx_precomputed(
+                         # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+-                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
++                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                     )
+                     for k in range(num_k_tile // 4 * 3, num_k_tile)
+                 )
+@@ -1019,6 +1042,7 @@ def gemm_ptx_precomputed_varname(
+     smem_offset: int,
+     zero_init: bool | Boolean = False,
+     cta_group: int = 1,
++    kind: str = "f16",
+ ) -> None:
+     is_ts = False
+     num_k_tile = cute.size(tCrB_layout.shape[2])
+@@ -1067,7 +1091,7 @@ def gemm_ptx_precomputed_varname(
+             )
+             + "setp.ne.b32 p, $1, 0;\n\t"
+             # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b, idesc, {pred_str};\n\t"
+-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
++            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
+             + "".join(
+                 (
+                     # f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+@@ -1077,7 +1101,7 @@ def gemm_ptx_precomputed_varname(
+                     # f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                     # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, idesc, 1;\n\t"
+                     # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, {idesc_var_name}, 1;\n\t"
+-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
++                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
+                 )
+                 for k in range(1, num_k_tile)
+             )
+diff --git a/flash_attn/cute/block_sparse_utils.py b/flash_attn/cute/block_sparse_utils.py
+index 52cb7e06044..b19dcd37cf8 100644
+--- a/flash_attn/cute/block_sparse_utils.py
++++ b/flash_attn/cute/block_sparse_utils.py
+@@ -667,6 +667,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
+     o_corr_consumer_phase: Int32,
+     corr_epi_producer_phase: Int32,
+     softmax_scale_log2: Float32,
++    max_offset: Float32,
++    max_offset_scale: Float32,
+     mO_cur: Optional[cute.Tensor] = None,
+     gO: Optional[cute.Tensor] = None,
+     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+@@ -706,10 +708,11 @@ def handle_block_sparse_empty_tile_correction_sm100(
+             if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
+                 if row_max_value == -Float32.inf:
+                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
+-                    row_sum_value = Float32(1.0)
++                    row_sum_value = max_offset_scale
+                 else:
+                     row_sum_value = row_sum_value + cute.math.exp2(
+-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2, fastmath=True
++                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
++                        fastmath=True,
+                     )
+         if tidx < m_block_size:
+             scale_row_idx = tidx + stage * m_block_size
+diff --git a/flash_attn/cute/cute_dsl_utils.py b/flash_attn/cute/cute_dsl_utils.py
+index 636f7de4de5..6dfad6606ef 100644
+--- a/flash_attn/cute/cute_dsl_utils.py
++++ b/flash_attn/cute/cute_dsl_utils.py
+@@ -26,6 +26,8 @@
+     torch.float16: cutlass.Float16,
+     torch.bfloat16: cutlass.BFloat16,
+     torch.float32: cutlass.Float32,
++    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
++    torch.float8_e5m2: cutlass.Float8E5M2,
+ }
+ 
+ 
+@@ -59,7 +61,20 @@ def assume_tensor_aligned(t):
+ 
+ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
++    # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
++    # currently export raw bytes as uint8 and tell cutlass correct type
++    # can directly export as fp8 when torch supports it
++    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++        tensor = from_dlpack(
++            t.view(torch.uint8).detach(),
++            assumed_align=assumed_align,
++            enable_tvm_ffi=enable_tvm_ffi,
++        )
++        tensor.element_type = (
++            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
++        )
++    else:
++        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+     if fully_dynamic:
+         return tensor.mark_layout_dynamic()
+     if leading_dim == -1:
+diff --git a/flash_attn/cute/flash_fwd_sm100.py b/flash_attn/cute/flash_fwd_sm100.py
+index 23a96a17b1a..75e767cdc44 100644
+--- a/flash_attn/cute/flash_fwd_sm100.py
++++ b/flash_attn/cute/flash_fwd_sm100.py
+@@ -14,7 +14,7 @@
+ # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
+ 
+ import math
+-from typing import Tuple, Callable, Optional, Literal
++from typing import Tuple, Callable, Optional, Literal, NamedTuple
+ from functools import partial
+ 
+ import cuda.bindings.driver as cuda
+@@ -87,9 +87,25 @@
+     (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
+     (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
+ }
++_FP8_TUNING_CONFIG = {
++    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
++}
++_FP8_SMALL_HDIM_REGS = {
++    False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
++    True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
++}
+ # === END TUNING KNOBS ===
+ 
+ 
++class DescaleTensors(NamedTuple):
++    q_descale: Optional[cute.Tensor] = None
++    k_descale: Optional[cute.Tensor] = None
++    v_descale: Optional[cute.Tensor] = None
++
++    def __new_from_mlir_values__(self, values):
++        return DescaleTensors(*((*values, None, None, None)[:3]))
++
++
+ class FlashAttentionForwardSm100:
+ 
+     def __init__(
+@@ -351,6 +367,7 @@ def __call__(
+         window_size_left: Int32 | int | None = None,
+         window_size_right: Int32 | int | None = None,
+         learnable_sink: Optional[cute.Tensor] = None,
++        descale_tensors: Optional[DescaleTensors] = None,
+         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+         aux_tensors: Optional[list] = None,
+         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+@@ -406,6 +423,24 @@ def __call__(
+             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
+         if const_expr(self.q_dtype != self.v_dtype):
+             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
++        if const_expr(self.q_dtype.width == 8):
++            paged_kv_non_tma = not self.use_tma_KV
++            if const_expr(self.head_dim_padded < 96):
++                fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
++                self.num_regs_softmax = fp8_regs["num_regs_softmax"]
++                self.num_regs_correction = fp8_regs["num_regs_correction"]
++                self.num_regs_other = fp8_regs["num_regs_other"]
++            else:
++                fp8_tune = _FP8_TUNING_CONFIG.get(
++                    (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
++                )
++                if const_expr("ex2_emu_freq" in fp8_tune):
++                    self._tune = {**self._tune, **fp8_tune}
++                    self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
++                if const_expr(not paged_kv_non_tma and "num_regs_softmax" in fp8_tune):
++                    self.num_regs_softmax = fp8_tune["num_regs_softmax"]
++                    self.num_regs_correction = fp8_tune["num_regs_correction"]
++                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+         self._setup_attributes()
+         self.use_tma_O = (
+             self.arch >= Arch.sm_90
+@@ -705,6 +740,7 @@ class SharedStorage:
+             window_size_left,
+             window_size_right,
+             learnable_sink,
++            descale_tensors,
+             blocksparse_tensors,
+             sQ_layout,
+             sK_layout,
+@@ -751,6 +787,7 @@ def kernel(
+         window_size_left: Optional[Int32],
+         window_size_right: Optional[Int32],
+         learnable_sink: Optional[cute.Tensor],
++        descale_tensors: Optional[DescaleTensors],
+         blocksparse_tensors: Optional[BlockSparseTensors],
+         sQ_layout: cute.ComposedLayout,
+         sK_layout: cute.ComposedLayout,
+@@ -1179,6 +1216,7 @@ def kernel(
+                 self.softmax_loop,
+                 softmax_scale_log2=softmax_scale_log2,
+                 softmax_scale=softmax_scale,
++                descale_tensors=descale_tensors,
+                 thr_mma_qk=thr_mma_qk,
+                 sScale=sScale,
+                 mLSE=mLSE,
+@@ -1234,6 +1272,7 @@ def kernel(
+                 sm_stats_barrier,
+                 pipeline_o_epi,
+                 learnable_sink,
++                descale_tensors,
+                 gmem_tiled_copy_O,
+                 tma_atom_O,
+                 softmax_scale_log2,
+@@ -1499,6 +1538,7 @@ def mma(
+ 
+         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
+         qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
++        qk_mma_kind = sm100_utils._tcgen05_mma_kind(qk_mma_op)
+         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
+         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
+         v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
+@@ -1527,6 +1567,7 @@ def mma(
+                 tCrB_layout=tSrK[None, None, None, 0].layout,
+                 smem_var_name_prefix=f"fa_fwd_q_smem_desc",
+                 idesc_var_name=f"fa_fwd_qk_mma_idesc",
++                kind=qk_mma_kind,
+                 smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                 zero_init=True,
+                 cta_group=self.cta_group_size,
+@@ -1755,12 +1796,39 @@ def mma(
+         # pipeline_o_acc.producer_acquire() inside the loop.
+ 
+     # for both softmax0 and softmax1 warp group
++    @cute.jit
++    def _kv_head_idx(self, head_idx: Int32) -> Int32:
++        """Map query-head tile index -> KV-head index (FA3 descale semantics)."""
++        if cutlass.const_expr(self.pack_gqa):
++            return head_idx
++        return head_idx // self.qhead_per_kvhead
++
++    @cute.jit
++    def _load_effective_descales(
++        self,
++        descale_tensors: Optional[DescaleTensors],
++        batch_idx: Int32,
++        kv_head_idx: Int32,
++    ) -> Tuple[Float32, Float32]:
++        """Load effective QK and V descales, defaulting unspecified tensors to identity."""
++        qk_descale = Float32(1.0)
++        v_descale = Float32(1.0)
++        if cutlass.const_expr(descale_tensors is not None):
++            if cutlass.const_expr(descale_tensors.q_descale is not None):
++                qk_descale = qk_descale * Float32(descale_tensors.q_descale[batch_idx, kv_head_idx])
++            if cutlass.const_expr(descale_tensors.k_descale is not None):
++                qk_descale = qk_descale * Float32(descale_tensors.k_descale[batch_idx, kv_head_idx])
++            if cutlass.const_expr(descale_tensors.v_descale is not None):
++                v_descale = Float32(descale_tensors.v_descale[batch_idx, kv_head_idx])
++        return qk_descale, v_descale
++
+     @cute.jit
+     def softmax_loop(
+         self,
+         stage: int | Int32,
+         softmax_scale_log2: Float32,
+-        softmax_scale: Float32,
++        softmax_scale: Float32 | None,
++        descale_tensors: Optional[DescaleTensors],
+         thr_mma_qk: cute.core.ThrMma,
+         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
+         sScale: cute.Tensor,
+@@ -1826,7 +1894,10 @@ def softmax_loop(
+         )
+         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
+         tmem_store_atom = cute.make_copy_atom(
+-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
++            tcgen05.copy.St32x32bOp(
++                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
++            ),
++            Float32,
+         )
+         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
+         tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
+@@ -1842,6 +1913,7 @@ def softmax_loop(
+         work_tile = tile_scheduler.initial_work_tile_info()
+         while work_tile.is_valid_tile:
+             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
++            kv_head_idx = self._kv_head_idx(head_idx)
+             seqlen = SeqlenInfoCls(batch_idx)
+             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+ 
+@@ -1896,10 +1968,26 @@ def softmax_loop(
+             else:
+                 mask_fn_none = None
+ 
++            qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
++
++            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
++            if const_expr(self.score_mod is None):
++                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
++                softmax_scale_eff = None
++            else:
++                softmax_scale_log2_eff = softmax_scale_log2
++                softmax_scale_eff = softmax_scale * qk_descale
++
++            rescale_threshold = (
++                8.0 if const_expr(self.q_dtype.width == 16) else
++                4.0 if const_expr(self.q_dtype.width == 8) else
++                0.0
++            )
+             softmax = SoftmaxSm100.create(
+-                softmax_scale_log2,
+-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+-                softmax_scale=softmax_scale,
++                softmax_scale_log2_eff,
++                rescale_threshold=rescale_threshold,
++                softmax_scale=softmax_scale_eff,
++                max_offset=max_offset,
+             )
+             softmax.reset()
+ 
+@@ -2245,6 +2333,7 @@ def correction_loop(
+         sm_stats_barrier: pipeline.NamedBarrier,
+         pipeline_o_epi: pipeline.PipelineAsync,
+         learnable_sink: Optional[cute.Tensor],
++        descale_tensors: Optional[DescaleTensors],
+         gmem_tiled_copy_O: cute.TiledCopy,
+         tma_atom_O: cute.CopyAtom,
+         softmax_scale_log2: Float32,
+@@ -2285,6 +2374,17 @@ def correction_loop(
+         work_tile = tile_scheduler.initial_work_tile_info()
+         while work_tile.is_valid_tile:
+             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
++            kv_head_idx = self._kv_head_idx(head_idx)
++            qk_descale, v_descale = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
++            if const_expr(self.score_mod is None):
++                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
++            else:
++                softmax_scale_log2_eff = softmax_scale_log2
++
++            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
++            max_offset_scale = (
++                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
++            )
+             seqlen = SeqlenInfoCls(batch_idx)
+             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+ 
+@@ -2387,15 +2487,16 @@ def correction_loop(
+                         if const_expr(not self.is_split_kv) or split_idx == 0:
+                             if row_max == -Float32.inf:
+                                 # It's possible to have an empty row with splitKV.
+-                                row_max = sink_val * (LOG2_E / softmax_scale_log2)
+-                                row_sum = Float32(1.0)
++                                row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
++                                row_sum = max_offset_scale
+                             else:
+                                 row_sum += cute.math.exp2(
+-                                    sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
++                                    sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset, fastmath=True
+                                 )
+                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
++                    scale = scale * v_descale
+                     # Wait for the last O to be ready from the MMA warp
+                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                     if const_expr(not self.use_correction_warps_for_epi):
+@@ -2459,7 +2560,9 @@ def correction_loop(
+                         sm_stats_consumer_phase,
+                         o_corr_consumer_phase,
+                         corr_epi_producer_phase,
+-                        softmax_scale_log2,
++                        softmax_scale_log2_eff,
++                        max_offset,
++                        max_offset_scale,
+                         mO_cur,
+                         gO,
+                         gmem_tiled_copy_O_for_empty_tile,
+@@ -2486,7 +2589,7 @@ def correction_loop(
+                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                     LN2 = math.log(2.0)
+                     lse = (
+-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
++                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                         if not acc_O_mn_row_is_zero_or_nan
+                         else -Float32.inf
+                     )
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+index 4be51d38839..5b9e382d217 100644
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -34,7 +34,7 @@
+ )
+ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+ from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
++from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+ from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+@@ -237,11 +237,12 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
+     if not is_fake_mode():
+         assert t.is_cuda, f"{name} must be on CUDA"
+ 
+-
+ torch2cute_dtype_map = {
+     torch.float16: cutlass.Float16,
+     torch.bfloat16: cutlass.BFloat16,
+     torch.float32: cutlass.Float32,
++    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
++    torch.float8_e5m2: cutlass.Float8E5M2,
+ }
+ 
+ 
+@@ -311,6 +312,9 @@ def _flash_attn_fwd(
+     out: Optional[torch.Tensor] = None,
+     lse: Optional[torch.Tensor] = None,
+     aux_tensors: Optional[list[torch.Tensor]] = None,
++    q_descale: Optional[torch.Tensor] = None,
++    k_descale: Optional[torch.Tensor] = None,
++    v_descale: Optional[torch.Tensor] = None,
+     gather_kv_indices: Optional[torch.Tensor] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Forward pass for FlashAttention.
+@@ -327,6 +331,7 @@ def _flash_attn_fwd(
+         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+     """
+     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
++    q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
+     num_head, head_dim = q.shape[-2:]
+     if cu_seqlens_q is None:
+         batch_size, seqlen_q = q.shape[:2]
+@@ -372,7 +377,9 @@ def _flash_attn_fwd(
+     assert seqused_k is None or seqused_k.shape == (batch_size,), (
+         "seqused_k must have shape (batch_size,)"
+     )
+-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
++    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
++        "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
++    )
+     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+         if t is not None:
+@@ -393,6 +400,9 @@ def _flash_attn_fwd(
+                 q,
+                 k,
+                 v,
++                q_descale,
++                k_descale,
++                v_descale,
+                 cu_seqlens_q,
+                 cu_seqlens_k,
+                 seqused_q,
+@@ -415,7 +425,10 @@ def _flash_attn_fwd(
+     if pack_gqa is None:
+         pack_gqa = qhead_per_kvhead > 1
+ 
+-    out_torch_dtype = q.dtype
++    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
++    if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
++        raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
++    out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
+     device = q.device
+     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+@@ -437,7 +450,18 @@ def _flash_attn_fwd(
+     elif lse is not None:
+         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+ 
++    if is_fp8:
++        for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
++            if t is not None:
++                _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
++    else:
++        assert q_descale is None and k_descale is None and v_descale is None, (
++            "q_descale/k_descale/v_descale are only supported for FP8 inputs"
++        )
++
+     dtype = torch2cute_dtype_map[q.dtype]
++    if is_fp8:
++        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+     use_block_sparsity = block_sparse_tensors is not None
+ 
+     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
+@@ -611,6 +635,9 @@ def _flash_attn_fwd(
+         assert head_dim == 64 and head_dim_v == 512, "only support MLA weight absorbed shape with qv"
+         assert not local, "local not yet supported with qv"
+         assert page_table is None, "page table not yet supported with qv"
++        assert q_descale is None and k_descale is None and v_descale is None, (
++            "q_descale/k_descale/v_descale are not yet supported with qv"
++        )
+ 
+         assert not is_split_kv, "split kv not supported with qv"
+         assert learnable_sink is None
+@@ -634,6 +661,7 @@ def _flash_attn_fwd(
+                 seqlen_k_boundary = min_seqlen_k
+                 disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
+     else:
++        assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
+         gather_kv_length = None
+         sparse_kv = None
+         disable_sparse_kv_bitmask = None
+@@ -658,6 +686,9 @@ def _flash_attn_fwd(
+         window_size_left is not None,
+         window_size_right is not None,
+         learnable_sink is not None,
++        q_descale is not None,
++        k_descale is not None,
++        v_descale is not None,
+         tile_m,
+         tile_n,
+         q_stage,
+@@ -705,6 +736,33 @@ def _flash_attn_fwd(
+         else:
+             lse_tensor = None
+ 
++        q_descale_tensor = (
++            to_cute_tensor(q_descale, assumed_align=4, leading_dim=1)
++            if q_descale is not None
++            else None
++        )
++        k_descale_tensor = (
++            to_cute_tensor(k_descale, assumed_align=4, leading_dim=1)
++            if k_descale is not None
++            else None
++        )
++        v_descale_tensor = (
++            to_cute_tensor(v_descale, assumed_align=4, leading_dim=1)
++            if v_descale is not None
++            else None
++        )
++        descale_tensors_tensor = (
++            DescaleTensors(
++                q_descale=q_descale_tensor,
++                k_descale=k_descale_tensor,
++                v_descale=v_descale_tensor,
++            )
++            if q_descale_tensor is not None
++            or k_descale_tensor is not None
++            or v_descale_tensor is not None
++            else None
++        )
++
+         sparse_tensors = None
+         if normalized_block_sparse_tensors is not None:
+             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
+@@ -849,7 +907,7 @@ def _flash_attn_fwd(
+                 options="--enable-tvm-ffi",
+             )
+         else:
+-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
++            compile_args = [
+                 fa_fwd,
+                 q_tensor,
+                 k_tensor,
+@@ -868,20 +926,36 @@ def _flash_attn_fwd(
+                 sparse_tensors,
+                 cute_aux_tensors,
+                 current_stream,
+-                options="--enable-tvm-ffi",
+-            )
++            ]
++            if arch // 10 in [10, 11]:
++                compile_args.insert(-3, descale_tensors_tensor)
++            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+ 
+     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
+     # - Use those fake metadata to populate compilation cache
+     # - Return "fake" output tensors, which could be needed in follow-up fake operations
+     # Thus, we skip the actual kernel invocation here.
+     if not is_fake_mode():
++        q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
++        qv_call = qv.detach() if qv is not None else None
++        if is_fp8:
++            # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
++            q_call = q_call.view(torch.uint8)
++            k_call = k_call.view(torch.uint8)
++            v_call = v_call.view(torch.uint8)
++            if qv_call is not None:
++                qv_call = qv_call.view(torch.uint8)
++        descale_tensors = (
++            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
++            if q_descale is not None or k_descale is not None or v_descale is not None
++            else None
++        )
+         if qv is not None:
+             _flash_attn_fwd.compile_cache[compile_key](
+-                q.detach(),
+-                qv.detach(),
+-                k.detach(),
+-                v.detach(),
++                q_call,
++                qv_call,
++                k_call,
++                v_call,
+                 out.detach(),
+                 lse,
+                 softmax_scale,
+@@ -895,10 +969,10 @@ def _flash_attn_fwd(
+                 window_size_right,
+             )
+         else:
+-            _flash_attn_fwd.compile_cache[compile_key](
+-                q.detach(),
+-                k.detach(),
+-                v.detach(),
++            call_args = [
++                q_call,
++                k_call,
++                v_call,
+                 out.detach() if not is_split_kv else out_partial,
+                 lse_partial if is_split_kv else lse,
+                 softmax_scale,
+@@ -910,9 +984,14 @@ def _flash_attn_fwd(
+                 window_size_left,
+                 window_size_right,
+                 learnable_sink,
++            ]
++            if arch // 10 in [10, 11]:
++                call_args.append(descale_tensors)
++            call_args.extend([
+                 normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                 aux_tensors,
+-            )
++            ])
++            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+     if is_split_kv:
+         _flash_attn_fwd_combine(
+             out_partial,
+diff --git a/flash_attn/cute/mma_sm100_desc.py b/flash_attn/cute/mma_sm100_desc.py
+index ab8dd098b92..9a2adfca8d7 100644
+--- a/flash_attn/cute/mma_sm100_desc.py
++++ b/flash_attn/cute/mma_sm100_desc.py
+@@ -83,9 +83,9 @@ def to_UMMA_format(cutlass_type) -> int:
+     if cutlass_type is cutlass.TFloat32:
+         return F16F32Format.TF32
+     # Float-8 / Float-6 / Float-4 – add whenever CUTLASS exposes them
+-    if cutlass_type is cutlass.FloatE4M3FN:
++    if cutlass_type is cutlass.Float8E4M3FN:
+         return MXF8F6F4Format.E4M3
+-    if cutlass_type is cutlass.FloatE5M2:
++    if cutlass_type is cutlass.Float8E5M2:
+         return MXF8F6F4Format.E5M2
+     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
+ 
+diff --git a/flash_attn/cute/softmax.py b/flash_attn/cute/softmax.py
+index 0565827b601..9369e0d49ca 100644
+--- a/flash_attn/cute/softmax.py
++++ b/flash_attn/cute/softmax.py
+@@ -169,12 +169,14 @@ def rescale_O(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
+ @dataclass
+ class SoftmaxSm100(Softmax):
+     rescale_threshold: cutlass.Constexpr[float] = 0.0
++    max_offset: cutlass.Constexpr[int] = 0
+ 
+     @staticmethod
+     def create(
+         scale_log2: Float32,
+         rescale_threshold: cutlass.Constexpr[float] = 0.0,
+         softmax_scale: Float32 | None = None,
++        max_offset: cutlass.Constexpr[int] = 0,
+     ):
+         num_rows = 1
+         arch = 100
+@@ -188,6 +190,7 @@ def create(
+             arch,
+             softmax_scale,
+             rescale_threshold=rescale_threshold,
++            max_offset=max_offset,
+         )
+ 
+     @cute.jit
+@@ -258,11 +261,13 @@ def scale_subtract_rowmax(
+     ):
+         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+         row_max_scaled = row_max * self.scale_log2
++        max_offset = Float32(self.max_offset)
++        bias = max_offset - row_max_scaled
+         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+                 (acc_S_row[i], acc_S_row[i + 1]),
+                 (self.scale_log2, self.scale_log2),
+-                (-row_max_scaled, -row_max_scaled),
++                (bias, bias),
+             )
+ 
+     @cute.jit

@@ -16,7 +16,7 @@ set -euo pipefail
 
 # DEFAULT_CODEX_MODEL and DEFAULT_CODEX_EFFORT are provided by loop-common.sh
 DEFAULT_CODEX_TIMEOUT=5400
-DEFAULT_MAX_ITERATIONS=42
+DEFAULT_MAX_ITERATIONS=84
 DEFAULT_FULL_REVIEW_ROUND=5
 
 # Default timeout for git operations (30 seconds)
@@ -102,7 +102,7 @@ ARGUMENTS:
 OPTIONS:
   --plan-file <path>   Explicit plan file path (alternative to positional arg)
   --track-plan-file    Indicate plan file should be tracked in git (must be clean)
-  --max <N>            Maximum iterations before auto-stop (default: 42)
+  --max <N>            Maximum iterations before auto-stop (default: 84)
   --codex-model <MODEL:EFFORT>
                        Codex model and reasoning effort for codex exec (default: ${DEFAULT_CODEX_MODEL}:${DEFAULT_CODEX_EFFORT})
   --codex-timeout <SECONDS>

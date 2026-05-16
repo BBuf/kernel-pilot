@@ -1,0 +1,306 @@
+diff --git a/test/TritonGPU/amd/amd-warp-pipeline.mlir b/test/TritonGPU/amd/amd-warp-pipeline.mlir
+index 1be47b58fc1e..7607c1f612f7 100644
+--- a/test/TritonGPU/amd/amd-warp-pipeline.mlir
++++ b/test/TritonGPU/amd/amd-warp-pipeline.mlir
+@@ -143,6 +143,64 @@ tt.func public @triple_buf_two_stages(%arg0: i32, %arg1: i32, %arg2: i32, %arg3:
+   tt.return
+ }
+ 
++// -- Post-unroll IV remap is sunk past ignorable ops (FA-kernel pattern) ----
++// The FA kernel body begins with async_wait.  After MLIR loop unrolling, IV
++// remap ops (arith.addi/muli) land between the last border of iter N and the
++// async_wait at the start of iter N+1, which would otherwise poison cluster
++// building.  The sink pre-pass moves scalar ops past adjacent ignorable ops so
++// they join the next cluster naturally.
++tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
++  %c0 = arith.constant 0 : index
++  %c1 = arith.constant 1 : index
++  %c2 = arith.constant 2 : index
++  %v0 = arith.constant 0.0 : f32
++
++  scf.for %i = %c0 to %n step %c2 {
++    // iter 0: async_wait FIRST, then stage1 / stage2 bodies.
++    ttg.async_wait {num = 0 : i32}
++    tt.store %ptr, %v0 : !tt.ptr<f32>
++    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage1"}
++    tt.store %ptr, %v0 : !tt.ptr<f32>
++    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage2"}
++
++    // IV remap injected by unroller; sits between iter-0 last border and
++    // iter-1 async_wait -- the poisonous spot.
++    %i_1 = arith.addi %i, %c1 : index
++
++    // iter 1: async_wait FIRST, then stage1 (uses %i_1) / stage2.
++    ttg.async_wait {num = 0 : i32}
++    %off = arith.muli %i_1, %c1 : index
++    tt.store %ptr, %v0 : !tt.ptr<f32>
++    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage1"}
++    tt.store %ptr, %v0 : !tt.ptr<f32>
++    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage2"}
++
++    scf.yield
++  }
++  tt.return
++}
++
++// CHECK-LABEL: tt.func @unroll_iv_remap_sunk_past_async_wait(
++// CHECK: scf.for
++// iter 0: async_wait, stage1 region, stage2 region.
++// CHECK:   ttg.async_wait
++// CHECK:   scf.execute_region
++// CHECK:     tt.store
++// CHECK:   scf.execute_region
++// CHECK:     tt.store
++// iter 1 starts with async_wait; IV remap was sunk past it into iter-1 stage1.
++// CHECK:   ttg.async_wait
++// CHECK:   scf.execute_region {{.*}} {
++// CHECK-NEXT: arith.addi
++// CHECK-NEXT: arith.muli
++// CHECK:     tt.store
++// CHECK:   scf.execute_region
++// CHECK:     tt.store
++// CHECK: triton.warp_pipeline.pipelined_for
++// No free arith ops or leftover sched.barrier markers in the loop body.
++// CHECK-NOT: rocdl.sched.barrier
++// CHECK: tt.return
++
+ // -- Negative: no border → no structuring ----
+ tt.func @no_split_example(%n: index) {
+   %c0  = arith.constant 0 : index
+diff --git a/third_party/amd/backend/compiler.py b/third_party/amd/backend/compiler.py
+index 0bbe6b594f8f..b65836a52810 100644
+--- a/third_party/amd/backend/compiler.py
++++ b/third_party/amd/backend/compiler.py
+@@ -314,6 +314,7 @@ def gluon_to_ttgir(src, metadata, options):
+         passes.common.add_sccp(pm)
+         passes.ttir.add_loop_aware_cse(pm)
+         passes.gluon.add_canonicalizer(pm)
++        passes.ttir.add_loop_unroll(pm)
+         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+         amd.passes.ttgpuir.add_warp_pipeline(pm)
+         passes.ttgpuir.add_allocate_warp_groups(pm)
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/WarpPipeliner.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/WarpPipeliner.cpp
+index 71ab36278428..40d566f40945 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/WarpPipeliner.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/WarpPipeliner.cpp
+@@ -10,6 +10,7 @@
+ #include "mlir/Pass/PassManager.h"
+ #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
++#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ 
+@@ -108,27 +109,85 @@ static void createClusterOp(OpBuilder &b, Location loc,
+   return;
+ }
+ 
++// Ops that may appear before or after a stage but not inside one.
++// Barrier/wait still require an explicit border op to split clusters.
++static bool canSitBetweenStages(Operation *op) {
++  return isa<ttg::AsyncWaitOp, gpu::BarrierOp, triton::gpu::BarrierOp,
++             tt::amdgpu::AsyncTDMWait>(op);
++}
++
++// Sink pure-scalar ops past adjacent ignorable ops so they join the next
++// cluster. After loop unrolling, scalar IV-remap ops (arith.addi/muli) land
++// between borders and the ignorable that starts the next iteration (FA
++// pattern); without this, WarpPipeliner sees scalars as an incomplete
++// cluster when it hits the ignorable and bails out. Single forward pass,
++// O(N).
++//
++// `pending` only accumulates pure scalars and is cleared at any other op,
++// so it forms a closed SSA DAG: any use of a pending scalar by the trailing
++// ignorable run must be a direct operand, so the dependency check is a
++// simple operand scan.
++static void sinkPureScalarsPastIgnorables(Block &blk) {
++  // Accumulates a run of consecutive pure scalars that might be sunk.
++  SmallVector<Operation *> pending;
++  auto consumesPending = [&](Operation *user) {
++    return llvm::any_of(user->getOperands(), [&](Value v) {
++      return llvm::is_contained(pending, v.getDefiningOp());
++    });
++  };
++  for (Operation *op = &blk.front(); op;) {
++    Operation *next = op->getNextNode();
++    if (triton::isPureScalarOp(op)) {
++      pending.push_back(op);
++      op = next;
++      continue;
++    }
++    // Non-scalar op: try to sink pending past an ignorable run, then reset.
++    if (canSitBetweenStages(op) && !pending.empty()) {
++      // Extend `anchor` to the last ignorable in the consecutive run.
++      Operation *anchor = op;
++      while (anchor->getNextNode() &&
++             canSitBetweenStages(anchor->getNextNode()))
++        anchor = anchor->getNextNode();
++      // Abort the sink if any ignorable in [op..anchor] consumes a pending
++      // scalar -- moving its producer past it would break SSA.
++      bool conflict = false;
++      for (Operation *ign = op; !conflict; ign = ign->getNextNode()) {
++        conflict = consumesPending(ign);
++        if (ign == anchor)
++          break;
++      }
++      if (!conflict) {
++        // Skip past the moved scalars on the next iteration.
++        next = anchor->getNextNode();
++        // Reverse iteration + moveAfter(anchor) preserves source order:
++        // each earlier-inserted scalar is pushed right by later inserts.
++        for (Operation *s : llvm::reverse(pending))
++          s->moveAfter(anchor);
++      }
++    }
++    // Pending is always cleared at a non-scalar op: the run is broken,
++    // either by a successful sink or by an op that anchors them in place.
++    pending.clear();
++    op = next;
++  }
++}
++
+ // Turns a partitioned region into the warp-pipelined clusters
+ static LogicalResult createPipeline(OpBuilder &b, Location loc,
+                                     scf::ForOp forOp) {
+-  // Collect ops in the loop body
+   Block &blk = *forOp.getBody();
+   SmallVector<Operation *> cluster;
+   SmallVector<std::pair<StringAttr, int>> clusterMarkers;
+   SmallVector<SmallVector<Operation *>> clusters;
+   auto ctx = forOp.getContext();
+ 
+-  // ops cannot be located within a cluster
+-  // barrier/wait still require border op
+-  auto isIgnorable = [](Operation *op) {
+-    return isa<ttg::AsyncWaitOp, gpu::BarrierOp, triton::gpu::BarrierOp,
+-               tt::amdgpu::AsyncTDMWait>(op);
+-  };
+-
+   auto isBorder = [](Operation *op) {
+     return op->hasAttr("triton.warp_pipeline.border");
+   };
+ 
++  sinkPureScalarsPastIgnorables(blk);
++
+   // One pass over the body; collect clusters split by explicit borders.
+   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
+     Operation *op = &opRef;
+@@ -154,7 +213,7 @@ static LogicalResult createPipeline(OpBuilder &b, Location loc,
+       op->erase(); // remove the marker
+       continue;
+     }
+-    if (isIgnorable(op)) {
++    if (canSitBetweenStages(op)) {
+       // Ignorable ops may appear before or after a stage, but not inside it.
+       // If encountered while building an execute_region, reject warp-pipeline.
+       if (!cluster.empty())
+diff --git a/third_party/amd/python/test/test_warp_pipeline_gfx9.py b/third_party/amd/python/test/test_warp_pipeline_gfx9.py
+index dd63dfe6ca71..7ee79c77aa22 100644
+--- a/third_party/amd/python/test/test_warp_pipeline_gfx9.py
++++ b/third_party/amd/python/test/test_warp_pipeline_gfx9.py
+@@ -17,7 +17,7 @@ def _compile_gluon(fn, signature, constexprs, arch="gfx950"):
+ 
+ @gluon.jit
+ def pipeline_simple(A, B, BLOCK: gl.constexpr):
+-    """Minimal 2-stage pipeline — baseline for s_setprio check."""
++    """Minimal 2-stage pipeline -- baseline for s_setprio check."""
+     blocked: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[16, 4],
+                                              warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+     offs_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked)
+@@ -31,6 +31,29 @@ def pipeline_simple(A, B, BLOCK: gl.constexpr):
+             gl.store(B + offs, a)
+ 
+ 
++@gluon.jit
++def pipeline_unrolled(A, B, N, BLOCK: gl.constexpr):
++    """2-stage pipeline with loop unrolling -- IV used inside stages.
++
++    The IV must be referenced inside execute_region bodies so only the
++    scalar IV-remap ops (arith.muli + arith.addi on the index) land
++    between the cloned clusters after unrolling.  Gluon skips make_ttir,
++    so loop_unroll_factor survives until after add_warp_pipeline.
++    """
++    blocked: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[16, 4],
++                                             warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
++    offs_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked)
++    base = gl.arange(0, BLOCK, layout=offs_layout)
++
++    for i in tl.range(0, N, loop_unroll_factor=2):
++        with warp_pipeline_stage("stage1", priority=1):
++            offs = base + i * BLOCK
++            a = gl.load(A + offs)
++
++        with warp_pipeline_stage("stage2", priority=0):
++            gl.store(B + offs, a)
++
++
+ def test_simple_pipeline_setprio():
+     """Baseline: a simple 2-stage pipeline emits s_setprio."""
+     signature = {"A": "*fp16", "B": "*fp16", "BLOCK": "constexpr"}
+@@ -38,3 +61,66 @@ def test_simple_pipeline_setprio():
+     k = _compile_gluon(pipeline_simple, signature, constexprs)
+     amdgcn = k.asm["amdgcn"]
+     assert amdgcn.count("s_setprio") > 0, "Simple pipeline must emit s_setprio."
++
++
++def test_pipeline_with_unroll():
++    """Warp pipeline + loop unrolling: IV remap ops between stages must not break conversion.
++
++    Gluon kernels skip make_ttir, so loop_unroll_factor survives until the
++    Gluon pipeline where add_loop_unroll runs AFTER add_warp_pipeline.  The
++    MLIR unroller emits arith.muli+arith.addi for IV remapping between the
++    cloned execute_region clusters -- ConvertWarpPipeline must tolerate these.
++    """
++    signature = {"A": "*fp16", "B": "*fp16", "N": "i32", "BLOCK": "constexpr"}
++    constexprs = {"BLOCK": BLOCK}
++    k = _compile_gluon(pipeline_unrolled, signature, constexprs)
++    amdgcn = k.asm["amdgcn"]
++    # Each successfully converted loop emits s_setprio instructions.
++    # With unroll factor 2 and dynamic bound, we get a main loop + epilogue.
++    # Both must convert: without the fix only the epilogue converts (4 s_setprio),
++    # with the fix both convert (10 s_setprio).
++    assert amdgcn.count("s_setprio") > 4, \
++        f"Expected > 4 s_setprio (both main+epilogue converted), got {amdgcn.count('s_setprio')}"
++
++
++@gluon.jit
++def pipeline_static_range_unrolled(A, B, N, BLOCK: gl.constexpr):
++    """Outer loop_unroll_factor + static_range wrapping both stages.
++
++    The outer tl.range has loop_unroll_factor=2, so MLIR unrolling injects
++    scalar IV remap ops between cloned bodies.  Inside each iteration,
++    static_range(2) duplicates both pipeline stages at the AST level.
++    This is the worst-case combo for ConvertWarpPipeline: the loop body
++    has 4 execute_region clusters with scalar ops between them.
++    """
++    blocked: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[16, 4],
++                                             warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
++    offs_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked)
++    base = gl.arange(0, BLOCK, layout=offs_layout)
++
++    for i in tl.range(0, N, loop_unroll_factor=2):
++        for j in gl.static_range(2):
++            with warp_pipeline_stage("stage1", priority=1):
++                offs = base + (i + j) * BLOCK
++                a = gl.load(A + offs)
++
++            with warp_pipeline_stage("stage2", priority=0):
++                gl.store(B + offs, a)
++
++
++def test_pipeline_static_range_with_unroll():
++    """static_range wrapping both stages + outer loop_unroll_factor must convert."""
++    signature = {"A": "*fp16", "B": "*fp16", "N": "i32", "BLOCK": "constexpr"}
++    constexprs = {"BLOCK": BLOCK}
++    k = _compile_gluon(pipeline_static_range_unrolled, signature, constexprs)
++    amdgcn = k.asm["amdgcn"]
++    setprio_lines = [line.strip() for line in amdgcn.splitlines() if "s_setprio" in line]
++    prios = [int(l.split()[-1]) for l in setprio_lines]
++    # Each converted loop emits: 1 pre-loop + (N-1) in-body + 1 wrap-around + 1 post-loop reset.
++    # Main loop has 8 clusters (static_range(2) * 2 stages * unroll(2)): 1+7+1+1 = 10.
++    # Epilogue has 4 clusters (static_range(2) * 2 stages): 1+3+1+1 = 6.
++    # Total: 16 s_setprio.  Both priority levels must appear.
++    assert len(prios) == 16, \
++        f"Expected 16 s_setprio (main=10 + epilogue=6), got {len(prios)}: {prios}"
++    assert prios.count(0) == 8 and prios.count(1) == 8, \
++        f"Expected 8 prio-0 and 8 prio-1, got {prios}"

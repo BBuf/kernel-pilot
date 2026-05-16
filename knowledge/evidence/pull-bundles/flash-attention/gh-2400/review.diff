@@ -1,0 +1,720 @@
+diff --git a/README.md b/README.md
+index b352dada6c8..09937571483 100755
+--- a/README.md
++++ b/README.md
+@@ -140,9 +140,10 @@ container from ROCm, which has all the required tools to install FlashAttention.
+ 
+ #### Composable Kernel Backend
+ FlashAttention-2 ROCm CK backend currently supports:
+-1. MI200x, MI250x, MI300x, and MI355x GPUs.
++1. MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs.
+ 2. Datatype fp16 and bf16
+ 3. Both forward's and backward's head dimensions up to 256.
++4. RDNA 3 GPUs do not currently support backward, and RDNA 4 GPUs support backward only with deterministic=False
+ 
+ #### Triton Backend
+ The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
+diff --git a/csrc/composable_kernel b/csrc/composable_kernel
+index 574c1c121a0..859acb5ae7f 160000
+--- a/csrc/composable_kernel
++++ b/csrc/composable_kernel
+@@ -1 +1 @@
+-Subproject commit 574c1c121a0f3c0b44155b2b1987d89d16159b58
++Subproject commit 859acb5ae7fdd7f1016a7bfbd1a85c26bb403c6b
+diff --git a/csrc/flash_attn_ck/flash_common.hpp b/csrc/flash_attn_ck/flash_common.hpp
+index cc86546ea54..75e83fe1180 100644
+--- a/csrc/flash_attn_ck/flash_common.hpp
++++ b/csrc/flash_attn_ck/flash_common.hpp
+@@ -9,6 +9,11 @@
+ #include <torch/nn/functional.h>
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
++#include <string>
++
++#ifdef USE_ROCM
++#include <hip/hip_runtime.h>
++#endif
+ 
+ #ifdef OLD_GENERATOR_PATH
+ #include <ATen/CUDAGeneratorImpl.h>
+@@ -73,4 +78,46 @@ inline int num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int nu
+ 
+ int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits);
+ 
++inline std::string get_gcn_arch_name() {
++#ifdef USE_ROCM
++    int dev = 0;
++    if (hipGetDevice(&dev) != hipSuccess) {
++        return std::string{};
++    }
++    hipDeviceProp_t prop{};
++    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
++        return std::string{};
++    }
++    return std::string{prop.gcnArchName};
++#else
++    return "";
++#endif
++}
++
++inline bool is_gfx11_arch() {
++    const std::string arch = get_gcn_arch_name();
++    return !arch.empty() && arch.rfind("gfx11", 0) == 0;
++}
++
++inline bool is_gfx12_arch() {
++    const std::string arch = get_gcn_arch_name();
++    return !arch.empty() && arch.rfind("gfx12", 0) == 0;
++}
++
++inline bool is_gfx1x_arch() {
++    return is_gfx11_arch() || is_gfx12_arch();
++}
++
++inline void check_gfx1x_bwd_supported(bool deterministic) {
++    if (is_gfx11_arch()) {
++        TORCH_CHECK(false, "CK backward is not supported on gfx11.");
++    }
++
++    if (is_gfx12_arch() && deterministic) {
++        TORCH_CHECK(false,
++                    "Deterministic CK backward is not supported on gfx12. "
++                    "Please rerun with deterministic=False.");
++    }
++}
++
+ } // namespace flash
+diff --git a/csrc/flash_attn_ck/mha_bwd.cpp b/csrc/flash_attn_ck/mha_bwd.cpp
+index 19a269a0344..e038d504a25 100644
+--- a/csrc/flash_attn_ck/mha_bwd.cpp
++++ b/csrc/flash_attn_ck/mha_bwd.cpp
+@@ -346,6 +346,9 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
+     at::cuda::CUDAGuard device_guard{q.device()};
+ 
+     auto opts = q.options();
++    if (flash::is_gfx1x_arch()) {
++        flash::check_gfx1x_bwd_supported(deterministic);
++    }
+     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+     at::Tensor dq_accum = torch::zeros({batch_size, num_heads, nsplits, seqlen_q, head_size}, opts.dtype(at::kFloat));
+ 
+diff --git a/csrc/flash_attn_ck/mha_fwd.cpp b/csrc/flash_attn_ck/mha_fwd.cpp
+index 44f7f4f0d93..57ffd57dd9d 100644
+--- a/csrc/flash_attn_ck/mha_fwd.cpp
++++ b/csrc/flash_attn_ck/mha_fwd.cpp
+@@ -2,11 +2,13 @@
+  * Copyright (c) 2024, Tri Dao.
+  ******************************************************************************/
+ 
+-#include "flash_common.hpp"
++#include "mha_fwd_head_grouping_utils.hpp"
+ 
+-#include "fmha_fwd.hpp"
+ #include "mask.hpp"
+ 
++#include <optional>
++#include <string>
++
+ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
+                                        std::string dtype,
+                                        int head_size,
+@@ -119,6 +121,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+                          d,             // hdim_v
+                          h,             // nhead
+                          h_k,           // nhead_k
++                         0,             // num_head_q_total
++                         0,             // head_start
+                          softmax_scale, // scale_s
+                          0.0f,          // logits_soft_cap
+                          stride_q,
+@@ -330,7 +334,27 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
+                 p_dropout,
+                 drop_seed_offset);
+ 
+-        float t = fmha_fwd(traits, args, stream_config);
++        float t =
++            flash::maybe_dispatch_head_grouped_fwd(
++                stream_config,
++                traits,
++                args,
++                num_heads,
++                num_heads_k,
++                batch_size,
++                seqlen_k,
++                head_size,
++                head_size,
++                k.element_size(),
++                v.element_size(),
++                q.scalar_type(),
++                [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
++                    return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
++                });
++
++        if (t < 0.0f) {
++            t = fmha_fwd(traits, args, stream_config);
++        }
+         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+     }
+     else {
+diff --git a/csrc/flash_attn_ck/mha_fwd_head_grouping_utils.hpp b/csrc/flash_attn_ck/mha_fwd_head_grouping_utils.hpp
+new file mode 100644
+index 00000000000..3b22cdf9d3e
+--- /dev/null
++++ b/csrc/flash_attn_ck/mha_fwd_head_grouping_utils.hpp
+@@ -0,0 +1,101 @@
++/******************************************************************************
++ * Copyright (c) 2024, Tri Dao.
++ ******************************************************************************/
++
++#pragma once
++
++#include "flash_common.hpp"
++
++#include "fmha_fwd.hpp"
++#include "fmha_fwd_head_grouping.hpp"
++
++#include <iostream>
++
++namespace flash {
++
++template <typename FmhaFwdTraits, typename FmhaFwdArgs, typename FmhaFwdFn>
++inline float maybe_dispatch_head_grouped_fwd(const ck_tile::stream_config& stream_config,
++                                             const FmhaFwdTraits& traits,
++                                             const FmhaFwdArgs& args,
++                                             int num_heads,
++                                             int num_heads_k,
++                                             int batch_size,
++                                             int seqlen_k,
++                                             int head_size_q,
++                                             int head_size_v,
++                                             size_t elem_bytes_k,
++                                             size_t elem_bytes_v,
++                                             at::ScalarType q_dtype,
++                                             FmhaFwdFn&& fmha_fwd_fn)
++{
++    namespace head_grouping = fmha_fwd_head_grouping;
++
++    if (head_grouping::disabled_by_env()) {
++        if (head_grouping::log_enabled()) {
++            std::cout << "[LLC Head Grouping] disabled by env" << std::endl;
++        }
++        return -1.0f;
++    }
++
++    const auto group_size_opt = head_grouping::get_head_group_size(num_heads,
++                                                                   num_heads_k,
++                                                                   batch_size,
++                                                                   seqlen_k,
++                                                                   head_size_q,
++                                                                   head_size_v,
++                                                                   elem_bytes_k,
++                                                                   elem_bytes_v);
++    if (!group_size_opt.has_value() || group_size_opt.value() >= num_heads) {
++        if (head_grouping::log_enabled()) {
++            std::cout << "[LLC Head Grouping] skipped (group_size not set or >= nhead)"
++                      << std::endl;
++        }
++        return -1.0f;
++    }
++
++    if (head_grouping::log_enabled()) {
++        const std::string arch = ck_tile::get_device_name();
++        const size_t llc_bytes = head_grouping::get_llc_cache_bytes(arch);
++        const ck_tile::index_t gqa_ratio = (num_heads_k > 0 ? (num_heads / num_heads_k) : 1);
++        const ck_tile::index_t group_sz = group_size_opt.value();
++        const ck_tile::index_t n_groups = ck_tile::integer_divide_ceil(num_heads, group_sz);
++        std::cout << "[LLC Head Grouping] enabled"
++                  << " arch=" << (arch.empty() ? "unknown" : arch)
++                  << " llc_mb=" << (llc_bytes / (1024ull * 1024ull))
++                  << " nhead_q=" << num_heads << " nhead_k=" << num_heads_k
++                  << " gqa_ratio=" << gqa_ratio << " group_size=" << group_sz
++                  << " groups=" << n_groups << std::endl;
++    }
++
++    const bool use_blockscale_qscale = traits.qscale_type == quant_scale_enum::blockscale;
++    auto dispatch_grouped_fwd = [&](auto type_config_tag) {
++        using TypeConfig = decltype(type_config_tag);
++        return head_grouping::run_fwd_head_grouped<typename TypeConfig::QDataType,
++                                                   typename TypeConfig::KDataType,
++                                                   typename TypeConfig::VDataType,
++                                                   typename TypeConfig::ODataType,
++                                                   float,
++                                                   typename TypeConfig::LSEDataType,
++                                                   typename TypeConfig::RandValOutputDataType>(
++            stream_config,
++            traits,
++            args,
++            num_heads,
++            num_heads_k,
++            group_size_opt.value(),
++            use_blockscale_qscale,
++            [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
++                return fmha_fwd_fn(grouped_traits, grouped_args, grouped_sc);
++            });
++    };
++
++    if (q_dtype == torch::kFloat16) {
++        return dispatch_grouped_fwd(FmhaFwdTypeConfig<FmhaFwdFp16>{});
++    }
++    if (q_dtype == torch::kBFloat16) {
++        return dispatch_grouped_fwd(FmhaFwdTypeConfig<FmhaFwdBf16>{});
++    }
++    return -1.0f;
++}
++
++} // namespace flash
+diff --git a/csrc/flash_attn_ck/mha_varlen_bwd.cpp b/csrc/flash_attn_ck/mha_varlen_bwd.cpp
+index 68618f8cecc..f0a1298f18e 100644
+--- a/csrc/flash_attn_ck/mha_varlen_bwd.cpp
++++ b/csrc/flash_attn_ck/mha_varlen_bwd.cpp
+@@ -363,6 +363,9 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads
+     at::cuda::CUDAGuard device_guard{q.device()};
+ 
+     auto opts = q.options();
++    if (flash::is_gfx1x_arch()) {
++        flash::check_gfx1x_bwd_supported(deterministic);
++    }
+     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+     at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
+ 
+@@ -450,4 +453,4 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads
+     }
+ 
+     return { dq, dk, dv, softmax_d };
+-}
+\ No newline at end of file
++}
+diff --git a/csrc/flash_attn_ck/mha_varlen_fwd.cpp b/csrc/flash_attn_ck/mha_varlen_fwd.cpp
+index 5bf60a82d7d..f08ffb54970 100644
+--- a/csrc/flash_attn_ck/mha_varlen_fwd.cpp
++++ b/csrc/flash_attn_ck/mha_varlen_fwd.cpp
+@@ -2,11 +2,13 @@
+  * Copyright (c) 2024, Tri Dao.
+  ******************************************************************************/
+ 
+-#include "flash_common.hpp"
++#include "mha_fwd_head_grouping_utils.hpp"
+ 
+-#include "fmha_fwd.hpp"
+ #include "mask.hpp"
+ 
++#include <optional>
++#include <string>
++
+ fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
+                                               std::string dtype,
+                                               int head_size,
+@@ -141,6 +143,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
+                          d,             // hdim_v
+                          h,             // nhead
+                          h_k,           // nhead_k
++                         0,             // num_head_q_total
++                         0,             // head_start
+                          softmax_scale, // scale_s
+                          0.0f,          // logits_soft_cap
+                          stride_q,
+@@ -572,7 +576,27 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
+                     p_dropout,
+                     drop_seed_offset);
+ 
+-            float t = fmha_fwd(traits, args, stream_config);
++            float t =
++                flash::maybe_dispatch_head_grouped_fwd(
++                    stream_config,
++                    traits,
++                    args,
++                    num_heads,
++                    num_heads_k,
++                    batch_size,
++                    max_seqlen_k,
++                    head_size,
++                    head_size,
++                    k.element_size(),
++                    v.element_size(),
++                    q.scalar_type(),
++                    [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
++                        return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
++                    });
++
++            if (t < 0.0f) {
++                t = fmha_fwd(traits, args, stream_config);
++            }
+             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+         }
+     }
+diff --git a/setup.py b/setup.py
+index db994bb3f7e..dcb89f85efe 100644
+--- a/setup.py
++++ b/setup.py
+@@ -199,12 +199,18 @@ def rename_cpp_to_cu(cpp_files):
+ 
+ def validate_and_update_archs(archs):
+     # List of allowed architectures
+-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
++    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
+ 
+     # Validate if each element in archs is in allowed_archs
+     assert all(
+         arch in allowed_archs for arch in archs
+-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
++    ), f"Invalid archs: {archs}. Allowed: {allowed_archs}"
++
++    if "native" in archs and len(archs) > 1:
++        raise ValueError(
++            f"'native' cannot be combined with explicit archs: {archs}. "
++            "Use either GPU_ARCHS='native' or GPU_ARCHS='gfx942;gfx950'."
++        )
+ 
+ 
+ cmdclass = {}
+@@ -397,10 +403,35 @@ def validate_and_update_archs(archs):
+             os.makedirs("build")
+ 
+         optdim = os.getenv("OPT_DIM", "32,64,128,256")
+-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
++        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
++        validate_and_update_archs(archs)
++
++        if archs != ["native"]:
++            kernel_targets = archs
++        else:
++            if not torch.cuda.is_available():
++                raise RuntimeError(
++                    "GPU_ARCHS not set and no GPU detected. "
++                    "Please set GPU_ARCHS (e.g. GPU_ARCHS='gfx942') to cross-compile."
++                )
++            props = torch.cuda.get_device_properties(torch.cuda.current_device())
++            gcn_arch = getattr(props, "gcnArchName", None)
++            if not gcn_arch:
++                raise RuntimeError(
++                    "GPU_ARCHS not set and current device does not expose gcnArchName. "
++                    "This usually means the active PyTorch build is not ROCm. "
++                    "Please set GPU_ARCHS explicitly."
++                )
++            detected_arch = gcn_arch.split(":")[0]
++            kernel_targets = [detected_arch.lower()]
++            validate_and_update_archs(kernel_targets)
++
++        # NOTE: --targets requires CK >= 859acb5 (the submodule version pinned in this repo).
++        # If generate.py fails with an unknown argument error, ensure the
++        # composable_kernel submodule is up to date.
++        targets_arg = ",".join(kernel_targets)
++        for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
++            subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
+ 
+         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
+         # See https://github.com/pytorch/pytorch/pull/70650
+@@ -410,14 +441,7 @@ def validate_and_update_archs(archs):
+             generator_flag = ["-DOLD_GENERATOR_PATH"]
+ 
+         check_if_rocm_home_none("flash_attn")
+-        archs = os.getenv("GPU_ARCHS", "native").split(";")
+-        validate_and_update_archs(archs)
+-
+-        if archs != ['native']:
+-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
+-        else:
+-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+-            cc_flag = [f"--offload-arch={arch}"]
++        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
+ 
+         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+         # torch._C._GLIBCXX_USE_CXX11_ABI
+@@ -468,7 +492,11 @@ def validate_and_update_archs(archs):
+                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                     "-D__HIP_PLATFORM_HCC__=1"]
+ 
+-        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
++        ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
++        if ck_tile_float_to_bfloat16_default is None:
++            has_gfx11_target = any(arch.startswith("gfx11") for arch in kernel_targets)
++            ck_tile_float_to_bfloat16_default = "0" if has_gfx11_target else "3"
++        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
+ 
+         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+         hip_version = get_hip_version()
+diff --git a/tests/test_flash_attn_ck.py b/tests/test_flash_attn_ck.py
+index d5590fcfc82..24c17b0133c 100644
+--- a/tests/test_flash_attn_ck.py
++++ b/tests/test_flash_attn_ck.py
+@@ -27,10 +27,61 @@
+ 
+ from flash_attn.layers.rotary import apply_rotary_emb
+ 
++
++def is_gfx11(device="cuda"):
++    if not torch.cuda.is_available():
++        return False
++    props = torch.cuda.get_device_properties(device)
++    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
++    return "gfx11" in name
++
++
++def is_gfx12(device="cuda"):
++    if not torch.cuda.is_available():
++        return False
++    props = torch.cuda.get_device_properties(device)
++    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
++    return "gfx12" in name
++
++
++def is_gfx1x(device="cuda"):
++    if not torch.cuda.is_available():
++        return False
++    props = torch.cuda.get_device_properties(device)
++    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
++    return ("gfx11" in name) or ("gfx12" in name)
++
++
+ def is_bwd_hdim_supported(d):
+     return d <= 256
+ 
+ 
++def is_bwd_supported(d, deterministic):
++    if not is_bwd_hdim_supported(d):
++        return False
++
++    if is_gfx11():
++        return False
++
++    if is_gfx12() and deterministic:
++        return False
++
++    return True
++
++
++def get_bwd_unsupported_reason(d, deterministic):
++    if is_bwd_hdim_supported(d) is False:
++        return f"CK backward is not supported for head dim {d}."
++
++    if is_gfx11():
++        return "CK backward is not supported on gfx11."
++
++    if is_gfx12() and deterministic:
++        return "Deterministic CK backward is not supported on gfx12."
++
++    return "CK backward is not supported on this arch/configuration."
++
++
+ def ck_randval_to_dropout_mask(randval, p):
+     # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
+     # randval in 255 * [0, 0.7] will be kept
+@@ -143,7 +194,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
+     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    if is_bwd_supported(d, deterministic):
+         (dqkv,) = torch.autograd.grad(out, qkv, g)
+         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
+         (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
+@@ -260,7 +311,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
+     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    if is_bwd_supported(d, deterministic):
+         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
+         dqkv = dqkv_pad_fn(dqkv_unpad)
+         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
+@@ -442,7 +493,7 @@ def test_flash_attn_output(
+     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    if is_bwd_supported(d, deterministic):
+         if kvpacked:
+             (
+                 dq,
+@@ -703,7 +754,7 @@ def test_flash_attn_varlen_output(
+     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item()
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    if is_bwd_supported(d, deterministic):
+         if kvpacked:
+             (
+                 dq_unpad,
+@@ -821,7 +872,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    if is_bwd_supported(d, deterministic=False):
+         do_o = (g.float() * out.float()).sum(-1)
+         (
+             dq,
+@@ -851,10 +902,10 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+ 
+-    # TODO - use 10 times to check, wait for ck to fix bwd precision issue
+-    assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-4
+-    assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-4
+-    assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-4
++        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
++        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-4
++        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-4
++        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-4
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@@ -973,46 +1024,44 @@ def test_flash_attn_varlen_causal(
+     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+ 
+     g = torch.randn_like(out)
+-    if is_bwd_hdim_supported(d):
++    test_backward = block_table is None and is_bwd_supported(d, deterministic=False)
++    if test_backward:
+         do_o = (g.float() * out.float()).sum(-1)
+-        test_backward = block_table is None
+-        if test_backward:
+-            (
+-                dq_unpad,
+-                dk_unpad,
+-                dv_unpad,
+-            ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
+-            dq = dq_pad_fn(dq_unpad)
+-            dk = dk_pad_fn(dk_unpad)
+-            dv = dk_pad_fn(dv_unpad)
+-            (
+-                dq_ref,
+-                dk_ref,
+-                dv_ref,
+-            ) = torch.autograd.grad(out_ref, (q, k, v), g)
+-            (
+-                dq_pt,
+-                dk_pt,
+-                dv_pt,
+-            ) = torch.autograd.grad(out_pt, (q, k, v), g)
+-            print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+-            print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+-            print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+-            print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+-            print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+-            print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+-            print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+-            print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+-            print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+-            print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+-            print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+-            print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
++        (
++            dq_unpad,
++            dk_unpad,
++            dv_unpad,
++        ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
++        dq = dq_pad_fn(dq_unpad)
++        dk = dk_pad_fn(dk_unpad)
++        dv = dk_pad_fn(dv_unpad)
++        (
++            dq_ref,
++            dk_ref,
++            dv_ref,
++        ) = torch.autograd.grad(out_ref, (q, k, v), g)
++        (
++            dq_pt,
++            dk_pt,
++            dv_pt,
++        ) = torch.autograd.grad(out_pt, (q, k, v), g)
++        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
++        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
++        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
++        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
++        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
++        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
++        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
++        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
++        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
++        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
++        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
++        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+ 
+-        if test_backward:
+-            # TODO - use 10 times to check, wait for ck to fix bwd precision issue
+-            assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-5
+-            assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-5
+-            assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-5
++        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
++        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-5
++        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-5
++        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-5
+ 
+ 
+ # TODO - support splitkv
+@@ -1323,7 +1372,8 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
+     torch.random.manual_seed(42)
+     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
+     g = torch.randn_like(out0)
+-    if dropout_p == 0 and is_bwd_hdim_supported(d):
++    test_backward = dropout_p == 0 and is_bwd_supported(d, deterministic=False)
++    if test_backward:
+         (
+             dq0,
+             dk0,
+@@ -1338,7 +1388,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
+         assert torch.equal(out, out0)
+         assert torch.equal(lse, lse0)
+ 
+-        if dropout_p == 0:
++        if test_backward:
+             (
+                 dq,
+                 dk,
+@@ -1365,6 +1415,8 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
+     # TODO - 1 or 2 might fail, need to check
+     if seqlen == 1 or seqlen == 2:
+         pytest.skip()
++    if not is_bwd_supported(d, deterministic=False):
++        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
+ 
+     device = "cuda"
+     # set seed
+@@ -1418,6 +1470,9 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
+     """We previously had a bug where we were using the wrong strides of dout, which shows up
+     when dout is not contiguous.
+     """
++    if not is_bwd_supported(d, deterministic=False):
++        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
++
+     device = "cuda"
+     # set seed
+     torch.random.manual_seed(0)
+@@ -1468,6 +1523,9 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
+     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
+     in the case where seqlen % 128 != 0 or varlen.
+     """
++    if not is_bwd_supported(d, deterministic=False):
++        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
++
+     device = "cuda"
+     # set seed
+     torch.random.manual_seed(0)
+@@ -1531,6 +1589,9 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
+     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+     out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, deterministic=True)
+ 
++    if not is_bwd_supported(d, deterministic=True):
++        pytest.skip(get_bwd_unsupported_reason(d, deterministic=True))
++
+     g = torch.randn_like(out)
+     dq0, dk0, dv0 = torch.autograd.grad(out, (q, k, v), g, retain_graph=True)
+     for _ in range(50):
+@@ -1608,6 +1669,9 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
+         deterministic=True,
+     )
+ 
++    if not is_bwd_supported(d, deterministic=True):
++        pytest.skip(get_bwd_unsupported_reason(d, deterministic=True))
++
+     g = torch.randn_like(out)
+     dq0, dk0, dv0 = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
+     for _ in range(50):
+@@ -1615,4 +1679,3 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
+         assert torch.equal(dv, dv0)
+         assert torch.equal(dk, dk0)
+         assert torch.equal(dq, dq0)
+-

@@ -1,0 +1,155 @@
+diff --git a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+index 2221b3b91542..bff47fdac7fe 100644
+--- a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
++++ b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+@@ -994,8 +994,8 @@ def __init__(self,
+             self.hidden_size,
+             self.head_dim,
+             bias=False,
+-            dtype=dtype,
+-            quant_config=quant_config,
++            dtype=torch.float32,
++            quant_config=None,
+             skip_create_weights_in_init=skip_create_weights_in_init,
+             use_custom_cublas_mm=True)
+         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
+@@ -1008,6 +1008,10 @@ def __init__(self,
+             skip_create_weights_in_init=skip_create_weights_in_init,
+             use_custom_cublas_mm=True)
+ 
++        # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
++        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
++        self._fused_wk_wp_weight: Optional[torch.Tensor] = None
++
+         indexer_rope_interleave = getattr(sparse_attention_config,
+                                           'indexer_rope_interleave', False)
+         self.rotary_emb = RotaryEmbedding(
+@@ -1023,6 +1027,13 @@ def __init__(self,
+         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+ 
++    def post_load_weights(self):
++        """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
++        # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
++        # → fused: [head_dim + n_heads, hidden_size]
++        self._fused_wk_wp_weight = torch.cat(
++            [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
++
+     @staticmethod
+     def prepare_one_prefill_chunk(
+         metadata: DSAtrtllmAttentionMetadata,
+@@ -1679,18 +1690,26 @@ def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
+     @torch.inference_mode()
+     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+                 metadata: DSAtrtllmAttentionMetadata,
+-                position_ids: torch.Tensor, indexer_k: torch.Tensor):
++                position_ids: torch.Tensor):
+         quant_block_size = metadata.kv_cache_manager.quant_block_size
+         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
+ 
+-        q_and_k, weights = maybe_execute_in_parallel(
+-            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
+-            lambda: self.weights_proj(_to_float(hidden_states)),
+-            self.ln_events[0],
+-            self.ln_events[1],
+-            self.aux_stream,
+-        )
+-        q_pe, q_nope, k_pe, k_nope = q_and_k
++        # Single fused FP32 cuBLAS GEMM (TF32 on Ampere+): wk + weights_proj
++        # hidden_states (FP32) @ fused_weight^T -> [N, head_dim + n_heads]
++        assert self._fused_wk_wp_weight is not None, \
++            "post_load_weights() must be called before forward()"
++        hidden_float = _to_float(hidden_states)
++        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
++                                               self._fused_wk_wp_weight.t(),
++                                               None,
++                                               out_dtype=None)
++        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
++                                             dim=-1)
++        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
++        indexer_k = indexer_k.to(hidden_states.dtype)
++
++        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
++            qr, indexer_k, position_ids)
+         q, k = maybe_execute_in_parallel(
+             lambda: self._prep_q_or_k(q_pe, q_nope),
+             lambda: self._prep_q_or_k(k_pe, k_nope),
+diff --git a/tensorrt_llm/_torch/modules/attention.py b/tensorrt_llm/_torch/modules/attention.py
+index 011a4d93da78..22b455ab3756 100644
+--- a/tensorrt_llm/_torch/modules/attention.py
++++ b/tensorrt_llm/_torch/modules/attention.py
+@@ -1632,15 +1632,11 @@ def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
+         if use_short_mha_for_ctx and num_generations == 0:
+             topk_indices = None
+         else:
+-            # Defer indexer.wk projection to here so the short-MHA skip
+-            # path above avoids the extra GEMM when indexer is not needed.
+-            indexer_k = self.indexer.wk(hidden_states)
+             topk_indices = self.indexer(
+                 qr,
+                 hidden_states,
+                 attn_metadata,
+                 position_ids,
+-                indexer_k=indexer_k,
+             )
+ 
+         assert q.shape[
+diff --git a/tests/unittest/_torch/attention/sparse/test_short_seq_mha.py b/tests/unittest/_torch/attention/sparse/test_short_seq_mha.py
+index c0d5d8a78524..b9c339f29dc6 100644
+--- a/tests/unittest/_torch/attention/sparse/test_short_seq_mha.py
++++ b/tests/unittest/_torch/attention/sparse/test_short_seq_mha.py
+@@ -296,6 +296,8 @@ def _init_mla_weights(mla):
+         mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=NN_INIT_STD)
+         mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=NN_INIT_STD)
+         mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=NN_INIT_STD)
++        # Build fused wk+weights_proj weight after random init
++        mla.mqa.indexer.post_load_weights()
+ 
+ 
+ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device):
+@@ -466,7 +468,6 @@ def test_standard_path_when_exceeds_threshold():
+         hidden_states,
+         metadata,
+         position_ids,
+-        indexer_k=mla.mqa.indexer.wk(hidden_states),
+     )
+ 
+     output = _run_forward(
+@@ -502,6 +503,8 @@ def test_agrees_with_absorption_path():
+             mla_absorb.mqa.indexer.named_parameters(),
+         ):
+             pa.data.copy_(ps.data)
++    # Build fused wk+weights_proj weight after copying params
++    mla_absorb.mqa.indexer.post_load_weights()
+ 
+     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
+     hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+@@ -522,7 +525,6 @@ def _run(mla_module):
+                 hidden_states.clone(),
+                 meta,
+                 position_ids.clone(),
+-                indexer_k=mla_module.mqa.indexer.wk(hidden_states.clone()),
+             )
+         out = _run_forward(
+             mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, topk
+diff --git a/tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py b/tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py
+index aacb61c4ea06..ffd9896fb53a 100644
+--- a/tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py
++++ b/tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py
+@@ -477,6 +477,8 @@ def yarn_get_mscale(scale=1, mscale=1):
+             mla_layer.mqa.indexer.wk.weight.normal_(mean=0.0, std=nn_init_std)
+             mla_layer.mqa.indexer.weights_proj.weight.normal_(mean=0.0,
+                                                               std=nn_init_std)
++            # Build fused wk+weights_proj weight after random init
++            mla_layer.mqa.indexer.post_load_weights()
+ 
+         # Extract W_UK and W_UV from test layer for reference calculation
+         kv_b_weight = mla.kv_b_proj.weight.data
+@@ -681,7 +683,6 @@ def yarn_get_mscale(scale=1, mscale=1):
+         hidden_states,
+         attn_metadata,
+         position_ids,
+-        indexer_k=mla.mqa.indexer.wk(hidden_states),  # indexer_k
+     )
+ 
+     # Validate indexer output against expected causal indices (since seq_len < topk=2048)

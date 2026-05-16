@@ -1,0 +1,3488 @@
+diff --git a/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+index 30db904020f2..4e76d2be5614 100644
+--- a/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
++++ b/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+@@ -308,6 +308,17 @@ struct QuantParams
+ 
+         GemmInputs fc1;
+         GemmInputs fc2;
++
++        // Dynamic fc2 input scale: compute fc2 input scale from intermediate activation at runtime.
++        // Only used when enabled = true; all pointers are nullptr otherwise.
++        struct DynamicFc2InputScale
++        {
++            bool enabled = false;
++            float* amax = nullptr;                 // [1] global amax output
++            float* alpha = nullptr;                // [num_experts] dynamic alpha output
++            void* bf16_buffer = nullptr;           // bf16 intermediate buffer
++            float const* weight_scale_2 = nullptr; // [num_experts] per-expert weight_scale_2 for fc2
++        } dynamic_fc2_input_scale;
+     } fp4;
+ 
+     // GPTQ/AWQ quantization params
+diff --git a/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu b/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu
+index 57a1b3427f33..a0b08a3df775 100644
+--- a/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu
++++ b/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu
+@@ -2059,13 +2059,14 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
+ // ============================== Activation =================================
+ 
+ template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
+-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int kProcessRows>
++    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int kProcessRows, bool DynamicFc2 = false>
+ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(T* output,
+     GemmOutputType const* gemm_result, float const* fp8_quant, ScaleBiasType const* bias_ptr, bool bias_is_broadcast,
+     int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
+     float const* fc2_act_global_scale, bool use_per_expert_act_scale,
+     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, ActivationParams activation_params,
+-    GemmOutputType const* prequant_scale)
++    GemmOutputType const* prequant_scale, float* dynamic_fc2_amax = nullptr,
++    GemmOutputType* bf16_intermediate_output = nullptr)
+ {
+ #ifdef ENABLE_FP4
+     constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>
+@@ -2237,7 +2238,29 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
+                     * arrayConvert<GemmResultElem, ComputeElem>(loadVec(&prequant_scale_vec[elem_index]));
+             }
+ 
+-            if constexpr (IsNVFP4 || IsMXFP8)
++            if constexpr (DynamicFc2 && (IsNVFP4 || IsMXFP8))
++            {
++                // Dynamic FC2 mode: output bf16 instead of FP4, and compute global amax
++                // for dynamic fc2 input scale computation.
++                using Bf16Elem = cutlass::Array<GemmOutputType, ACTIVATION_ELEM_PER_THREAD>;
++                auto* bf16_output_vec = reinterpret_cast<Bf16Elem*>(bf16_intermediate_output + output_offset);
++                storeVec(&bf16_output_vec[elem_index], arrayConvert<ComputeElem, Bf16Elem>(post_act_val));
++
++                // Compute local amax for dynamic fc2 scale
++                float local_amax = 0.0f;
++                for (int k = 0; k < ACTIVATION_ELEM_PER_THREAD; ++k)
++                {
++                    local_amax = fmaxf(local_amax, fabsf(post_act_val[k]));
++                }
++                // Warp reduction for amax
++                for (int offset = 16; offset > 0; offset >>= 1)
++                    local_amax = fmaxf(local_amax, __shfl_down_sync(0xffffffff, local_amax, offset));
++                if ((threadIdx.y % 32) == 0 && dynamic_fc2_amax)
++                {
++                    atomicMax(reinterpret_cast<int*>(dynamic_fc2_amax), __float_as_int(local_amax));
++                }
++            }
++            else if constexpr (IsNVFP4 || IsMXFP8)
+             {
+                 // We use GemmOutputType as the intermediate compute type as that should always be unquantized
+                 auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize>(post_act_val,
+@@ -2270,8 +2293,8 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
+ #endif
+ 
+     // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values in the padded
+-    // SF atom.
+-    if constexpr (IsNVFP4 || IsMXFP8)
++    // SF atom. Skip when DynamicFc2 since we output bf16, not FP4.
++    if constexpr (!DynamicFc2 && (IsNVFP4 || IsMXFP8))
+     {
+         constexpr int64_t min_num_tokens_alignment = IsNVFP4
+             ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
+@@ -2335,6 +2358,134 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
+     }
+ }
+ 
++// =============================================================================
++// dynamicFP4QuantizeKernel: Quantize bf16 intermediate to FP4 with dynamic
++// global scale derived from the global amax computed by doActivationKernel.
++// Also computes dynamic fc2_alpha for each expert.
++// =============================================================================
++template <class T, class GemmOutputType,
++    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
++__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4QuantizeKernel(T* output, // FP4 packed output
++    GemmOutputType const* bf16_input,         // bf16 intermediate from doActivation (DynamicFc2 mode)
++    int64_t const* expert_first_token_offset, // [num_experts + 1]
++    int num_experts_per_node, int64_t inter_size,
++    float const* dynamic_amax,                // [1] global amax from doActivation
++    float const* fc2_weight_scale_2,          // [num_experts] per-expert weight_scale_2
++    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, // block scale output
++    float* dynamic_fc2_alpha)                                       // [num_experts] output: adjusted alpha
++{
++#ifdef ENABLE_FP4
++    constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>
++        && BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
++    constexpr int64_t VecSize = TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
++    constexpr int64_t ACTIVATION_ELEM_PER_THREAD = CVT_ELTS_PER_THREAD;
++
++    if constexpr (!IsNVFP4)
++        return;
++
++    constexpr float FP8_MAX = 448.0f;
++    constexpr float E2M1_MAX = 6.0f;
++
++    // Compute dynamic global scale from amax
++    float const amax = dynamic_amax[0];
++    float const dyn_input_scale = FP8_MAX * E2M1_MAX / fmaxf(amax, 1e-12f);
++
++    // Compute dynamic fc2_alpha directly from weight_scale_2 (only thread 0)
++    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0 && dynamic_fc2_alpha && fc2_weight_scale_2)
++    {
++        for (int e = 0; e < num_experts_per_node; ++e)
++        {
++            // alpha = weight_scale_2 / dyn_input_scale
++            dynamic_fc2_alpha[e] = fc2_weight_scale_2[e] / dyn_input_scale;
++        }
++    }
++
++    int64_t const min_k_dim_alignment = TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4;
++    int64_t const padded_inter_size = ceilDiv(inter_size, min_k_dim_alignment) * min_k_dim_alignment;
++    int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
++    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
++
++    int64_t const rows_per_cta = blockDim.x; // 1 row per thread in x dim
++    int64_t const grid_stride = static_cast<int64_t>(gridDim.x) * rows_per_cta;
++    int64_t const col_offset = blockIdx.y * blockDim.y + threadIdx.y;
++
++    if (col_offset >= num_elems_in_col)
++        return;
++
++    // K-dimension padding
++    int64_t const k_padding_start = inter_size / VecSize;
++    int64_t const k_padding_end = padded_inter_size / VecSize;
++    bool const do_k_padding = col_offset >= k_padding_start && col_offset < k_padding_end;
++
++    for (int64_t row_offset = blockIdx.x * rows_per_cta; row_offset < num_valid_tokens; row_offset += grid_stride)
++    {
++        int64_t const token = row_offset;
++        if (token >= num_valid_tokens)
++            break;
++
++        // Find expert for this token
++        int32_t expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) - 1;
++        int64_t num_tokens_before_expert = expert_first_token_offset[expert];
++
++        size_t input_offset = token * inter_size;
++        size_t output_offset = token * inter_size;
++
++        using Bf16Elem = cutlass::Array<GemmOutputType, ACTIVATION_ELEM_PER_THREAD>;
++        using ComputeElem = cutlass::Array<float, ACTIVATION_ELEM_PER_THREAD>;
++        using OutputElem = uint32_t; // packed FP4
++
++        auto const* bf16_vec = reinterpret_cast<Bf16Elem const*>(bf16_input + input_offset);
++        auto* output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
++
++        auto bf16_val = loadVec(&bf16_vec[col_offset]);
++        auto float_val = arrayConvert<Bf16Elem, ComputeElem>(bf16_val);
++
++        // Quantize to FP4 with dynamic global scale
++        // Use dyn_input_scale (= 448*6/amax) as the global scale for FP4 quantization
++        auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize>(float_val, dyn_input_scale,
++            num_tokens_before_expert, expert, token, col_offset, inter_size, fc2_act_sf_flat,
++            TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
++        static_assert(sizeof(res) == sizeof(*output_vec));
++        output_vec[col_offset] = res;
++
++        if (do_k_padding)
++        {
++            writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token, col_offset,
++                padded_inter_size, fc2_act_sf_flat, nullptr);
++        }
++    }
++
++    // N-dimension SF padding
++    constexpr int64_t min_num_tokens_alignment = TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
++    int64_t const num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
++    int64_t const padded_num_elems_in_col = padded_inter_size / VecSize;
++    if (col_offset >= padded_num_elems_in_col)
++        return;
++
++    for (int64_t row_offset = blockIdx.x * rows_per_cta; row_offset < num_padding_tokens; row_offset += grid_stride)
++    {
++        int64_t const padding_token = row_offset;
++        if (padding_token >= num_padding_tokens)
++            break;
++        int64_t expert = padding_token / min_num_tokens_alignment;
++        int64_t num_tokens_before = expert_first_token_offset[expert];
++        int64_t num_tokens_after = expert_first_token_offset[expert + 1];
++        int64_t tokens_to_expert = num_tokens_after - num_tokens_before;
++        if (tokens_to_expert == 0)
++            continue;
++        int64_t padding_to_expert
++            = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(tokens_to_expert, min_num_tokens_alignment)
++            - tokens_to_expert;
++        int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
++        if (expert_pad_idx < padding_to_expert)
++        {
++            writeSF<VecSize, VecSize>(num_tokens_before, expert, -1, num_tokens_after + expert_pad_idx, col_offset,
++                padded_inter_size, fc2_act_sf_flat, nullptr);
++        }
++    }
++#endif
++}
++
+ template <class T, class GemmOutputType, class ScaleBiasType>
+ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8_quant, ScaleBiasType const* bias,
+     bool bias_is_broadcast, int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
+@@ -2370,7 +2521,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
+                 = [&](auto block_scaling_type) -> void (*)(T*, GemmOutputType const*, float const*,
+                                                    ScaleBiasType const*, bool, int64_t const*, int, int64_t,
+                                                    float const*, bool, TmaWarpSpecializedGroupedGemmInput::ElementSF*,
+-                                                   ActivationParams, GemmOutputType const*)
++                                                   ActivationParams, GemmOutputType const*, float*, GemmOutputType*)
+             {
+                 switch (activation_type.activation_type)
+                 {
+@@ -2465,7 +2616,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
+         config.attrs = attrs;
+         cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
+             expert_first_token_offset, num_experts_per_node, inter_size, quant_params.fp4.fc2.act_global_scale,
+-            use_per_expert_act_scale, fc2_act_sf_flat, activation_type, prequant_scale);
++            use_per_expert_act_scale, fc2_act_sf_flat, activation_type, prequant_scale, (float*) nullptr,
++            (GemmOutputType*) nullptr);
+     }; // end lambda doActivationKernelLauncher
+ 
+     // 256 threads per block * 256 blocks / 1 rows per block can be handled by 1-2 waves depending on SM arch
+@@ -2485,6 +2637,109 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
+     }
+ }
+ 
++// =============================================================================
++// doActivationDynamic: Two-phase activation for dynamic fc2 input scale.
++// Phase 1: doActivationKernel with DynamicFc2=true → bf16 output + global amax
++// Phase 2: dynamicFP4QuantizeKernel → FP4 quantize with dynamic global scale
++// =============================================================================
++template <class T, class GemmOutputType, class ScaleBiasType>
++void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
++    ScaleBiasType const* bias, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
++    int num_experts_per_node, int64_t inter_size, int64_t expanded_num_tokens, ActivationParams activation_type,
++    QuantParams const& quant_params, bool use_per_expert_act_scale,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, cudaStream_t stream,
++    GemmOutputType* bf16_intermediate, float* dynamic_amax, float* dynamic_fc2_alpha)
++{
++#ifdef ENABLE_FP4
++    constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>;
++    if constexpr (!IsNVFP4)
++    {
++        TLLM_CHECK_WITH_INFO(false, "doActivationDynamic only supports NVFP4");
++        return;
++    }
++    else
++    {
++        constexpr int64_t ACTIVATION_ELEM_PER_THREAD = CVT_ELTS_PER_THREAD;
++        int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
++
++        // Reset amax to 0
++        cudaMemsetAsync(dynamic_amax, 0, sizeof(float), stream);
++
++        // Phase 1: Activation → bf16 + amax
++        {
++            constexpr auto NVFP4_TYPE = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
++            auto get_kernel = [&](auto num_rows_per_cta)
++            {
++                constexpr int kRows = decltype(num_rows_per_cta)::value;
++                switch (activation_type.activation_type)
++                {
++                case ActivationType::Identity:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        IdentityAdaptor<cutlass::epilogue::thread::Identity>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::Gelu:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        IdentityAdaptor<cutlass::epilogue::thread::GELU>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::Relu:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        IdentityAdaptor<cutlass::epilogue::thread::ReLu>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::Silu:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        IdentityAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::Swiglu:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::Geglu:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        GLUAdaptor<cutlass::epilogue::thread::GELU>, NVFP4_TYPE, kRows, true>;
++                case ActivationType::SwigluBias:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, NVFP4_TYPE, kRows,
++                        true>;
++                case ActivationType::Relu2:
++                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                        IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;
++                default:
++                    TLLM_CHECK_WITH_INFO(false, "Unsupported activation type for dynamic fc2");
++                    return decltype(&doActivationKernel<T, GemmOutputType, ScaleBiasType,
++                                    GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>){nullptr};
++                }
++            };
++
++            auto fn = get_kernel(std::integral_constant<int, 1>());
++            static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
++            int32_t const max_blocks_per_sm
++                = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
++            int32_t const grid_x = std::min(sm_count * max_blocks_per_sm, static_cast<int32_t>(expanded_num_tokens));
++            int32_t const grid_y = static_cast<int32_t>(
++                (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
++
++            fn<<<dim3(grid_x, grid_y, 1), dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1), 0, stream>>>(output, gemm_result,
++                fp8_quant, bias, bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
++                quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale, fc2_act_sf_flat, activation_type,
++                (GemmOutputType const*) nullptr, dynamic_amax, bf16_intermediate);
++            sync_check_cuda_error(stream);
++        }
++
++        // Phase 2: FP4 quantize with dynamic global scale
++        {
++            constexpr auto NVFP4_TYPE = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
++            auto fn = &dynamicFP4QuantizeKernel<T, GemmOutputType, NVFP4_TYPE>;
++
++            static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
++            int32_t const grid_x = std::min(sm_count * 4, static_cast<int32_t>(expanded_num_tokens));
++            int32_t const grid_y = static_cast<int32_t>(
++                (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
++
++            fn<<<dim3(grid_x, grid_y, 1), dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1), 0, stream>>>(output,
++                bf16_intermediate, expert_first_token_offset, num_experts_per_node, inter_size, dynamic_amax,
++                quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2, fc2_act_sf_flat, dynamic_fc2_alpha);
++            sync_check_cuda_error(stream);
++        }
++    }
++#else
++    TLLM_CHECK_WITH_INFO(false, "ENABLE_FP4 required for doActivationDynamic");
++#endif
++}
++
+ // ============================== Lora Add Bias =================================
+ constexpr static int LORA_KERNELS_THREADS_PER_BLOCK = 256;
+ 
+@@ -3163,6 +3418,18 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
+                 fc1_activation_type, quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream,
+                 static_cast<UnfusedGemmOutputType const*>(fc2_prequant_scale));
+         }
++        else if (quant_params.fp4.dynamic_fc2_input_scale.enabled && use_fp4
++            && quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer && quant_params.fp4.dynamic_fc2_input_scale.amax
++            && quant_params.fp4.dynamic_fc2_input_scale.alpha)
++        {
++            // Dynamic fc2: two-phase activation (bf16 + amax, then FP4 quantize with dynamic scale)
++            doActivationDynamic<T, UnfusedGemmOutputType, ScaleBiasType>(reinterpret_cast<T*>(output),
++                static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
++                bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size, expanded_num_rows,
++                fc1_activation_type, quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream,
++                static_cast<UnfusedGemmOutputType*>(quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer),
++                quant_params.fp4.dynamic_fc2_input_scale.amax, quant_params.fp4.dynamic_fc2_input_scale.alpha);
++        }
+         else
+         {
+             using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+@@ -3950,11 +4217,14 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
+         : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc1.global_scale
+         : use_fp8                    ? fp8_dequant1
+                                      : nullptr;
+-    auto alpha_scale_flat2 = use_fp4 ? quant_params.fp4.fc2.global_scale
+-        : use_w4afp8                 ? quant_params.groupwise.fc2.alpha
+-        : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc2.global_scale
+-        : use_fp8                    ? fp8_dequant2
+-                                     : nullptr;
++    auto alpha_scale_flat2 = use_fp4
++        ? (quant_params.fp4.dynamic_fc2_input_scale.enabled && quant_params.fp4.dynamic_fc2_input_scale.alpha
++                ? quant_params.fp4.dynamic_fc2_input_scale.alpha
++                : quant_params.fp4.fc2.global_scale)
++        : use_w4afp8   ? quant_params.groupwise.fc2.alpha
++        : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
++        : use_fp8      ? fp8_dequant2
++                       : nullptr;
+     if (!alpha_scale_flat1 && !alpha_scale_flat2)
+     {
+         layout_info1.alpha_scale_ptr_array = nullptr;
+diff --git a/cpp/tensorrt_llm/thop/moeOp.cpp b/cpp/tensorrt_llm/thop/moeOp.cpp
+index c8062a73ddb8..1cedb93b3127 100644
+--- a/cpp/tensorrt_llm/thop/moeOp.cpp
++++ b/cpp/tensorrt_llm/thop/moeOp.cpp
+@@ -273,7 +273,8 @@ class FusedMoeRunner : public torch::CustomClassHolder
+         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+         torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+-        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
++        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
++        bool use_dynamic_fc2_scale = false)
+     {
+         std::lock_guard<std::mutex> lock(mMutex);
+         // Free the profile workspace to save memory
+@@ -448,8 +449,29 @@ class FusedMoeRunner : public torch::CustomClassHolder
+         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+ 
+-        auto const quant_params
++        auto quant_params
+             = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
++
++        // Dynamic fc2 scale: allocate workspace buffers
++        at::Tensor dynamic_fc2_amax_tensor, dynamic_fc2_alpha_tensor, dynamic_fc2_bf16_tensor;
++        if (use_dynamic_fc2_scale && isNvfp4Quant() && quant_scales.has_value() && quant_scales.value().size() >= 7)
++        {
++            auto opts_f32 = at::TensorOptions().dtype(at::ScalarType::Float).device(input.device());
++            auto opts_bf16 = at::TensorOptions().dtype(at::ScalarType::BFloat16).device(input.device());
++            dynamic_fc2_amax_tensor = at::empty({1}, opts_f32);
++            dynamic_fc2_alpha_tensor = at::empty({num_experts_on_rank}, opts_f32);
++            int64_t expanded_rows = num_rows * static_cast<int64_t>(experts_per_token);
++            dynamic_fc2_bf16_tensor = at::empty({expanded_rows, inter_size}, opts_bf16);
++
++            quant_params.fp4.dynamic_fc2_input_scale.enabled = true;
++            quant_params.fp4.dynamic_fc2_input_scale.amax = dynamic_fc2_amax_tensor.data_ptr<float>();
++            quant_params.fp4.dynamic_fc2_input_scale.alpha = dynamic_fc2_alpha_tensor.data_ptr<float>();
++            quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer = dynamic_fc2_bf16_tensor.data_ptr();
++            // 7th element: per-expert fc2_weight_scale_2 passed directly from Python
++            quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2
++                = static_cast<float const*>(quant_scales.value()[6].data_ptr());
++        }
++
+         kernels::MoeMinLatencyParams min_latency_params{};
+ 
+         // TODO: support lora in the future
+@@ -627,7 +649,7 @@ class FusedMoeRunner : public torch::CustomClassHolder
+         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+ 
+-        auto const quant_params
++        auto quant_params
+             = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
+ 
+         // TODO: support lora in the future
+@@ -1027,7 +1049,8 @@ class FusedMoeRunner : public torch::CustomClassHolder
+         else if (isNvfp4Quant())
+         {
+             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for nvfp4 quantization");
+-            TORCH_CHECK(quant_scales.value().size() == 6, "Expecting 6 quant scales for nvfp4 quantization");
++            TORCH_CHECK(quant_scales.value().size() == 6 || quant_scales.value().size() == 7,
++                "Expecting 6 or 7 quant scales for nvfp4 quantization");
+ 
+             auto const fc1_act_global = quant_scales.value()[0];
+             auto const fc1_weight_block = quant_scales.value()[1];
+diff --git a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+index 6f6eab4fd468..42f41de8b911 100644
+--- a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+@@ -229,6 +229,7 @@ def fused_moe(
+     activation_type: int = int(ActivationType.Swiglu),
+     unpadded_hidden_size: Optional[int] = None,
+     out_tensor: Optional[torch.Tensor] = None,
++    use_dynamic_fc2_scale: bool = False,
+ ) -> List[torch.Tensor]:
+ 
+     tuner = AutoTuner.get()
+@@ -300,7 +301,7 @@ def fused_moe(
+                          cluster_size, cluster_rank, enable_alltoall,
+                          min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                          activation_type, unpadded_hidden_size,
+-                         tuner_num_tokens, out_tensor)
++                         tuner_num_tokens, out_tensor, use_dynamic_fc2_scale)
+     except RuntimeError as e:
+         error_msg = str(e)
+         if "DeepGEMM only supports Hopper" in error_msg:
+@@ -354,7 +355,8 @@ def _(input: torch.Tensor,
+       tuner_top_k: Optional[int] = None,
+       activation_type: ActivationType = ActivationType.Swiglu,
+       unpadded_hidden_size: Optional[int] = None,
+-      out_tensor: Optional[torch.Tensor] = None):
++      out_tensor: Optional[torch.Tensor] = None,
++      use_dynamic_fc2_scale: bool = False):
+     seq_len = input.shape[0]
+     if use_int8_woq_per_channel:
+         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
+diff --git a/tensorrt_llm/_torch/model_config.py b/tensorrt_llm/_torch/model_config.py
+index ad6d44289951..47bb4a0ef821 100644
+--- a/tensorrt_llm/_torch/model_config.py
++++ b/tensorrt_llm/_torch/model_config.py
+@@ -444,6 +444,19 @@ def load_hf_quant_config(hf_quant_config, moe_backend):
+                     "Supported: 8.")
+ 
+             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
++        elif hf_quant_config.get("quant_method") == "nvfp4":
++            quant_config.quant_algo = QuantAlgo.NVFP4
++            group_size = hf_quant_config.get("group_size", 16)
++            assert group_size == 16, "NVFP4 only supports group_size=16"
++            quant_config.group_size = group_size
++            default_exclude = ['*.mlp.gate', 'lm_head']
++
++            # Merge HF config's modules_to_not_convert with default exclude_modules
++            if hf_exclude_modules is not None:
++                quant_config.exclude_modules = list(
++                    dict.fromkeys(hf_exclude_modules + default_exclude))
++            else:
++                quant_config.exclude_modules = default_exclude
+         return quant_config, layer_quant_config
+ 
+     @staticmethod
+diff --git a/tensorrt_llm/_torch/models/checkpoints/hf/qwen3_next_weight_mapper.py b/tensorrt_llm/_torch/models/checkpoints/hf/qwen3_next_weight_mapper.py
+index df6085c7349e..7abd08bdd29b 100644
+--- a/tensorrt_llm/_torch/models/checkpoints/hf/qwen3_next_weight_mapper.py
++++ b/tensorrt_llm/_torch/models/checkpoints/hf/qwen3_next_weight_mapper.py
+@@ -1,27 +1,15 @@
+-from typing import Union
+-
+ import torch
+ from torch import nn
+ 
+-from tensorrt_llm._torch.model_config import ModelConfig
+ from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
+     Qwen2MoeHfWeightMapper
+ from tensorrt_llm._torch.models.modeling_utils import register_mapper
+ from tensorrt_llm._torch.utils import split
+-from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
+ 
+ 
+ @register_mapper("HF", "Qwen3NextForCausalLM")
+ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
+ 
+-    def init_model_and_config(self, model: Union[nn.Module,
+-                                                 DecoderModelForCausalLM],
+-                              config: ModelConfig):
+-        super().init_model_and_config(model, config)
+-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
+-            model.config, 'num_key_value_heads'
+-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
+-
+     def should_skip_module(self, module_name: str) -> bool:
+         if module_name.startswith("draft_model"):
+             return True
+diff --git a/tensorrt_llm/_torch/models/checkpoints/hf/weight_mapper.py b/tensorrt_llm/_torch/models/checkpoints/hf/weight_mapper.py
+index cb1d8671a804..3c27230dd83d 100644
+--- a/tensorrt_llm/_torch/models/checkpoints/hf/weight_mapper.py
++++ b/tensorrt_llm/_torch/models/checkpoints/hf/weight_mapper.py
+@@ -2,7 +2,6 @@
+ from torch import nn
+ 
+ from tensorrt_llm._torch.models.modeling_utils import register_mapper
+-from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
+ 
+ from ..base_weight_mapper import BaseWeightMapper
+ 
+@@ -57,18 +56,18 @@ def should_skip_module(self, module_name: str) -> bool:
+ 
+         return super().should_skip_module(module_name)
+ 
++    @property
++    def _num_kv_heads(self) -> int:
++        config = self.model.config
++        if hasattr(config, 'num_key_value_heads'
++                   ) and config.num_key_value_heads is not None:
++            return config.num_key_value_heads
++        return config.num_attention_heads
++
+     def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
+                               weights: dict):
+         if new_name in ['k_proj', 'v_proj']:
+-            if "weight" not in weights and "bias" not in weights:
+-                return weights
+-            # k_proj and v_proj shape is [num_kv_heads*head_dim, hidden_dim]
+-            kv_shape = weights['weight'].shape[
+-                0] if "weight" in weights else weights['bias'].shape[0]
+-            if isinstance(module.quant_method, W4A16_AWQ_LinearMethod):
+-                num_kv_heads = kv_shape * 2 // self._head_dim
+-            else:
+-                num_kv_heads = kv_shape // self._head_dim
++            num_kv_heads = self._num_kv_heads
+ 
+             duplicated_keys = ["weight", "bias"]
+             if module.quant_config.quant_mode.has_nvfp4():
+diff --git a/tensorrt_llm/_torch/modules/attention.py b/tensorrt_llm/_torch/modules/attention.py
+index 3ead33963531..b35cf475e476 100644
+--- a/tensorrt_llm/_torch/modules/attention.py
++++ b/tensorrt_llm/_torch/modules/attention.py
+@@ -648,6 +648,12 @@ def _use_quantize_output(self):
+         if hasattr(self.attn, 'has_nvfp4'
+                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
+             return False
++
++        # If o_proj does dynamic activation quantization, it computes its own scales
++        # at runtime from a BF16 input — attention must NOT pre-quantize output
++        if self.o_proj.force_dynamic_quantization:
++            return False
++
+         # If no quant is applied, no need to quantize the output
+         if self.quant_config is not None and not self.quant_config.layer_quant_mode.has_any_quant(
+                 exclude_kv_cache=True):
+diff --git a/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py b/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py
+index ef33242b33e6..fcd31ada5596 100755
+--- a/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py
++++ b/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py
+@@ -473,6 +473,20 @@ def quantize_input(
+                         x, Fp4QuantizedTensor
+                     ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                     x = x * self.fc31_act_scale
++
++                # Dynamic quantization: compute input_scale from current input
++                # and update alpha in-place (same tensor addresses for CUDA graph).
++                if self.force_dynamic_quantization and hasattr(
++                        self, 'fc31_weight_scale_2'):
++                    FP8_MAX, E2M1_MAX = 448.0, 6.0
++                    amax_input = torch.amax(torch.abs(x)).float()
++                    dyn_input_scale = FP8_MAX * E2M1_MAX / amax_input
++
++                    # fc31_alpha[e] = weight_scale_2[e] / dyn_input_scale
++                    self.fc31_alpha.data.copy_(self.fc31_weight_scale_2.data /
++                                               dyn_input_scale)
++                    self.fc31_input_scale.data.copy_(dyn_input_scale)
++
+                 # Quantize based on communication scenario
+                 if post_quant_comm:
+                     if isinstance(x, Fp4QuantizedTensor):
+@@ -611,6 +625,10 @@ def run_moe(
+         if enable_alltoall is None:
+             enable_alltoall = self.enable_alltoall
+ 
++        use_dynamic_fc2_scale = (self.has_nvfp4 and getattr(
++            self, 'force_dynamic_quantization', False)
++                                 and hasattr(self, 'fc2_weight_scale_2'))
++
+         result = torch.ops.trtllm.fused_moe(
+             x,
+             token_selected_experts,
+@@ -620,7 +638,8 @@ def run_moe(
+             self.w2_weight.view(weight_dtype),
+             self.w2_bias,
+             output_dtype,
+-            quant_scales=self.quant_scales,
++            quant_scales=list(self.quant_scales) +
++            ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
+             input_sf=x_sf,
+             swizzled_input_sf=is_sf_swizzled,
+             swiglu_alpha=self.swiglu_alpha,
+@@ -645,6 +664,7 @@ def run_moe(
+             activation_type=self.activation_type,
+             unpadded_hidden_size=self.unpadded_hidden_size,
+             out_tensor=moe_output,
++            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
+         )
+         # When moe_output is provided, the result is written in-place and
+         # fused_moe returns empty list to avoid aliasing constraint violation.
+diff --git a/tensorrt_llm/_torch/modules/fused_moe/interface.py b/tensorrt_llm/_torch/modules/fused_moe/interface.py
+index b01cc1cdbe29..9dd902b83977 100644
+--- a/tensorrt_llm/_torch/modules/fused_moe/interface.py
++++ b/tensorrt_llm/_torch/modules/fused_moe/interface.py
+@@ -253,6 +253,9 @@ def __init__(
+ 
+         # could be modified later
+         self.quant_config = model_config.quant_config
++        self.force_dynamic_quantization = getattr(model_config,
++                                                  'force_dynamic_quantization',
++                                                  False)
+ 
+         self.cluster_rank = model_config.mapping.moe_cluster_rank
+         self.cluster_size = model_config.mapping.moe_cluster_size
+diff --git a/tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py b/tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py
+index fdcaf40584c5..971847720d20 100644
+--- a/tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py
++++ b/tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py
+@@ -194,6 +194,16 @@ def compute_moe(
+         unpadded_hidden_size = getattr(module, 'unpadded_hidden_size',
+                                        x.shape[1])
+ 
++        use_dynamic_fc2_scale = (
++            getattr(module, 'has_nvfp4', False)
++            and getattr(module, 'force_dynamic_quantization', False)
++            and hasattr(module, 'fc2_weight_scale_2'))
++
++        # Ensure quant_scales is a plain list for C++ ArrayRef<Tensor> binding.
++        # NamedTuple (e.g. FusedMoEQuantScalesW4A8) may not convert correctly.
++        if not isinstance(quant_scales, list):
++            quant_scales = list(quant_scales)
++
+         # Run the actual MoE computation
+         output = run_moe(x, token_selected_slots, token_final_scales,
+                          w3_w1_weight.view(weight_dtype), w3_w1_bias,
+@@ -202,7 +212,8 @@ def compute_moe(
+                          swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
+                          cluster_size, cluster_rank, use_all_to_all,
+                          min_latency_mode, self.gemm_tactics, activation_type,
+-                         unpadded_hidden_size, tuner_num_tokens, None)
++                         unpadded_hidden_size, tuner_num_tokens, None,
++                         use_dynamic_fc2_scale)
+ 
+         # Return output based on latency mode
+         return output if min_latency_mode else [output]
+diff --git a/tensorrt_llm/_torch/modules/fused_moe/quantization.py b/tensorrt_llm/_torch/modules/fused_moe/quantization.py
+index fd46a4a25a41..0feb706ffa8b 100644
+--- a/tensorrt_llm/_torch/modules/fused_moe/quantization.py
++++ b/tensorrt_llm/_torch/modules/fused_moe/quantization.py
+@@ -320,6 +320,7 @@ def load_expert_weights_to_dst(
+             w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
+         if "allow_partial_loading" in w2_args:
+             w2_kargs["allow_partial_loading"] = allow_partial_loading
++        pass_expert_idx_w3w1 = "expert_idx" in w3_w1_args
+ 
+         def maybe_pageout_mmapped_cpu_weights(
+                 weight_tensors: List[object]) -> None:
+@@ -377,6 +378,8 @@ def maybe_pageout_mmapped_cpu_weights(
+                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
+                 )
+ 
++            if pass_expert_idx_w3w1:
++                w3_w1_kargs["expert_idx"] = expert_idx
+             self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                           dst_w3_w1_weights_tensor[expert_idx],
+                                           **w3_w1_kargs)
+@@ -415,7 +418,8 @@ def load_weights(self,
+             if not isinstance(self,
+                               (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                                DeepSeekFP8BlockScalesFusedMoEMethod,
+-                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm)):
++                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
++                               NVFP4FusedMoEMethod)):
+                 raise NotImplementedError(
+                     f"Partial loading is not supported for {type(self).__name__}"
+                 )
+@@ -2023,6 +2027,17 @@ def create_weights(self,
+                                  requires_grad=False)
+         module.register_parameter("fc2_alpha", fc2_alpha)
+ 
++        # Per-expert weight_scale_2 for dynamic quantization (fixed address for CUDA graph)
++        fc31_weight_scale_2 = nn.Parameter(torch.ones(
++            module.expert_size_per_partition, dtype=torch.float32),
++                                           requires_grad=False)
++        module.register_parameter("fc31_weight_scale_2", fc31_weight_scale_2)
++
++        fc2_weight_scale_2 = nn.Parameter(torch.ones(
++            module.expert_size_per_partition, dtype=torch.float32),
++                                          requires_grad=False)
++        module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
++
+         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
+         # This will be initialized in load_quant_scales if pre_quant_scale exists
+         module.register_parameter("fc31_act_scale", None)
+@@ -2081,16 +2096,21 @@ def load_expert_fc2_alpha_nvfp4(self, w2_weight_scale_2,
+         w2_weight_scale_2 = 1.0 / w2_weight_scale_2[...].reshape([])
+         dst_w2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
+ 
+-    def load_all_fp4_weight_scales_and_alphas(
++    def load_fp4_weight_block_scales(
+             self,
+             module: torch.nn.Module,
+             weights: Dict,
+             load_expert_ids: List[int],
+             dst_w3_w1_weight_scale: Optional[torch.Tensor],
+             dst_w2_weight_scale: Optional[torch.Tensor],
+-            dst_fc31_alpha: torch.Tensor,
+-            dst_fc2_alpha: torch.Tensor,
++            tmp_weight_scale_2: Dict,
+             ignore_weight_scale=False):
++        """Load weight block scales and store raw weight_scale_2 per expert.
++
++        Block scales are loaded directly into destination tensors.
++        weight_scale_2 values are stored in tmp_weight_scale_2 for deferred
++        alpha computation in process_weights_after_loading().
++        """
+         w1_weight_scale = None
+         w2_weight_scale = None
+         w3_weight_scale = None
+@@ -2100,23 +2120,35 @@ def load_all_fp4_weight_scales_and_alphas(
+         for local_slot_id, expert_id in enumerate(load_expert_ids):
+             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                 if not ignore_weight_scale:
+-                    w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+-                    w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+-                    w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+-                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
+-                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
+-                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
++                    w1_weight_scale = weights.get(
++                        f"{expert_id}.w1.weight_scale")
++                    w3_weight_scale = weights.get(
++                        f"{expert_id}.w3.weight_scale")
++                    w2_weight_scale = weights.get(
++                        f"{expert_id}.w2.weight_scale")
++                w1_weight_scale_2 = weights.get(
++                    f"{expert_id}.w1.weight_scale_2")
++                w3_weight_scale_2 = weights.get(
++                    f"{expert_id}.w3.weight_scale_2")
++                w2_weight_scale_2 = weights.get(
++                    f"{expert_id}.w2.weight_scale_2")
+             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                 if not ignore_weight_scale:
+-                    w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+-                        expert_id].transpose(0, 1).contiguous()
+-                    w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+-                        2, dim=0)
++                    if "gate_up_proj_weight_scale" in weights:
++                        w1_w3_weight_scale = weights[
++                            "gate_up_proj_weight_scale"][expert_id].transpose(
++                                0, 1).contiguous()
++                        w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
++                            2, dim=0)
++                    else:
++                        w1_weight_scale = None
++                        w3_weight_scale = None
+                     w2_weight_scale = weights["down_proj_weight_scale"][
+-                        expert_id].transpose(0, 1).contiguous()
+-                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+-                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+-                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
++                        expert_id].transpose(0, 1).contiguous(
++                        ) if "down_proj_weight_scale" in weights else None
++                w1_weight_scale_2 = weights.get("gate_up_proj_weight_scale_2")
++                w3_weight_scale_2 = weights.get("gate_up_proj_weight_scale_2")
++                w2_weight_scale_2 = weights.get("down_proj_weight_scale_2")
+             else:
+                 raise NotImplementedError(
+                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+@@ -2124,30 +2156,36 @@ def load_all_fp4_weight_scales_and_alphas(
+ 
+             expert_idx = local_slot_id
+ 
+-            if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
+-                logger.warning(
+-                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), selecting the larger value. Accuracy may be affected."
+-                )
+-                w1_weight_scale_2 = torch.max(w1_weight_scale_2,
+-                                              w3_weight_scale_2)
+-                w3_weight_scale_2 = w1_weight_scale_2
+-
+             if not ignore_weight_scale:
+-                self.load_expert_w3_w1_weight_scale_nvfp4(
+-                    module, w1_weight_scale, w3_weight_scale,
+-                    dst_w3_w1_weight_scale[expert_idx])
+-                self.load_expert_w2_weight_scale_nvfp4(
+-                    module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+-                module._add_raw_shared_weights_for_unmap(
+-                    [w1_weight_scale, w3_weight_scale, w2_weight_scale])
+-
+-            self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
+-                                              w3_weight_scale_2,
+-                                              module.fc31_input_scale.data,
+-                                              dst_fc31_alpha[expert_idx])
+-            self.load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
+-                                             module.fc2_input_scale.data,
+-                                             dst_fc2_alpha[expert_idx])
++                if w1_weight_scale is not None or w3_weight_scale is not None:
++                    scale_kargs = {}
++                    if "expert_idx" in inspect.getfullargspec(
++                            self.load_expert_w3_w1_weight_scale_nvfp4).args:
++                        scale_kargs["expert_idx"] = expert_idx
++                    self.load_expert_w3_w1_weight_scale_nvfp4(
++                        module, w1_weight_scale, w3_weight_scale,
++                        dst_w3_w1_weight_scale[expert_idx], **scale_kargs)
++                    unmap_scales = [
++                        s for s in [w1_weight_scale, w3_weight_scale]
++                        if s is not None
++                    ]
++                    module._add_raw_shared_weights_for_unmap(unmap_scales)
++                if w2_weight_scale is not None:
++                    self.load_expert_w2_weight_scale_nvfp4(
++                        module, w2_weight_scale,
++                        dst_w2_weight_scale[expert_idx])
++                    module._add_raw_shared_weights_for_unmap([w2_weight_scale])
++
++            # Store raw weight_scale_2 for deferred computation in process_weights_after_loading()
++            if w1_weight_scale_2 is not None:
++                tmp_weight_scale_2.setdefault(expert_idx, {})
++                tmp_weight_scale_2[expert_idx]['w1'] = w1_weight_scale_2
++            if w3_weight_scale_2 is not None:
++                tmp_weight_scale_2.setdefault(expert_idx, {})
++                tmp_weight_scale_2[expert_idx]['w3'] = w3_weight_scale_2
++            if w2_weight_scale_2 is not None:
++                tmp_weight_scale_2.setdefault(expert_idx, {})
++                tmp_weight_scale_2[expert_idx]['w2'] = w2_weight_scale_2
+ 
+     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+         # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
+@@ -2156,12 +2194,6 @@ def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+             # Check if any expert has pre_quant_scale
+             has_pre_quant_scale = f"0.w1.pre_quant_scale" in weights
+ 
+-        # Step1: Load input scales.
+-        tmp_fc31_input_scale = torch.empty(module.num_experts,
+-                                           dtype=torch.float32)
+-        tmp_fc2_input_scale = torch.empty(module.num_experts,
+-                                          dtype=torch.float32)
+-
+         # If pre_quant_scale exists, we need a per-channel act scale for fc31
+         # All experts share the same input, so pre_quant_scale should be identical across experts
+         if has_pre_quant_scale:
+@@ -2174,31 +2206,31 @@ def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+                                           requires_grad=False)
+             module.register_parameter("fc31_act_scale", fc31_act_scale)
+ 
++        # Step1: Store raw per-expert input scales individually into tmp dict.
++        # Consistency check + global max computation deferred to process_weights_after_loading().
++        if not hasattr(module, 'tmp_raw_input_scales'):
++            module.tmp_raw_input_scales = {}
+         for expert_id in range(module.num_experts):
+             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+-                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+-                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+-                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
++                w1_input_scale = weights.get(f"{expert_id}.w1.input_scale")
++                w3_input_scale = weights.get(f"{expert_id}.w3.input_scale")
++                w2_input_scale = weights.get(f"{expert_id}.w2.input_scale")
+             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+-                w1_input_scale = weights["gate_up_proj_input_scale"]
+-                w3_input_scale = weights["gate_up_proj_input_scale"]
+-                w2_input_scale = weights["down_proj_input_scale"]
++                w1_input_scale = weights.get("gate_up_proj_input_scale")
++                w3_input_scale = weights.get("gate_up_proj_input_scale")
++                w2_input_scale = weights.get("down_proj_input_scale")
+             else:
+                 raise NotImplementedError(
+                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                 )
+ 
+-            self.load_expert_fc31_input_scale_nvfp4(
+-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+-            self.load_expert_fc2_input_scale_nvfp4(
+-                w2_input_scale, tmp_fc2_input_scale[expert_id])
+-
+-        # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
+-        module.fc31_input_scale.data.copy_(
+-            tmp_fc31_input_scale.max().reciprocal())
+-        # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
+-        module.fc2_input_scale.data.copy_(
+-            tmp_fc2_input_scale.max().reciprocal())
++            entry = module.tmp_raw_input_scales.setdefault(expert_id, {})
++            if w1_input_scale is not None:
++                entry['w1'] = w1_input_scale[...].reshape([])
++            if w3_input_scale is not None:
++                entry['w3'] = w3_input_scale[...].reshape([])
++            if w2_input_scale is not None:
++                entry['w2'] = w2_input_scale[...].reshape([])
+ 
+         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+         if has_pre_quant_scale:
+@@ -2210,104 +2242,218 @@ def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+             device = module.fc31_act_scale.device
+             # Load fc31 (w3/w1) pre_quant_scales
+             # All experts should have identical pre_quant_scale since they share the same input
+-            all_w3_pre_quant_scales = []
+-            all_w1_pre_quant_scales = []
++            # Store raw pre_quant_scale per expert into tmp for deferred
++            # consistency check + max(w3, w1) in process_weights_after_loading()
++            if not hasattr(module, 'tmp_pre_quant_scales'):
++                module.tmp_pre_quant_scales = {}
+             for expert_id in module.initial_local_expert_ids:
+-                w3_pre_quant_scale = load_weight_shard(
+-                    weights[f"{expert_id}.w3.pre_quant_scale"],
+-                    module.tp_size,
+-                    module.tp_rank,
+-                    TensorParallelMode.ROW,
+-                    device=device)
+-                w1_pre_quant_scale = load_weight_shard(
+-                    weights[f"{expert_id}.w1.pre_quant_scale"],
+-                    module.tp_size,
+-                    module.tp_rank,
+-                    TensorParallelMode.ROW,
+-                    device=device)
+-                all_w3_pre_quant_scales.append(w3_pre_quant_scale)
+-                all_w1_pre_quant_scales.append(w1_pre_quant_scale)
+-
+-            # Verify that all experts have identical pre_quant_scale
+-            # (they should be the same since all experts share the same input)
+-            w3_reference = all_w3_pre_quant_scales[0]
+-            w1_reference = all_w1_pre_quant_scales[0]
+-
+-            def check_consistency(scale, ref_scale, scale_name, expert_id):
+-                if not torch.allclose(scale, ref_scale, rtol=1e-5, atol=1e-8):
+-                    max_diff = (scale - ref_scale).abs().max()
++                w3_pqs_key = f"{expert_id}.w3.pre_quant_scale"
++                w1_pqs_key = f"{expert_id}.w1.pre_quant_scale"
++                entry = module.tmp_pre_quant_scales.setdefault(expert_id, {})
++                if w3_pqs_key in weights:
++                    entry['w3'] = load_weight_shard(weights[w3_pqs_key],
++                                                    module.tp_size,
++                                                    module.tp_rank,
++                                                    TensorParallelMode.ROW,
++                                                    device=device)
++                if w1_pqs_key in weights:
++                    entry['w1'] = load_weight_shard(weights[w1_pqs_key],
++                                                    module.tp_size,
++                                                    module.tp_rank,
++                                                    TensorParallelMode.ROW,
++                                                    device=device)
++
++        # Step2: Load weight block scales and store raw weight_scale_2.
++        # Alphas are computed in process_weights_after_loading() using global input_scale.
++        if not hasattr(module, 'tmp_weight_scale_2'):
++            module.tmp_weight_scale_2 = {}
++        self.load_fp4_weight_block_scales(module, weights,
++                                          module.initial_local_expert_ids,
++                                          module.w3_w1_weight_scale.data,
++                                          module.w2_weight_scale.data,
++                                          module.tmp_weight_scale_2)
++
++        # Step 3: if needed, load into shared
++        if self.need_load_shared_weights(module):
++            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
++            )
++            if getattr(module, 'local_shared_w3_w1_scale_tensors',
++                       None) is not None:
++                local_shared_w3_w1_scale_tensors = module.local_shared_w3_w1_scale_tensors
++            else:
++                local_shared_w3_w1_scale_tensors = torch.empty(
++                    (len(local_shared_load_expert_ids), ) +
++                    module.w3_w1_weight_scale.data.shape[1:],
++                    dtype=module.w3_w1_weight_scale.data.dtype,
++                    device='cpu')
++                module.local_shared_w3_w1_scale_tensors = local_shared_w3_w1_scale_tensors
++            if getattr(module, 'local_shared_w2_scale_tensors',
++                       None) is not None:
++                local_shared_w2_scale_tensors = module.local_shared_w2_scale_tensors
++            else:
++                local_shared_w2_scale_tensors = torch.empty(
++                    (len(local_shared_load_expert_ids), ) +
++                    module.w2_weight_scale.data.shape[1:],
++                    dtype=module.w2_weight_scale.data.dtype,
++                    device='cpu')
++                module.local_shared_w2_scale_tensors = local_shared_w2_scale_tensors
++            if not hasattr(module, 'tmp_shared_weight_scale_2'):
++                module.tmp_shared_weight_scale_2 = {}
++            self.load_fp4_weight_block_scales(module, weights,
++                                              local_shared_load_expert_ids,
++                                              local_shared_w3_w1_scale_tensors,
++                                              local_shared_w2_scale_tensors,
++                                              module.tmp_shared_weight_scale_2)
++
++    def _reconcile_and_compute_alphas(self, module: torch.nn.Module,
++                                      tmp_weight_scale_2: Dict,
++                                      dst_fc31_alpha: torch.Tensor,
++                                      dst_fc2_alpha: torch.Tensor):
++        """Reconcile w1/w3 weight_scale_2 and compute alphas for each expert.
++
++        For each expert, reconciles w1 and w3 weight_scale_2 (taking the max
++        if they differ), then computes fc31_alpha and fc2_alpha using the
++        finalized global input_scale values.
++        """
++        for expert_idx, scales in tmp_weight_scale_2.items():
++            w1_ws2 = scales.get('w1')
++            w3_ws2 = scales.get('w3')
++            w2_ws2 = scales.get('w2')
++            if w1_ws2 is None or w3_ws2 is None or w2_ws2 is None:
++                continue
++
++            if not torch.allclose(w1_ws2, w3_ws2):
++                logger.warning(
++                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_ws2} != {w3_ws2}), "
++                    f"selecting the larger value. Accuracy may be affected.")
++                w1_ws2 = torch.max(w1_ws2, w3_ws2)
++                w3_ws2 = w1_ws2
++
++            self.load_expert_fc31_alpha_nvfp4(w1_ws2, w3_ws2,
++                                              module.fc31_input_scale.data,
++                                              dst_fc31_alpha[expert_idx])
++            self.load_expert_fc2_alpha_nvfp4(w2_ws2,
++                                             module.fc2_input_scale.data,
++                                             dst_fc2_alpha[expert_idx])
++
++            # Store per-expert weight_scale_2 for dynamic quantization
++            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape(
++                []).float()
++            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape(
++                []).float()
++
++    def _finalize_pre_quant_scales(self, module: torch.nn.Module):
++        """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
++        if not hasattr(module, 'tmp_pre_quant_scales'):
++            return
++        # Collect all loaded w3/w1 pre_quant_scales
++        all_w3 = []
++        all_w1 = []
++        for expert_id, entry in module.tmp_pre_quant_scales.items():
++            if 'w3' in entry:
++                all_w3.append(entry['w3'])
++            if 'w1' in entry:
++                all_w1.append(entry['w1'])
++
++        if not all_w3 or not all_w1:
++            raise ValueError(
++                "Missing pre_quant_scale data: all experts must have both "
++                "w3.pre_quant_scale and w1.pre_quant_scale loaded before "
++                "calling process_weights_after_loading().")
++
++        # Verify consistency (all experts should have identical pre_quant_scale)
++        w3_reference = all_w3[0]
++        w1_reference = all_w1[0]
++        expert_ids = list(module.tmp_pre_quant_scales.keys())
++        for i in range(1, len(all_w3)):
++            for scale, ref, name in [
++                (all_w3[i], w3_reference, "w3.pre_quant_scale"),
++                (all_w1[i], w1_reference, "w1.pre_quant_scale")
++            ]:
++                if not torch.allclose(scale, ref, rtol=1e-5, atol=1e-8):
++                    max_diff = (scale - ref).abs().max()
+                     msg = (
+-                        f"MoE pre_quant_scale: expert {expert_id} {scale_name} "
+-                        f"differs from expert {module.initial_local_expert_ids[0]}! Max diff: {max_diff:.6e}. "
++                        f"MoE pre_quant_scale: expert {expert_ids[i]} {name} "
++                        f"differs from expert {expert_ids[0]}! Max diff: {max_diff:.6e}. "
+                         f"All experts should have identical pre_quant_scale since they share the same input."
+                     )
+                     logger.error(msg)
+                     raise ValueError(msg)
+ 
+-            for i, (w3_scale, w1_scale) in enumerate(
+-                    zip(all_w3_pre_quant_scales[1:],
+-                        all_w1_pre_quant_scales[1:]), 1):
+-                check_consistency(w3_scale, w3_reference, "w3.pre_quant_scale",
+-                                  module.initial_local_expert_ids[i])
+-                check_consistency(w1_scale, w1_reference, "w1.pre_quant_scale",
+-                                  module.initial_local_expert_ids[i])
+-
+-            # Take the maximum pre_quant_scale between w3 and w1 from the first expert
+-            # (all experts should have the same values)
+-            # Shape: (hidden_size,)
+-            # Keep on CUDA device (w3_reference and w1_reference are already on CUDA)
+-            fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+-                dtype=module.dtype, device='cuda')
+-
+-            # Store as a single vector since all experts share the same pre_quant_scale
+-            # This will be broadcasted to all tokens in the forward pass
+-            module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
+-
+-        # Step2: Load weight block scales and alphas.
+-        self.load_all_fp4_weight_scales_and_alphas(
+-            module, weights, module.initial_local_expert_ids,
+-            module.w3_w1_weight_scale.data, module.w2_weight_scale.data,
+-            module.fc31_alpha.data, module.fc2_alpha.data)
++        # Take the max of w3 and w1 from the first expert
++        fc31_pre_quant_scale = torch.max(w3_reference,
++                                         w1_reference).to(dtype=module.dtype,
++                                                          device='cuda')
++        module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
+ 
+-        # Step 3: if needed, load into shared
+-        if self.need_load_shared_weights(module):
+-            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+-            )
+-            local_shared_w3_w1_scale_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.w3_w1_weight_scale.data.shape[1:],
+-                dtype=module.w3_w1_weight_scale.data.dtype,
+-                device='cpu')
+-            local_shared_w2_scale_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.w2_weight_scale.data.shape[1:],
+-                dtype=module.w2_weight_scale.data.dtype,
+-                device='cpu')
+-            local_shared_fc31_alpha_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.fc31_alpha.data.shape[1:],
++        delattr(module, 'tmp_pre_quant_scales')
++
++    def process_weights_after_loading(self, module: torch.nn.Module):
++        if not hasattr(module, 'tmp_raw_input_scales'):
++            return  # No quant scales were loaded, nothing to finalize
++
++        # Step 1: Verify w1/w3 input_scale consistency per expert,
++        # then compute global input scales from per-expert max.
++        fc31_values = []
++        fc2_values = []
++        for expert_id, entry in module.tmp_raw_input_scales.items():
++            w1_is = entry.get('w1')
++            w3_is = entry.get('w3')
++            w2_is = entry.get('w2')
++            if w1_is is not None and w3_is is not None:
++                assert torch.allclose(
++                    w1_is, w3_is
++                ), f"Expert {expert_id}: w1_input_scale != w3_input_scale"
++                fc31_values.append(w1_is)
++            if w2_is is not None:
++                fc2_values.append(w2_is)
++
++        if fc31_values:
++            module.fc31_input_scale.data.copy_(
++                torch.stack(fc31_values).max().reciprocal())
++        if fc2_values:
++            module.fc2_input_scale.data.copy_(
++                torch.stack(fc2_values).max().reciprocal())
++
++        delattr(module, 'tmp_raw_input_scales')
++
++        # Step 2: Finalize pre_quant_scale (NVFP4_AWQ)
++        self._finalize_pre_quant_scales(module)
++
++        # Step 3: Reconcile weight_scale_2 and compute alphas
++        self._reconcile_and_compute_alphas(module, module.tmp_weight_scale_2,
++                                           module.fc31_alpha.data,
++                                           module.fc2_alpha.data)
++        delattr(module, 'tmp_weight_scale_2')
++
++        # Step 4: Finalize shared weight alphas if needed
++        if hasattr(module, 'tmp_shared_weight_scale_2'):
++            num_shared = len(module.tmp_shared_weight_scale_2)
++            shared_fc31_alpha = torch.empty(
++                (num_shared, ) + module.fc31_alpha.data.shape[1:],
+                 dtype=module.fc31_alpha.data.dtype,
+                 device='cpu')
+-            local_shared_fc2_alpha_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.fc2_alpha.data.shape[1:],
++            shared_fc2_alpha = torch.empty(
++                (num_shared, ) + module.fc2_alpha.data.shape[1:],
+                 dtype=module.fc2_alpha.data.dtype,
+                 device='cpu')
+-            self.load_all_fp4_weight_scales_and_alphas(
+-                module, weights, local_shared_load_expert_ids,
+-                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors,
+-                local_shared_fc31_alpha_tensors, local_shared_fc2_alpha_tensors)
++            self._reconcile_and_compute_alphas(module,
++                                               module.tmp_shared_weight_scale_2,
++                                               shared_fc31_alpha,
++                                               shared_fc2_alpha)
++            weight_fns = {
++                'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
++                'w2_weight_scale': module.local_shared_w2_scale_tensors,
++                'fc31_alpha': shared_fc31_alpha,
++                'fc2_alpha': shared_fc2_alpha,
++            }
++            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
++            delattr(module, 'tmp_shared_weight_scale_2')
++            delattr(module, 'local_shared_w3_w1_scale_tensors')
++            delattr(module, 'local_shared_w2_scale_tensors')
+ 
+-            module.register_all_parameter_slot_and_to_fix_weight_fns({
+-                'w3_w1_weight_scale':
+-                local_shared_w3_w1_scale_tensors,
+-                'w2_weight_scale':
+-                local_shared_w2_scale_tensors,
+-                'fc31_alpha':
+-                local_shared_fc31_alpha_tensors,
+-                'fc2_alpha':
+-                local_shared_fc2_alpha_tensors,
+-            })
++        # Step 5: Setup quant scales and clean up temp data
++        self.setup_quant_scales(module)
+ 
+     def setup_quant_scales(self, module: torch.nn.Module):
+         module.quant_scales = FusedMoEQuantScalesNVFP4(
+@@ -2383,40 +2529,55 @@ def create_weights(self, module: torch.nn.Module):
+                                self.block_scales_vec_size)
+ 
+     def load_expert_w3_w1_weight_scale_nvfp4(
+-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
++            self,
++            module: torch.nn.Module,
++            w1_weight_scale: torch.Tensor,
+             w3_weight_scale: torch.Tensor,
+-            dst_w3_w1_weight_scale: torch.Tensor):
++            dst_w3_w1_weight_scale: torch.Tensor,
++            expert_idx: int = -1):
+         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
+         device = dst_w3_w1_weight_scale.device
+-        w1_weight_scale = load_weight_shard(w1_weight_scale,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+-        w3_weight_scale = load_weight_shard(w3_weight_scale,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+-
+-        cast_w3_weight_scale = w3_weight_scale.contiguous().view(
+-            dst_w3_w1_weight_scale.dtype)
+-        cast_w1_weight_scale = w1_weight_scale.contiguous().view(
+-            dst_w3_w1_weight_scale.dtype)
+-        cast_w31_weight_scale = torch.cat(
+-            [cast_w3_weight_scale, cast_w1_weight_scale], dim=0)
+-        cast_w31_weight_scale = self._maybe_padding_shape(
+-            cast_w31_weight_scale, dst_w3_w1_weight_scale)
+-        dst_w3_w1_weight_scale.copy_(cast_w31_weight_scale)
+-
++        w1_weight_scale = load_weight_shard(
++            w1_weight_scale,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight_scale is not None else None
++        w3_weight_scale = load_weight_shard(
++            w3_weight_scale,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w3_weight_scale is not None else None
++
++        # Store raw shards in tmp. Cat + pad + interleave always done in
++        # process_weights_after_loading() because padding the whole buffer
++        # differs from padding each half independently.
++        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
++        # since both use local_slot_id starting from 0 but point to different dst buffers.
++        if not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
++            module.tmp_cutlass_w3_w1_weight_scales = {}
++        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
++        dst_base = dst_w3_w1_weight_scale.storage().data_ptr()
++        dict_key = (dst_base, expert_idx)
++        expert_entry = module.tmp_cutlass_w3_w1_weight_scales.setdefault(
++            dict_key, {})
++        expert_entry['dst'] = dst_w3_w1_weight_scale
++        if w3_weight_scale is not None:
++            expert_entry['w3'] = w3_weight_scale.contiguous().view(
++                dst_w3_w1_weight_scale.dtype)
++        if w1_weight_scale is not None:
++            expert_entry['w1'] = w1_weight_scale.contiguous().view(
++                dst_w3_w1_weight_scale.dtype)
++
++    def _interleave_w3_w1_weight_scale(self,
++                                       dst_w3_w1_weight_scale: torch.Tensor):
++        """Apply block_scale_interleave to w3_w1 weight scale buffer."""
+         orig_shape = dst_w3_w1_weight_scale.shape
+-
+         dst_w3_w1_weight_scale_interleaved = torch.ops.trtllm.block_scale_interleave(
+             dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
+                 self.block_scales_dtype).reshape(orig_shape)
+-
+         torch.cuda.synchronize()
+-
+         dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_interleaved)
+ 
+     def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+@@ -2443,50 +2604,72 @@ def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+         cast_w2_weight_scale = w2_weight_scale.view(dst_w2_weight_scale.dtype)
+         cast_w2_weight_scale = self._maybe_padding_shape(
+             cast_w2_weight_scale, dst_w2_weight_scale)
+-        # Keep weights in device buffer
++        # Keep weights in device buffer. Interleave done in process_weights_after_loading().
+         dst_w2_weight_scale.copy_(cast_w2_weight_scale)
+ 
++    def _interleave_w2_weight_scale(self, dst_w2_weight_scale: torch.Tensor):
++        """Apply block_scale_interleave to w2 weight scale buffer."""
+         orig_shape = dst_w2_weight_scale.shape
+-
+         dst_w2_weight_scale_interleaved = torch.ops.trtllm.block_scale_interleave(
+             dst_w2_weight_scale.view(float4_sf_dtype)).view(
+                 self.block_scales_dtype).reshape(orig_shape)
+-
+         torch.cuda.synchronize()
+-
+         dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
+ 
+-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
++    def load_expert_w3_w1_weight(self,
++                                 module: torch.nn.Module,
+                                  w1_weight: torch.Tensor,
+                                  w3_weight: torch.Tensor,
+-                                 dst_w3_w1_weight: torch.Tensor):
++                                 dst_w3_w1_weight: torch.Tensor,
++                                 allow_partial_loading: bool = False,
++                                 expert_idx: int = -1):
+         """Load and pad w1 and w3 weights for each expert, to match shape requirements for Cutlass nvfp4 alignment."""
++        if not allow_partial_loading:
++            assert w1_weight is not None and w3_weight is not None
++        if w1_weight is None and w3_weight is None:
++            return
+         device = dst_w3_w1_weight.device
+-        w1_weight_shard = load_weight_shard(w1_weight,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+-        w3_weight_shard = load_weight_shard(w3_weight,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
++        w1_weight_shard = load_weight_shard(
++            w1_weight,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight is not None else None
++        w3_weight_shard = load_weight_shard(
++            w3_weight,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w3_weight is not None else None
+ 
+-        cast_w1_weight_shard = w1_weight_shard.contiguous().view(
+-            dst_w3_w1_weight.dtype)
+-        cast_w3_weight_shard = w3_weight_shard.contiguous().view(
+-            dst_w3_w1_weight.dtype)
+-        cast_w31_weight_shard = torch.cat(
+-            [cast_w3_weight_shard, cast_w1_weight_shard], dim=0)
+-        cast_w31_weight_shard = self._maybe_padding_shape(
+-            cast_w31_weight_shard, dst_w3_w1_weight)
+-        dst_w3_w1_weight.copy_(cast_w31_weight_shard, non_blocking=True)
++        # Store raw shards in tmp. Cat + pad always done in process_weights_after_loading()
++        # because padding the whole buffer differs from padding each half independently.
++        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
++        # since both use local_slot_id starting from 0 but point to different dst buffers.
++        if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
++            module.tmp_cutlass_w3_w1_weights = {}
++        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
++        dst_base = dst_w3_w1_weight.storage().data_ptr()
++        dict_key = (dst_base, expert_idx)
++        expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
++        expert_entry['dst'] = dst_w3_w1_weight
++        if w1_weight_shard is not None:
++            expert_entry['w1'] = w1_weight_shard.contiguous().view(
++                dst_w3_w1_weight.dtype)
++        if w3_weight_shard is not None:
++            expert_entry['w3'] = w3_weight_shard.contiguous().view(
++                dst_w3_w1_weight.dtype)
+ 
+-    def load_expert_w2_weight(self, module: torch.nn.Module,
++    def load_expert_w2_weight(self,
++                              module: torch.nn.Module,
+                               w2_weight: torch.Tensor,
+-                              dst_w2_weight: torch.Tensor):
++                              dst_w2_weight: torch.Tensor,
++                              allow_partial_loading: bool = False):
+         """Load and pad w2 weight for each expert, to match shape requirements for Cutlass nvfp4 alignment."""
++        if not allow_partial_loading:
++            assert w2_weight is not None
++        if w2_weight is None:
++            return
+         device = dst_w2_weight.device
+         w2_weight_shard = load_weight_shard(w2_weight,
+                                             module.tp_size,
+@@ -2513,34 +2696,98 @@ def _maybe_padding_shape(self, source_tensor, dst_tensor):
+                 "constant", 0).contiguous()
+         return source_tensor
+ 
++    def process_weights_after_loading(self, module: torch.nn.Module):
++        # Finalize w3_w1 weights: cat + pad
++        if hasattr(module, 'tmp_cutlass_w3_w1_weights'):
++            for entry in module.tmp_cutlass_w3_w1_weights.values():
++                w3 = entry.get('w3')
++                w1 = entry.get('w1')
++                dst = entry['dst']
++                if w3 is not None and w1 is not None:
++                    cat_weight = torch.cat([w3, w1], dim=0)
++                    cat_weight = self._maybe_padding_shape(cat_weight, dst)
++                    dst.copy_(cat_weight, non_blocking=True)
++            delattr(module, 'tmp_cutlass_w3_w1_weights')
++
++        # Finalize w3_w1 weight scales: cat + pad + interleave
++        if hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
++            for entry in module.tmp_cutlass_w3_w1_weight_scales.values():
++                w3_scale = entry.get('w3')
++                w1_scale = entry.get('w1')
++                dst = entry['dst']
++                if w3_scale is not None and w1_scale is not None:
++                    cat_scale = torch.cat([w3_scale, w1_scale], dim=0)
++                    cat_scale = self._maybe_padding_shape(cat_scale, dst)
++                    dst.copy_(cat_scale)
++                    self._interleave_w3_w1_weight_scale(dst)
++            delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
++
++        # Finalize w2 weight scales: interleave (regular experts)
++        num_experts = module.w2_weight_scale.data.shape[0]
++        for expert_idx in range(num_experts):
++            self._interleave_w2_weight_scale(
++                module.w2_weight_scale.data[expert_idx])
++
++        # Finalize w2 weight scales: interleave (shared experts for online EPLB)
++        if hasattr(module, 'local_shared_w2_scale_tensors'):
++            num_shared = module.local_shared_w2_scale_tensors.shape[0]
++            for expert_idx in range(num_shared):
++                self._interleave_w2_weight_scale(
++                    module.local_shared_w2_scale_tensors[expert_idx])
++
++        super().process_weights_after_loading(module)
++
+ 
+ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+ 
+-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
++    def load_expert_w3_w1_weight(self,
++                                 module: torch.nn.Module,
+                                  w1_weight: torch.Tensor,
+                                  w3_weight: torch.Tensor,
+-                                 dst_w3_w1_weight: torch.Tensor):
+-        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+-                                         dst_w3_w1_weight)
+-
+-        # Interleave FC1 weight for GEMM1 + SwiGLU fusion.
++                                 dst_w3_w1_weight: torch.Tensor,
++                                 allow_partial_loading: bool = False,
++                                 expert_idx: int = -1):
++        if not allow_partial_loading:
++            assert w1_weight is not None and w3_weight is not None
++        if w1_weight is None and w3_weight is None:
++            return
++        super().load_expert_w3_w1_weight(module,
++                                         w1_weight,
++                                         w3_weight,
++                                         dst_w3_w1_weight,
++                                         allow_partial_loading,
++                                         expert_idx=expert_idx)
++        # CuteDsl interleave deferred to process_weights_after_loading().
++
++    @staticmethod
++    def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
++        """Interleave FC1 weight for GEMM1 + SwiGLU fusion."""
+         w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
+         w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
+                                                               group_size=64,
+                                                               dim=0)
+-        w3_w1_weight_interleaved = w3_w1_weight_interleaved.view(
+-            dst_w3_w1_weight.dtype)
+-        dst_w3_w1_weight.copy_(w3_w1_weight_interleaved)
++        dst_w3_w1_weight.copy_(
++            w3_w1_weight_interleaved.view(dst_w3_w1_weight.dtype))
+ 
+     def load_expert_w3_w1_weight_scale_nvfp4(
+-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
++            self,
++            module: torch.nn.Module,
++            w1_weight_scale: torch.Tensor,
+             w3_weight_scale: torch.Tensor,
+-            dst_w3_w1_weight_scale: torch.Tensor):
+-        super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
++            dst_w3_w1_weight_scale: torch.Tensor,
++            expert_idx: int = -1):
++        super().load_expert_w3_w1_weight_scale_nvfp4(module,
++                                                     w1_weight_scale,
+                                                      w3_weight_scale,
+-                                                     dst_w3_w1_weight_scale)
++                                                     dst_w3_w1_weight_scale,
++                                                     expert_idx=expert_idx)
++
++        # CuteDsl interleave deferred to process_weights_after_loading().
+ 
+-        # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
++    def _interleave_w3_w1_weight_scale_cute_dsl(
++            self, module: torch.nn.Module,
++            dst_w3_w1_weight_scale: torch.Tensor):
++        """Interleave FC1 scales for GEMM1 + SwiGLU fusion (CuteDsl-specific)."""
+         n = module.intermediate_size_per_partition * 2
+         k = module.hidden_size
+         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
+@@ -2551,9 +2798,19 @@ def load_expert_w3_w1_weight_scale_nvfp4(
+         w3_w1_weight_scale_interleaved = swizzle_sf(
+             w3_w1_weight_scale_unswizzled_interleaved, n,
+             k).view(n, k // module.scaling_vector_size)
+-        w3_w1_weight_scale_interleaved = w3_w1_weight_scale_interleaved.view(
+-            dst_w3_w1_weight_scale.dtype)
+-        dst_w3_w1_weight_scale.copy_(w3_w1_weight_scale_interleaved)
++        dst_w3_w1_weight_scale.copy_(
++            w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
++
++    def process_weights_after_loading(self, module: torch.nn.Module):
++        # First let Cutlass parent do cat + pad + block_scale_interleave
++        super().process_weights_after_loading(module)
++
++        # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers
++        num_experts = module.w3_w1_weight.data.shape[0]
++        for expert_idx in range(num_experts):
++            self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
++            self._interleave_w3_w1_weight_scale_cute_dsl(
++                module, module.w3_w1_weight_scale.data[expert_idx])
+ 
+ 
+ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
+@@ -2587,55 +2844,71 @@ def create_weights(self,
+     def setup_quant_scales(self, module: torch.nn.Module):
+         module.quant_scales = tuple()
+ 
+-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
++    def load_expert_w3_w1_weight(self,
++                                 module: torch.nn.Module,
+                                  w1_weight: torch.Tensor,
+                                  w3_weight: torch.Tensor,
+-                                 dst_w3_w1_weight: torch.Tensor):
++                                 dst_w3_w1_weight: torch.Tensor,
++                                 allow_partial_loading: bool = False):
++        if not allow_partial_loading:
++            assert w1_weight is not None
++        if w1_weight is None and w3_weight is None:
++            return
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+-        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+-        )
+-
+-        w1_weight_shard = load_weight_shard(w1_weight,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+ 
+-        # FIXME: this depends on the kernel internals
+-        epilogue_tile_m = 128
++        w1_weight_shard = load_weight_shard(
++            w1_weight,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight is not None else None
+ 
+         # Handle gated vs non-gated activations
+         if module.is_gated_activation:
+             # Gated activation: buffer contains both w3 and w1
+-            w3_weight_shard = load_weight_shard(w3_weight,
+-                                                module.tp_size,
+-                                                module.tp_rank,
+-                                                TensorParallelMode.COLUMN,
+-                                                device=device)
++            w3_weight_shard = load_weight_shard(
++                w3_weight,
++                module.tp_size,
++                module.tp_rank,
++                TensorParallelMode.COLUMN,
++                device=device) if w3_weight is not None else None
+ 
+-            if dst_w3_w1_weight_gpu.shape[
++            if dst_w3_w1_weight.shape[
+                     0] != module.intermediate_size_per_partition * 2:
+                 # If padded, we can't just use split directly if we want to fill the padded area correctly or ignore it.
+                 # But here we just want to fill the first N rows.
+-                dst_w3_weight = dst_w3_w1_weight_gpu.narrow(
++                dst_w3_weight = dst_w3_w1_weight.narrow(
+                     0, 0, module.intermediate_size_per_partition)
+-                dst_w1_weight = dst_w3_w1_weight_gpu.narrow(
++                dst_w1_weight = dst_w3_w1_weight.narrow(
+                     0, module.intermediate_size_per_partition,
+                     module.intermediate_size_per_partition)
+             else:
+                 # Keep weights in device buffer
+-                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
++                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.split(
+                     module.intermediate_size_per_partition, dim=0)
+ 
+-            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+-            dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
++            if w3_weight_shard is not None:
++                dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
++            if w1_weight_shard is not None:
++                dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+         else:
+             # Non-gated activation (e.g., ReLU2): buffer only contains w1
+-            dst_w3_w1_weight_gpu.copy_(
+-                w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
++            if w1_weight_shard is not None:
++                dst_w3_w1_weight.copy_(
++                    w1_weight_shard.view(dst_w3_w1_weight.dtype))
++
++        # Shuffle deferred to process_weights_after_loading().
++
++    def _shuffle_w3_w1_weight(self, module: torch.nn.Module,
++                              dst_w3_w1_weight: torch.Tensor):
++        """Apply trtllm-gen specific shuffle to the w3_w1 weight buffer."""
++        # FIXME: this depends on the kernel internals
++        epilogue_tile_m = 128
++
++        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
++        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
++        )
+ 
+-        # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+             dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+ 
+@@ -2645,45 +2918,48 @@ def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+             permute_indices.to(dst_w3_w1_weight_gpu.device))
+ 
+         # Copy the result into device buffer
+-        dst_w3_w1_weight_gpu.copy_(processed_w31_weight_shard.view(
+-            dst_w3_w1_weight_gpu.dtype),
+-                                   non_blocking=dst_on_gpu)
++        dst_w3_w1_weight_gpu.copy_(
++            processed_w31_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
+         if not dst_on_gpu:
+             dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
+ 
+-    def load_expert_w2_weight(self, module: torch.nn.Module,
++    def load_expert_w2_weight(self,
++                              module: torch.nn.Module,
+                               w2_weight: torch.Tensor,
+-                              dst_w2_weight: torch.Tensor):
++                              dst_w2_weight: torch.Tensor,
++                              allow_partial_loading: bool = False):
++        if not allow_partial_loading:
++            assert w2_weight is not None
++        if w2_weight is None:
++            return
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+         dst_on_gpu = dst_w2_weight.device.type == "cuda"
+-        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+-        )
+-
+         w2_weight_shard = load_weight_shard(w2_weight,
+                                             module.tp_size,
+                                             module.tp_rank,
+                                             TensorParallelMode.ROW,
+                                             device=device)
+ 
++        # Keep weights in device buffer. Shuffle deferred to process_weights_after_loading().
++        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
++                            non_blocking=dst_on_gpu)
++
++    def _shuffle_w2_weight(self, dst_w2_weight: torch.Tensor):
++        """Apply trtllm-gen specific shuffle to the w2 weight buffer."""
+         # FIXME: this depends on the kernel internals
+         epilogue_tile_m = 128
+ 
+-        # Keep weights in device buffer
+-        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
+-                                non_blocking=dst_on_gpu)
+-        # Get permuted indices
++        dst_on_gpu = dst_w2_weight.device.type == "cuda"
++        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
++        )
++
+         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+             dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+ 
+-        # Shuffle the weight according to permute indices
+-        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
++        processed = torch.ops.trtllm.shuffle_matrix(
+             dst_w2_weight_gpu, permute_indices.to(dst_w2_weight_gpu.device))
+ 
+-        # Copy the result into device buffer
+-        dst_w2_weight_gpu.copy_(processed_w2_weight.view(
+-            dst_w2_weight_gpu.dtype),
+-                                non_blocking=dst_on_gpu)
+-
++        dst_w2_weight_gpu.copy_(processed.view(dst_w2_weight_gpu.dtype))
+         if not dst_on_gpu:
+             dst_w2_weight.copy_(dst_w2_weight_gpu)
+ 
+@@ -2695,58 +2971,68 @@ def load_expert_w3_w1_weight_scale_nvfp4(
+             dst_w3_w1_weight_scale: torch.Tensor,
+             num_elts_per_sf: int = 16):
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
+-        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
+-        )
+ 
+-        w1_weight_scale = load_weight_shard(w1_weight_scale,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+-        w3_weight_scale = load_weight_shard(w3_weight_scale,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
++        w1_weight_scale = load_weight_shard(
++            w1_weight_scale,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight_scale is not None else None
++        w3_weight_scale = load_weight_shard(
++            w3_weight_scale,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w3_weight_scale is not None else None
+ 
+         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
+-        w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
++        w3_size = w3_weight_scale.shape[
++            0] if w3_weight_scale is not None and w3_weight_scale.numel(
++            ) > 0 else 0
+ 
+         # Keep weights in device buffer
+         if module.is_gated_activation:
+             # Gated activation: buffer contains both w3 and w1 scales
+             # w3
+-            dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
++            dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
+                 dim=0, start=0, length=module.intermediate_size_per_partition)
+ 
+             # w1
+-            dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
++            dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
+                 dim=0,
+                 start=module.intermediate_size_per_partition,
+                 length=module.intermediate_size_per_partition)
+ 
+-            if w3_size == 0:
+-                # Special case: w3 is empty (shouldn't happen for gated activation)
+-                dst_w3_weight_scale.zero_()
+-                dst_w1_weight_scale.copy_(
+-                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+-            else:
+-                # Normal case: both w3 and w1 scales are present
+-                dst_w3_weight_scale.copy_(
+-                    w3_weight_scale.view(dst_w3_weight_scale.dtype))
++            if w3_weight_scale is not None:
++                if w3_size == 0:
++                    # Special case: w3 is empty (shouldn't happen for gated activation)
++                    dst_w3_weight_scale.zero_()
++                else:
++                    dst_w3_weight_scale.copy_(
++                        w3_weight_scale.view(dst_w3_weight_scale.dtype))
++            if w1_weight_scale is not None:
+                 dst_w1_weight_scale.copy_(
+                     w1_weight_scale.view(dst_w1_weight_scale.dtype))
+         else:
+             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+-            dst_w3_w1_weight_scale_gpu.copy_(
+-                w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
++            if w1_weight_scale is not None:
++                dst_w3_w1_weight_scale.copy_(
++                    w1_weight_scale.view(dst_w3_w1_weight_scale.dtype))
+ 
+-        orig_shape = dst_w3_w1_weight_scale_gpu.shape
++        # Shuffle + interleave deferred to process_weights_after_loading().
+ 
+-        # trtllm-gen specific block scales preprocessing logics
++    def _shuffle_and_interleave_w3_w1_weight_scale(
++            self,
++            dst_w3_w1_weight_scale: torch.Tensor,
++            num_elts_per_sf: int = 16):
++        """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer."""
++        orig_shape = dst_w3_w1_weight_scale.shape
+         epilogue_tile_m = 128  # FIXME
+ 
++        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
++        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
++        )
++
+         # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
+@@ -2758,16 +3044,11 @@ def load_expert_w3_w1_weight_scale_nvfp4(
+         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype), permute_indices)
+ 
+-        # Assert should only be removed during debugging
+-        assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+-        # Interleave the weight.
+-        processed_w3_w1_weight_scale = torch.ops.trtllm.block_scale_interleave(
++        processed = torch.ops.trtllm.block_scale_interleave(
+             w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
+-        # Copy the result into device buffer
+-        dst_w3_w1_weight_scale_gpu.copy_(
+-            processed_w3_w1_weight_scale.view(
+-                self.block_scales_dtype).reshape(orig_shape))
+ 
++        dst_w3_w1_weight_scale_gpu.copy_(
++            processed.view(self.block_scales_dtype).reshape(orig_shape))
+         if not dst_on_gpu:
+             dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
+ 
+@@ -2777,26 +3058,27 @@ def load_expert_w2_weight_scale_nvfp4(self,
+                                           dst_w2_weight_scale: torch.Tensor,
+                                           num_elts_per_sf: int = 16):
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
+-        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
+-        )
+-
+         w2_weight_scale = load_weight_shard(w2_weight_scale,
+                                             module.tp_size,
+                                             module.tp_rank,
+                                             TensorParallelMode.ROW,
+                                             device=device)
+-        # Keep weights in device buffer
+-        dst_w2_weight_scale_gpu.copy_(
+-            w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
+-
+-        orig_shape = dst_w2_weight_scale_gpu.shape
++        # Keep weights in device buffer. Shuffle + interleave deferred to process_weights_after_loading().
++        dst_w2_weight_scale.copy_(
++            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+ 
+-        # trtllm-gen specific block scales preprocessing logics
+-        epilogue_tile_m = 128  # FIXME: read from kernel
++    def _shuffle_and_interleave_w2_weight_scale(self,
++                                                dst_w2_weight_scale: torch.
++                                                Tensor,
++                                                num_elts_per_sf: int = 16):
++        """Apply trtllm-gen specific shuffle + interleave to w2 weight scale buffer."""
++        orig_shape = dst_w2_weight_scale.shape
++        # FIXME: this depends on the kernel internals
++        epilogue_tile_m = 128
+ 
+-        # Assert should only be removed during debugging
+-        assert dst_w2_weight_scale_gpu.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
++        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
++        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
++        )
+ 
+         # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+@@ -2816,14 +3098,99 @@ def load_expert_w2_weight_scale_nvfp4(self,
+         dst_w2_weight_scale_gpu.copy_(
+             processed_w2_weight_scale.view(
+                 self.block_scales_dtype).reshape(orig_shape))
+-
+         if not dst_on_gpu:
+             dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
+ 
+     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+         super().load_quant_scales(module, weights)
+ 
+-        # last step: load fc31_scale_c
++        # Store raw shared weight_scale_2 for deferred alpha + fc31_scale_c computation
++        if self.need_load_shared_weights(module):
++            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
++            )
++            if not hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
++                module.tmp_trtllmgen_shared_weight_scale_2 = {}
++            self.load_fp4_weight_block_scales(
++                module,
++                weights,
++                local_shared_load_expert_ids,
++                None,
++                None,
++                module.tmp_trtllmgen_shared_weight_scale_2,
++                ignore_weight_scale=True)
++
++    def process_weights_after_loading(self,
++                                      module: torch.nn.Module,
++                                      num_elts_per_sf: int = 16):
++        # Shuffle/interleave shared expert tensors BEFORE super() call,
++        # because super().process_weights_after_loading() will delattr these tensors
++        # after registering them with EPLB.
++        self._shuffle_shared_expert_tensors(module, num_elts_per_sf)
++
++        # Call parent to compute global input scales and main alphas first
++        super().process_weights_after_loading(module)
++
++        # Apply shuffle/interleave to all regular expert weights and weight scales.
++        self._shuffle_all_experts(module, num_elts_per_sf)
++
++        # Compute fc31_scale_c from finalized scales and alphas
++        self._compute_fc31_scale_c(module)
++
++        # Finalize shared expert alphas and fc31_scale_c for online EPLB
++        self._finalize_shared_expert_alphas(module)
++
++    def _shuffle_shared_expert_tensors(self,
++                                       module: torch.nn.Module,
++                                       num_elts_per_sf: int = 16):
++        """Shuffle/interleave shared expert tensors for online EPLB.
++
++        Must be called BEFORE super().process_weights_after_loading() which
++        delattrs these tensors after registering them with EPLB.
++        These are CPU tensors - must move to GPU for CUDA shuffle ops, then copy back.
++        """
++        shared_tensor_attrs = [
++            ('local_shared_w3_w1_tensors',
++             lambda t: self._shuffle_w3_w1_weight(module, t)),
++            ('local_shared_w2_tensors', self._shuffle_w2_weight),
++            ('local_shared_w3_w1_scale_tensors',
++             lambda t: self._shuffle_and_interleave_w3_w1_weight_scale(
++                 t, num_elts_per_sf=num_elts_per_sf)),
++            ('local_shared_w2_scale_tensors',
++             lambda t: self._shuffle_and_interleave_w2_weight_scale(
++                 t, num_elts_per_sf=num_elts_per_sf)),
++        ]
++        for attr_name, shuffle_fn in shared_tensor_attrs:
++            shared_tensors = getattr(module, attr_name, None)
++            if shared_tensors is None:
++                continue
++            for i in range(shared_tensors.shape[0]):
++                gpu_tensor = shared_tensors[i].cuda()
++                shuffle_fn(gpu_tensor)
++                shared_tensors[i].copy_(gpu_tensor.cpu())
++
++    def _shuffle_all_experts(self,
++                             module: torch.nn.Module,
++                             num_elts_per_sf: int = 16):
++        """Apply shuffle/interleave to all regular experts' weights and weight scales."""
++        num_experts = module.w3_w1_weight.data.shape[0]
++        for expert_idx in range(num_experts):
++            self._shuffle_w3_w1_weight(module,
++                                       module.w3_w1_weight.data[expert_idx])
++            self._shuffle_w2_weight(module.w2_weight.data[expert_idx])
++            self._shuffle_and_interleave_w3_w1_weight_scale(
++                module.w3_w1_weight_scale.data[expert_idx],
++                num_elts_per_sf=num_elts_per_sf)
++            self._shuffle_and_interleave_w2_weight_scale(
++                module.w2_weight_scale.data[expert_idx],
++                num_elts_per_sf=num_elts_per_sf)
++            # Shuffle biases (same shuffle as weights, deferred from load)
++            if module.bias:
++                self._shuffle_w3_w1_weight(module,
++                                           module.w3_w1_bias.data[expert_idx])
++                self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
++
++    def _compute_fc31_scale_c(self, module: torch.nn.Module):
++        # Compute fc31_scale_c now that global input_scale and alphas are finalized
+         # c_global_sf: fc2_input_scale
+         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
+         # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
+@@ -2831,7 +3198,7 @@ def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+         if hasattr(module, 'activation_type') and module.activation_type in [
+                 ActivationType.Relu2, ActivationType.Silu
+         ]:
+-            # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
++            # For Relu2/Silu: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
+             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
+                 module.expert_size_per_partition),
+                                            non_blocking=True)
+@@ -2841,40 +3208,32 @@ def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+                                            module.fc31_alpha.data,
+                                            non_blocking=True)
+ 
+-        if self.need_load_shared_weights(module):
+-            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+-            )
+-            # fc2_input_scale has shape (1,), so we don't need to reload that.
+-            # We only need to load fc31_alpha,
+-            # we reuse existing load_all_fp4_weight_scales_and_alphas logic, ignore large weight_scales.
+-            local_shared_fc31_alpha_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.fc31_alpha.data.shape[1:],
++    def _finalize_shared_expert_alphas(self, module: torch.nn.Module):
++        """Finalize shared weight alphas and fc31_scale_c for online EPLB."""
++        if hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
++            num_shared = len(module.tmp_trtllmgen_shared_weight_scale_2)
++            local_shared_fc31_alpha = torch.empty(
++                (num_shared, ) + module.fc31_alpha.data.shape[1:],
+                 dtype=module.fc31_alpha.data.dtype,
+                 device='cpu')
+-            local_shared_fc2_alpha_tensors = torch.empty(
+-                (len(local_shared_load_expert_ids), ) +
+-                module.fc2_alpha.data.shape[1:],
++            local_shared_fc2_alpha = torch.empty(
++                (num_shared, ) + module.fc2_alpha.data.shape[1:],
+                 dtype=module.fc2_alpha.data.dtype,
+                 device='cpu')
+-            self.load_all_fp4_weight_scales_and_alphas(
+-                module,
+-                weights,
+-                local_shared_load_expert_ids,
+-                None,
+-                None,
+-                local_shared_fc31_alpha_tensors,
+-                local_shared_fc2_alpha_tensors,
+-                ignore_weight_scale=True)
++            self._reconcile_and_compute_alphas(
++                module, module.tmp_trtllmgen_shared_weight_scale_2,
++                local_shared_fc31_alpha, local_shared_fc2_alpha)
+ 
+             local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+-            ) * local_shared_fc31_alpha_tensors
++            ) * local_shared_fc31_alpha
+ 
+             module.register_all_parameter_slot_and_to_fix_weight_fns({
+                 'fc31_scale_c':
+                 local_shared_fc31_scale_c,
+             })
+ 
++            delattr(module, 'tmp_trtllmgen_shared_weight_scale_2')
++
+ 
+ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+     weight_alignment = 32
+@@ -2954,44 +3313,50 @@ def create_weights(self, module: torch.nn.Module):
+     def setup_quant_scales(self, module: torch.nn.Module):
+         module.quant_scales = tuple()
+ 
+-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
++    def load_expert_w3_w1_weight(self,
++                                 module: torch.nn.Module,
+                                  w1_weight: torch.Tensor,
+                                  w3_weight: torch.Tensor,
+-                                 dst_w3_w1_weight: torch.Tensor):
++                                 dst_w3_w1_weight: torch.Tensor,
++                                 allow_partial_loading: bool = False):
++        if not allow_partial_loading:
++            assert w1_weight is not None
++        if w1_weight is None and w3_weight is None:
++            return
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+         dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+         dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+         )
+ 
+-        alignment = _get_weight_alignment(self.weight_alignment,
+-                                          module.scaling_vector_size,
+-                                          module.tp_size, w1_weight.shape[0])
+-        if len(w1_weight.shape) == 2:
+-            # Pad weights
+-            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+-            assert w1_weight.dtype == torch.uint8
+-            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+-                                            self.input_hidden_alignment // 2,
+-                                            alignment)
+-            if module.is_gated_activation:
+-                assert w3_weight.dtype == torch.uint8
+-                w3_weight = maybe_pad_for_mxfp4(
+-                    w3_weight, self.input_hidden_alignment // 2, alignment)
+-        else:
+-            # Pad bias, TRTLLM backend expects float32 bias.
+-            assert len(w1_weight.shape) == 1
+-            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
+-            if module.is_gated_activation:
+-                assert len(w3_weight.shape) == 1
+-
+-                w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
++        if w1_weight is not None:
++            alignment = _get_weight_alignment(self.weight_alignment,
++                                              module.scaling_vector_size,
++                                              module.tp_size,
++                                              w1_weight.shape[0])
++            if len(w1_weight.shape) == 2:
++                assert w1_weight.dtype == torch.uint8
++                w1_weight = maybe_pad_for_mxfp4(
++                    w1_weight, self.input_hidden_alignment // 2, alignment)
++                if module.is_gated_activation and w3_weight is not None:
++                    assert w3_weight.dtype == torch.uint8
++                    w3_weight = maybe_pad_for_mxfp4(
++                        w3_weight, self.input_hidden_alignment // 2, alignment)
++            else:
++                assert len(w1_weight.shape) == 1
++                w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
++                if module.is_gated_activation and w3_weight is not None:
++                    assert len(w3_weight.shape) == 1
++                    w3_weight = maybe_pad_for_mxfp4(w3_weight,
++                                                    alignment).float()
+ 
+-        w1_weight_shard = load_weight_shard(w1_weight,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
+-        if module.is_gated_activation:
++        w1_weight_shard = load_weight_shard(
++            w1_weight,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight is not None else None
++        w3_weight_shard = None
++        if module.is_gated_activation and w3_weight is not None:
+             w3_weight_shard = load_weight_shard(w3_weight,
+                                                 module.tp_size,
+                                                 module.tp_rank,
+@@ -2999,45 +3364,51 @@ def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                                 device=device)
+ 
+         # FIXME: this depends on the kernel internals
+-        epilogue_tile_m = 128
+ 
+-        # Keep weights in device buffer
+         if module.is_gated_activation:
+             dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.chunk(2, dim=0)
+-            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+-            dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
++            if w3_weight_shard is not None:
++                dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
++            if w1_weight_shard is not None:
++                dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+         else:
+-            w1_weight_shard = _pad_tensor_to_shape(w1_weight_shard,
+-                                                   dst_w3_w1_weight_gpu.shape)
+-            dst_w3_w1_weight_gpu.copy_(
+-                w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
++            if w1_weight_shard is not None:
++                w1_weight_shard = _pad_tensor_to_shape(
++                    w1_weight_shard, dst_w3_w1_weight_gpu.shape)
++                dst_w3_w1_weight_gpu.copy_(
++                    w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
++
++        # Shuffle deferred to process_weights_after_loading().
++        if not dst_on_gpu:
++            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
++
++    def _shuffle_w3_w1_weight(self, module: torch.nn.Module,
++                              dst_w3_w1_weight_gpu: torch.Tensor):
++        """Apply trtllm-gen specific shuffle to the w3_w1 weight buffer (with gated act support)."""
++        epilogue_tile_m = 128
+ 
+-        # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+             dst_w3_w1_weight_gpu,
+             self._cache_permute_indices,
+             epilogue_tile_m,
+             is_gated_act_gemm=module.is_gated_activation)
+ 
+-        # Shuffle the weight according to permute indices
+-        processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
++        processed = torch.ops.trtllm.shuffle_matrix(
+             dst_w3_w1_weight_gpu,
+             permute_indices.to(dst_w3_w1_weight_gpu.device))
+ 
+-        # Copy the result into device buffer
+-        dst_w3_w1_weight_gpu.copy_(processed_w31_weight_shard.view(
+-            dst_w3_w1_weight_gpu.dtype),
+-                                   non_blocking=dst_on_gpu)
+-        if not dst_on_gpu:
+-            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
++        dst_w3_w1_weight_gpu.copy_(processed.view(dst_w3_w1_weight_gpu.dtype))
+ 
+-    def load_expert_w2_weight(self, module: torch.nn.Module,
++    def load_expert_w2_weight(self,
++                              module: torch.nn.Module,
+                               w2_weight: torch.Tensor,
+-                              dst_w2_weight: torch.Tensor):
++                              dst_w2_weight: torch.Tensor,
++                              allow_partial_loading: bool = False):
++        if not allow_partial_loading:
++            assert w2_weight is not None
++        if w2_weight is None:
++            return
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w2_weight.device.type == "cuda"
+-        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+-        )
+ 
+         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
+             w2_weight.shape) == 2 else w2_weight.shape[0]
+@@ -3062,29 +3433,10 @@ def load_expert_w2_weight(self, module: torch.nn.Module,
+                                             TensorParallelMode.ROW,
+                                             device=device)
+ 
+-        # FIXME: this depends on the kernel internals
+-        epilogue_tile_m = 128
+-
+-        # Keep weights in device buffer
++        # Keep weights in device buffer. Shuffle deferred to process_weights_after_loading().
+         w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
+-                                               dst_w2_weight_gpu.shape)
+-        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
+-                                non_blocking=dst_on_gpu)
+-        # Get permuted indices
+-        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+-            dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+-
+-        # Shuffle the weight according to permute indices
+-        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+-            dst_w2_weight_gpu, permute_indices.to(dst_w2_weight_gpu.device))
+-
+-        # Copy the result into device buffer
+-        dst_w2_weight_gpu.copy_(processed_w2_weight.view(
+-            dst_w2_weight_gpu.dtype),
+-                                non_blocking=dst_on_gpu)
+-
+-        if not dst_on_gpu:
+-            dst_w2_weight.copy_(dst_w2_weight_gpu)
++                                               dst_w2_weight.shape)
++        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
+ 
+     def load_expert_w3_w1_weight_scale_nvfp4(
+             self,
+@@ -3094,89 +3446,84 @@ def load_expert_w3_w1_weight_scale_nvfp4(
+             dst_w3_w1_weight_scale: torch.Tensor,
+             num_elts_per_sf: int = 16):
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
+-        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
+-        )
+ 
+-        alignment = _get_weight_alignment(self.weight_alignment,
+-                                          module.scaling_vector_size,
+-                                          module.tp_size,
+-                                          w1_weight_scale.shape[0])
+-        w1_weight_scale = maybe_pad_for_mxfp4(
+-            w1_weight_scale,
+-            self.input_hidden_alignment // module.scaling_vector_size,
+-            alignment)
+-        if module.is_gated_activation:
+-            w3_weight_scale = maybe_pad_for_mxfp4(
+-                w3_weight_scale,
++        if w1_weight_scale is not None:
++            alignment = _get_weight_alignment(self.weight_alignment,
++                                              module.scaling_vector_size,
++                                              module.tp_size,
++                                              w1_weight_scale.shape[0])
++            w1_weight_scale = maybe_pad_for_mxfp4(
++                w1_weight_scale,
+                 self.input_hidden_alignment // module.scaling_vector_size,
+                 alignment)
++            if module.is_gated_activation and w3_weight_scale is not None:
++                w3_weight_scale = maybe_pad_for_mxfp4(
++                    w3_weight_scale,
++                    self.input_hidden_alignment // module.scaling_vector_size,
++                    alignment)
+ 
+-        w1_weight_scale = load_weight_shard(w1_weight_scale,
+-                                            module.tp_size,
+-                                            module.tp_rank,
+-                                            TensorParallelMode.COLUMN,
+-                                            device=device)
++        w1_weight_scale = load_weight_shard(
++            w1_weight_scale,
++            module.tp_size,
++            module.tp_rank,
++            TensorParallelMode.COLUMN,
++            device=device) if w1_weight_scale is not None else None
+         if module.is_gated_activation:
+-            w3_weight_scale = load_weight_shard(w3_weight_scale,
+-                                                module.tp_size,
+-                                                module.tp_rank,
+-                                                TensorParallelMode.COLUMN,
+-                                                device=device)
++            w3_weight_scale = load_weight_shard(
++                w3_weight_scale,
++                module.tp_size,
++                module.tp_rank,
++                TensorParallelMode.COLUMN,
++                device=device) if w3_weight_scale is not None else None
+ 
+-        # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
+-        w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
+         # Keep weights in device buffer
+         if module.is_gated_activation:
+-            # Gated activation: buffer contains both w3 and w1 scales
+-            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
++            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
+                 2, dim=0)
+-
+-            if w3_size == 0:
+-                # Special case: w3 is empty (shouldn't happen for gated activation)
+-                dst_w3_weight_scale.zero_()
+-                dst_w1_weight_scale.copy_(
+-                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+-            else:
+-                # Normal case: both w3 and w1 scales are present
++            if w3_weight_scale is not None:
+                 dst_w3_weight_scale.copy_(
+                     w3_weight_scale.view(dst_w3_weight_scale.dtype))
++            if w1_weight_scale is not None:
+                 dst_w1_weight_scale.copy_(
+                     w1_weight_scale.view(dst_w1_weight_scale.dtype))
+         else:
+             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+-            w1_weight_scale = _pad_tensor_to_shape(
+-                w1_weight_scale, dst_w3_w1_weight_scale_gpu.shape)
+-            dst_w3_w1_weight_scale_gpu.copy_(
+-                w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
++            if w1_weight_scale is not None:
++                w1_weight_scale = _pad_tensor_to_shape(
++                    w1_weight_scale, dst_w3_w1_weight_scale.shape)
++                dst_w3_w1_weight_scale.copy_(
++                    w1_weight_scale.view(dst_w3_w1_weight_scale.dtype))
+ 
+-        orig_shape = dst_w3_w1_weight_scale_gpu.shape
++        # Shuffle + interleave deferred to process_weights_after_loading().
+ 
+-        # trtllm-gen specific block scales preprocessing logics
+-        epilogue_tile_m = 128  # FIXME
++    def _shuffle_and_interleave_w3_w1_weight_scale(
++            self,
++            dst_w3_w1_weight_scale: torch.Tensor,
++            num_elts_per_sf: int = 16,
++            is_gated_act_gemm: bool = True):
++        """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer (with gated act support)."""
++        orig_shape = dst_w3_w1_weight_scale.shape
++        epilogue_tile_m = 128
++
++        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
++        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
++        )
+ 
+-        # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
+             self._cache_permute_indices,
+             epilogue_tile_m,
+             num_elts_per_sf=num_elts_per_sf,
+-            is_gated_act_gemm=module.is_gated_activation)
++            is_gated_act_gemm=is_gated_act_gemm)
+ 
+-        # Shuffle the weight according to permute indices
+         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype), permute_indices)
+ 
+-        # Assert should only be removed during debugging
+-        assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+-        # Interleave the weight.
+-        processed_w3_w1_weight_scale = torch.ops.trtllm.block_scale_interleave(
++        processed = torch.ops.trtllm.block_scale_interleave(
+             w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
+-        # Copy the result into device buffer
+-        dst_w3_w1_weight_scale_gpu.copy_(
+-            processed_w3_w1_weight_scale.view(
+-                self.block_scales_dtype).reshape(orig_shape))
+ 
++        dst_w3_w1_weight_scale_gpu.copy_(
++            processed.view(self.block_scales_dtype).reshape(orig_shape))
+         if not dst_on_gpu:
+             dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
+ 
+@@ -3186,9 +3533,6 @@ def load_expert_w2_weight_scale_nvfp4(self,
+                                           dst_w2_weight_scale: torch.Tensor,
+                                           num_elts_per_sf: int = 16):
+         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
+-        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
+-        )
+ 
+         alignment = _get_weight_alignment(self.weight_alignment,
+                                           module.scaling_vector_size,
+@@ -3205,45 +3549,72 @@ def load_expert_w2_weight_scale_nvfp4(self,
+                                             device=device)
+         # Keep weights in device buffer
+         w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
+-                                               dst_w2_weight_scale_gpu.shape)
+-        dst_w2_weight_scale_gpu.copy_(
+-            w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
+-
+-        orig_shape = dst_w2_weight_scale_gpu.shape
++                                               dst_w2_weight_scale.shape)
++        # Shuffle + interleave deferred to process_weights_after_loading().
++        dst_w2_weight_scale.copy_(
++            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+ 
+-        # trtllm-gen specific block scales preprocessing logics
+-        epilogue_tile_m = 128  # FIXME: read from kernel
++    def _shuffle_and_interleave_w2_weight_scale(self,
++                                                dst_w2_weight_scale: torch.
++                                                Tensor,
++                                                num_elts_per_sf: int = 16):
++        """Apply trtllm-gen specific shuffle + interleave to w2 weight scale buffer."""
++        orig_shape = dst_w2_weight_scale.shape
++        epilogue_tile_m = 128
+ 
+-        # Assert should only be removed during debugging
+-        assert dst_w2_weight_scale_gpu.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
++        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
++        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
++        )
+ 
+-        # Get permute indices
+         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+             dst_w2_weight_scale_gpu.view(float4_sf_dtype),
+             self._cache_permute_indices,
+             epilogue_tile_m,
+             num_elts_per_sf=num_elts_per_sf)
+ 
+-        # Shuffle the weight according to permute indices
+         w_shuffled = torch.ops.trtllm.shuffle_matrix(
+             dst_w2_weight_scale_gpu.view(dtype=float4_sf_dtype),
+             permute_indices)
+-        # Interleave the weight.
+-        processed_w2_weight_scale = torch.ops.trtllm.block_scale_interleave(
+-            w_shuffled)
+-        # Copy the result into device buffer
+-        dst_w2_weight_scale_gpu.copy_(
+-            processed_w2_weight_scale.view(
+-                self.block_scales_dtype).reshape(orig_shape))
+ 
++        processed = torch.ops.trtllm.block_scale_interleave(w_shuffled)
++
++        dst_w2_weight_scale_gpu.copy_(
++            processed.view(self.block_scales_dtype).reshape(orig_shape))
+         if not dst_on_gpu:
+             dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
+ 
+-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+-        super().load_quant_scales(module, weights)
++    def _shuffle_all_experts(self,
++                             module: torch.nn.Module,
++                             num_elts_per_sf: int = 16):
++        """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle."""
++        num_experts = module.w3_w1_weight.data.shape[0]
++        for expert_idx in range(num_experts):
++            self._shuffle_w3_w1_weight(module,
++                                       module.w3_w1_weight.data[expert_idx])
++            self._shuffle_w2_weight(module.w2_weight.data[expert_idx])
++            self._shuffle_and_interleave_w3_w1_weight_scale(
++                module.w3_w1_weight_scale.data[expert_idx],
++                num_elts_per_sf=num_elts_per_sf,
++                is_gated_act_gemm=module.is_gated_activation)
++            self._shuffle_and_interleave_w2_weight_scale(
++                module.w2_weight_scale.data[expert_idx],
++                num_elts_per_sf=num_elts_per_sf)
++            # Shuffle biases (same shuffle as weights)
++            if module.bias:
++                self._shuffle_w3_w1_weight(module,
++                                           module.w3_w1_bias.data[expert_idx])
++                self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
++
++    def process_weights_after_loading(self,
++                                      module: torch.nn.Module,
++                                      num_elts_per_sf: int = 16):
++        # Call parent to compute global input scales, alphas, and fc31_scale_c first
++        super().process_weights_after_loading(module,
++                                              num_elts_per_sf=num_elts_per_sf)
+ 
+         # Normalize biases to account for the global scale factors,
+         # matching the kernel's expectation (similar to test_moe.py logic).
++        # This must happen after alphas are finalized.
+         if module.w3_w1_bias is not None:
+             # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+@@ -3292,7 +3663,10 @@ def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+                                           w2_weight_scale: torch.Tensor,
+                                           dst_w2_weight_scale: torch.Tensor):
+         return super().load_expert_w2_weight_scale_nvfp4(
+-            module, w2_weight_scale, dst_w2_weight_scale, 32)
++            module, w2_weight_scale, dst_w2_weight_scale)
++
++    def process_weights_after_loading(self, module: torch.nn.Module):
++        return super().process_weights_after_loading(module, num_elts_per_sf=32)
+ 
+ 
+ def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
+diff --git a/tensorrt_llm/_torch/modules/linear.py b/tensorrt_llm/_torch/modules/linear.py
+index 60bd89ecddad..ab2132bf611b 100644
+--- a/tensorrt_llm/_torch/modules/linear.py
++++ b/tensorrt_llm/_torch/modules/linear.py
+@@ -362,18 +362,21 @@ def load_weights(self,
+         """
+         Load weights from the checkpoint.
+         """
+-        kargs = {}
+-        if isinstance(self, UnquantizedLinearMethod):
+-            kargs['allow_partial_loading'] = allow_partial_loading
+         if weight_mode == WeightMode.VANILLA:
+-            self.load_weights_vanilla(module, weights, **kargs)
++            load_fn = self.load_weights_vanilla
+         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+-            self.load_weights_fused_qkv_linear(module, weights, **kargs)
++            load_fn = self.load_weights_fused_qkv_linear
+         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+-            self.load_weights_fused_gate_up_linear(module, weights, **kargs)
++            load_fn = self.load_weights_fused_gate_up_linear
+         else:
+             raise ValueError(f'unsupported weight mode: {weight_mode}')
+ 
++        kargs = {}
++        if isinstance(self, (UnquantizedLinearMethod,
++                             FP8BlockScalesLinearMethod, NVFP4LinearMethod)):
++            kargs['allow_partial_loading'] = allow_partial_loading
++        load_fn(module, weights, **kargs)
++
+         if not allow_partial_loading:
+             self.process_weights_after_loading(module)
+ 
+@@ -447,6 +450,17 @@ def process_weights_after_loading_fused_gate_up_linear(
+         Process quantization weights and scales after loading weights for fused gate up linear layer.
+         """
+ 
++    def pre_reload_weights(self, module: Linear):
++        """
++        Pre-reload weights for the linear layer.
++        """
++        for param_name, metadata in module.rebuild_tensor_metadata.items():
++            # Extract meta tensor from metadata dict
++            meta_tensor = metadata['meta']
++            param = Parameter(torch.empty_like(meta_tensor, device="cuda"),
++                              requires_grad=False)
++            module.register_parameter(param_name, param)
++
+ 
+ class UnquantizedLinearMethod(LinearMethodBase):
+ 
+@@ -474,8 +488,6 @@ def create_weights(self, module: Linear, in_features: int,
+         else:
+             module.register_parameter("bias", None)
+ 
+-        module.rebuild_tensor_metadata = {}
+-
+     def apply(self, module: Linear, input: torch.Tensor,
+               bias: Optional[torch.Tensor]):
+         if module.use_custom_cublas_mm:
+@@ -564,14 +576,6 @@ def load_weights_fused_gate_up_linear(
+                     copy_weight_shard(module.weight, weight, shard_offset,
+                                       shard_size)
+ 
+-    def pre_reload_weights(self, module: Linear):
+-        for param_name, metadata in module.rebuild_tensor_metadata.items():
+-            # Extract meta tensor from metadata dict
+-            meta_tensor = metadata['meta']
+-            param = Parameter(torch.empty_like(meta_tensor, device="cuda"),
+-                              requires_grad=False)
+-            module.register_parameter(param_name, param)
+-
+ 
+ class FP8QDQLinearMethod(UnquantizedLinearMethod):
+ 
+@@ -602,8 +606,6 @@ def create_weights(self, module: Linear, in_features: int,
+         else:
+             module.register_parameter("bias", None)
+ 
+-        module.rebuild_tensor_metadata = {}
+-
+     def apply(self, module: Linear, input: torch.Tensor,
+               bias: Optional[torch.Tensor]):
+         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+@@ -928,8 +930,6 @@ def create_weights(self, module: Linear, in_features: int,
+         else:
+             module.register_parameter("bias", None)
+ 
+-        module.rebuild_tensor_metadata = {}
+-
+     def apply(self, module: Linear, input: torch.Tensor,
+               bias: Optional[torch.Tensor]):
+         # FP8 tensor inputs are from attention. Directly use ones as scale.
+@@ -1070,8 +1070,6 @@ def create_weights(self, module: Linear, in_features: int,
+         else:
+             module.register_parameter("bias", None)
+ 
+-        module.rebuild_tensor_metadata = {}
+-
+     def apply(self, module: Linear, input: torch.Tensor,
+               bias: Optional[torch.Tensor]):
+         # fp8_block_scaling_gemm does not support writing into an NCCL window
+@@ -1318,18 +1316,20 @@ def _input_prepare(self, module: Linear, input: torch.Tensor):
+         """
+         if isinstance(input, Fp4QuantizedTensor):
+             # Input is already quantized - this should not happen if pre_quant_scale exists
+-            if module.pre_quant_scale is not None:
++            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
+                 raise RuntimeError(
+-                    "Received FP4 quantized input but pre_quant_scale exists. "
+-                    "This indicates FP4 output was not properly disabled for the previous layer."
++                    "Received pre-quantized FP4 input for a layer that must quantize activations locally "
++                    "(pre_quant_scale is set or dynamic quantization is forced). "
++                    "This indicates FP4 output was not disabled in the previous layer."
+                 )
+             return input.fp4_tensor, input.scaling_factor, module.alpha
+         elif isinstance(input, tuple):
+             # Input is a tuple of (fp4_tensor, scaling_factor)
+-            if module.pre_quant_scale is not None:
++            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
+                 raise RuntimeError(
+-                    "Received FP4 quantized tuple input but pre_quant_scale exists. "
+-                    "This indicates FP4 output was not properly disabled for the previous layer."
++                    "Received pre-quantized FP4 tuple input for a layer that must quantize activations locally "
++                    "(pre_quant_scale is set or dynamic quantization is forced). "
++                    "This indicates FP4 output was not disabled in the previous layer."
+                 )
+             return input[0], input[1], module.alpha
+         else:
+@@ -1432,43 +1432,95 @@ def load_kv_scales(self, weights: List[Dict]):
+         return k_scale, v_scale
+ 
+     def load_weight_scales(self,
++                           module: Linear,
+                            weights: List[Dict],
+-                           tp_size: int = 1,
+-                           tp_rank: int = 0,
+-                           tp_mode: Optional[TensorParallelMode] = None):
+-        # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
+-        input_scale = None
+-        weight_scale_2 = None
+-        weight_scale = []
++                           shard_keys: Optional[List[str]] = None):
++        """Load NVFP4 scales from weights into module tmp attributes.
++
++        Supports partial loading: scales are accumulated across multiple calls
++        and finalized in _finalize_nvfp4_scales (called by process_weights_after_loading_*).
+ 
++        Args:
++            module: Target Linear module
++            weights: List of weight dicts (one per shard for fused, one for vanilla)
++            shard_keys: Shard keys for fused weights (e.g., ['q','k','v'] or ['gate','up']).
++                       None for vanilla (single weight).
++        """
+         device = torch.device("cuda")
+ 
+-        for w in weights:
+-            if "input_scale" in w:
+-                if input_scale is None:
+-                    input_scale = w["input_scale"][...]
+-                else:
+-                    assert input_scale == w["input_scale"][
+-                        ...], "The input_scale should be same for all the weights"
++        # Per-shard weight_scale: load, TP-shard, store in tmp dict keyed by shard
++        if shard_keys is not None:
++            if not hasattr(module, "tmp_nvfp4_weight_scales"):
++                module.tmp_nvfp4_weight_scales = {}
++            for shard_key, w in zip(shard_keys, weights):
++                if "weight_scale" in w:
++                    ws = load_weight_shard(w["weight_scale"],
++                                           module.tp_size,
++                                           module.tp_rank,
++                                           module.tp_mode,
++                                           device=device).contiguous()
++                    assert ws.dtype == torch.float8_e4m3fn
++                    module.tmp_nvfp4_weight_scales[shard_key] = ws.view(
++                        fp4_utils.float4_sf_dtype)
++        else:
++            # Vanilla: single weight_scale, load + interleave directly
++            w = weights[0]
+             if "weight_scale" in w:
+                 ws = load_weight_shard(w["weight_scale"],
+-                                       tp_size,
+-                                       tp_rank,
+-                                       tp_mode,
++                                       module.tp_size,
++                                       module.tp_rank,
++                                       module.tp_mode,
+                                        device=device).contiguous()
+-                assert ws.dtype == torch.float8_e4m3fn  # TODO: or e8m0 for mxfp4 recipe?
+-                weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
++                ws = ws.view(fp4_utils.float4_sf_dtype)
++                ws = torch.ops.trtllm.block_scale_interleave(ws)
++                copy_weight(module.weight_scale, ws)
++
++        # Accumulate input_scale and weight_scale_2 across partial loads
++        if not hasattr(module, "tmp_nvfp4_input_scales_list"):
++            module.tmp_nvfp4_input_scales_list = []
++        if not hasattr(module, "tmp_nvfp4_weight_scale_2_list"):
++            module.tmp_nvfp4_weight_scale_2_list = []
++        for w in weights:
++            if "input_scale" in w:
++                module.tmp_nvfp4_input_scales_list.append(
++                    w["input_scale"][...].reshape([]))
+             if "weight_scale_2" in w:
+-                if weight_scale_2 is None:
+-                    weight_scale_2 = w["weight_scale_2"][...]
+-                else:
+-                    assert weight_scale_2 == w["weight_scale_2"][
+-                        ...], "The weight_scale_2 should be same for all the weights"
++                module.tmp_nvfp4_weight_scale_2_list.append(
++                    w["weight_scale_2"][...].reshape([]))
++
++    def _finalize_nvfp4_scales(self, module: Linear):
++        """Finalize accumulated NVFP4 scales after all partial loads.
++
++        Verifies consistency of input_scale/weight_scale_2 across shards,
++        computes input_scale, weight_scale_2, and alpha.
++
++        Returns:
++            Tuple of (input_scale, weight_scale_2, alpha) matching origin/main's
++            load_weight_scales return convention. Callers (process_weights_after_loading_*)
++            apply these to the module, since vanilla/fused_qkv/fused_gateup may
++            handle them differently.
++        """
++        input_scale_list = getattr(module, "tmp_nvfp4_input_scales_list", [])
++        weight_scale_2_list = getattr(module, "tmp_nvfp4_weight_scale_2_list",
++                                      [])
++
++        input_scale = None
++        if input_scale_list:
++            for s in input_scale_list[1:]:
++                assert torch.allclose(input_scale_list[0], s), \
++                    f"input_scale mismatch across shards: {input_scale_list}"
++            input_scale = input_scale_list[0]
++
++        weight_scale_2 = None
++        if weight_scale_2_list:
++            for s in weight_scale_2_list[1:]:
++                assert torch.allclose(weight_scale_2_list[0], s), \
++                    f"weight_scale_2 mismatch across shards: {weight_scale_2_list}"
++            weight_scale_2 = weight_scale_2_list[0]
+ 
+         # Compute scaling factor and alpha required by GEMM kernels
+         # For dynamic activation quantization, input_scale may be None (computed at runtime)
+         if input_scale is not None:
+-            # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
+             alpha = input_scale.float() * weight_scale_2.float()
+             # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
+             input_scale = 1.0 / input_scale
+@@ -1476,23 +1528,26 @@ def load_weight_scales(self,
+             # Dynamic mode: input_scale and alpha computed at runtime
+             alpha = None
+ 
+-        return input_scale, weight_scale, weight_scale_2.float(
++        return input_scale, weight_scale_2.float(
+         ) if weight_scale_2 is not None else None, alpha
+ 
+-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+-        load_weights_vanilla_helper(module, weights)
+-
+-        input_scale, weight_scale, weight_scale_2, alpha = self.load_weight_scales(
+-            weights,
+-            tp_size=module.tp_size,
+-            tp_rank=module.tp_rank,
+-            tp_mode=module.tp_mode)
+-
+-        assert len(weights) == 1
+-        weight_scale = weight_scale[0]
+-        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
++    def _cleanup_nvfp4_tmp_attrs(self,
++                                 module: Linear,
++                                 extra_attrs: Optional[List[str]] = None):
++        """Clean up temporary attributes after process_weights_after_loading."""
++        attrs = [
++            "tmp_nvfp4_weight_scales",
++            "tmp_nvfp4_input_scales_list",
++            "tmp_nvfp4_weight_scale_2_list",
++        ]
++        if extra_attrs:
++            attrs.extend(extra_attrs)
++        for attr in attrs:
++            if hasattr(module, attr):
++                delattr(module, attr)
+ 
+-        copy_weight(module.weight_scale, weight_scale)
++    def process_weights_after_loading_vanilla(self, module: Linear):
++        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
+ 
+         # For dynamic activation quantization, input_scale and alpha are computed at runtime
+         if input_scale is not None:
+@@ -1505,6 +1560,19 @@ def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+         if weight_scale_2 is not None:
+             copy_weight(module.weight_scale_2, weight_scale_2)
+ 
++        self._cleanup_nvfp4_tmp_attrs(module)
++
++    def load_weights_vanilla(self,
++                             module: Linear,
++                             weights: List[Dict],
++                             allow_partial_loading: bool = False) -> None:
++        load_weights_vanilla_helper(module,
++                                    weights,
++                                    allow_partial_loading=allow_partial_loading)
++
++        # Load scales (vanilla = no shard_keys)
++        self.load_weight_scales(module, weights, shard_keys=None)
++
+         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+         if "pre_quant_scale" in weights[0]:
+             device = module.weight.device
+@@ -1523,22 +1591,54 @@ def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+ 
+             copy_weight(module.pre_quant_scale, pre_quant_scale)
+ 
+-    def load_weights_fused_qkv_linear(self, module: Linear,
+-                                      weights: List[Dict]) -> None:
++    def load_weights_fused_qkv_linear(
++            self,
++            module: Linear,
++            weights: List[Dict],
++            allow_partial_loading: bool = False) -> None:
+         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+-            module, weights)
++            module, weights, allow_partial_loading=allow_partial_loading)
+ 
+-        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
+-            weights,
+-            tp_size=module.tp_size,
+-            tp_rank=module.tp_rank,
+-            tp_mode=module.tp_mode)
+-        weight_scale = torch.cat(weight_scales, 0)
+-        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
++        weight_mode = module.weights_loading_config.weight_mode
+ 
++        for shard_key, weight in zip(('q', 'k', 'v'),
++                                     (q_weight, k_weight, v_weight)):
++            if weight is not None:
++                shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
++                    shard_key]
++                copy_weight_shard(module.weight, weight, shard_offset,
++                                  shard_size)
++
++        self.load_weight_scales(module,
++                                weights[:3],
++                                shard_keys=weight_mode.shard_keys)
++
++        k_scale, v_scale = self.load_kv_scales(weights)
++        if k_scale:
++            if not hasattr(module, "tmp_k_scales"):
++                module.tmp_k_scales = []
++            module.tmp_k_scales.extend(k_scale)
++        if v_scale:
++            if not hasattr(module, "tmp_v_scales"):
++                module.tmp_v_scales = []
++            module.tmp_v_scales.extend(v_scale)
++
++    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
++        if not hasattr(module, "tmp_nvfp4_weight_scales"):
++            return
++
++        # Cat + interleave per-shard weight_scales
++        weight_mode = module.weights_loading_config.weight_mode
++        ordered_scales = [
++            module.tmp_nvfp4_weight_scales[key]
++            for key in weight_mode.shard_keys
++        ]
++        weight_scale = torch.cat(ordered_scales, 0)
++        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
+         copy_weight(module.weight_scale, weight_scale)
+ 
+-        # For dynamic activation quantization, input_scale and alpha are computed at runtime
++        # Finalize input_scale, weight_scale_2, alpha
++        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
+         if input_scale is not None:
+             copy_weight(module.input_scale, input_scale)
+         if alpha is not None:
+@@ -1547,45 +1647,44 @@ def load_weights_fused_qkv_linear(self, module: Linear,
+         if weight_scale_2 is not None:
+             copy_weight(module.weight_scale_2, weight_scale_2)
+ 
+-        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+-        copy_weight(module.weight, fused_weight)
+-
+-        # Load k and v scales, used for NVFP4 KV cache
+-        k_scale, v_scale = self.load_kv_scales(weights)
++        # Handle KV scales
+         if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
+-            if len(k_scale) != 0:
+-                assert len(v_scale) != 0
++            k_scales = getattr(module, "tmp_k_scales", [])
++            v_scales = getattr(module, "tmp_v_scales", [])
++            if k_scales:
++                assert v_scales, "k_scale and v_scale must be loaded together"
+                 copy_weight(
+                     module.kv_scales,
+                     torch.tensor(
+-                        [1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
++                        [1.0, max(k_scales).item(),
++                         max(v_scales).item()],
++                        dtype=torch.float32))
+                 module.inv_kv_scales.data = 1.0 / module.kv_scales
+ 
+-    def load_weights_fused_gate_up_linear(self, module: Linear,
+-                                          weights: List[Dict]) -> None:
++        self._cleanup_nvfp4_tmp_attrs(
++            module, extra_attrs=["tmp_k_scales", "tmp_v_scales"])
++
++    def load_weights_fused_gate_up_linear(
++            self,
++            module: Linear,
++            weights: List[Dict],
++            allow_partial_loading: bool = False) -> None:
+         gate_weight, up_weight = load_weights_fused_gate_up_helper(
+-            module, weights)
+-        fused_weight = torch.cat((gate_weight, up_weight))
+-        copy_weight(module.weight, fused_weight)
++            module, weights, allow_partial_loading=allow_partial_loading)
+ 
+-        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
+-            weights,
+-            tp_size=module.tp_size,
+-            tp_rank=module.tp_rank,
+-            tp_mode=module.tp_mode)
+-        weight_scale = torch.cat(weight_scales, 0)
+-        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
++        weight_mode = module.weights_loading_config.weight_mode
++        device = torch.device("cuda")
+ 
+-        copy_weight(module.weight_scale, weight_scale)
++        for shard_key, weight in zip(('gate', 'up'), (gate_weight, up_weight)):
++            if weight is not None:
++                shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
++                    shard_key]
++                copy_weight_shard(module.weight, weight, shard_offset,
++                                  shard_size)
+ 
+-        # For dynamic activation quantization, input_scale and alpha are computed at runtime
+-        if input_scale is not None:
+-            copy_weight(module.input_scale, input_scale)
+-        if alpha is not None:
+-            copy_weight(module.alpha, alpha)
+-            module.scalar_alpha = alpha.item()
+-        if weight_scale_2 is not None:
+-            copy_weight(module.weight_scale_2, weight_scale_2)
++        self.load_weight_scales(module,
++                                weights[:2],
++                                shard_keys=weight_mode.shard_keys)
+ 
+         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+         # NOTE: pre_quant_scale is the same for gate and up since modelopt checks which layer shared the same input
+@@ -1606,6 +1705,34 @@ def load_weights_fused_gate_up_linear(self, module: Linear,
+ 
+             copy_weight(module.pre_quant_scale, pre_quant_scale)
+ 
++    def process_weights_after_loading_fused_gate_up_linear(
++            self, module: Linear):
++        if not hasattr(module, "tmp_nvfp4_weight_scales"):
++            return
++
++        # Cat + interleave per-shard weight_scales
++        weight_mode = module.weights_loading_config.weight_mode
++        ordered_scales = [
++            module.tmp_nvfp4_weight_scales[key]
++            for key in weight_mode.shard_keys
++        ]
++        weight_scale = torch.cat(ordered_scales, 0)
++        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
++        copy_weight(module.weight_scale, weight_scale)
++
++        # Finalize input_scale, weight_scale_2, alpha
++        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
++        if input_scale is not None:
++            copy_weight(module.input_scale, input_scale)
++        if alpha is not None:
++            copy_weight(module.alpha, alpha)
++            module.scalar_alpha = alpha.item()
++        if weight_scale_2 is not None:
++            copy_weight(module.weight_scale_2, weight_scale_2)
++
++        self._cleanup_nvfp4_tmp_attrs(module,
++                                      extra_attrs=["tmp_nvfp4_pre_quant_scale"])
++
+     def post_load_weights(self, module: Linear):
+         """Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements."""
+         super().post_load_weights(module)
+@@ -1613,12 +1740,13 @@ def post_load_weights(self, module: Linear):
+         row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
+         col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
+         if row_pad_size != 0 or col_pad_size != 0:
+-            # Pad weight to meet NVFP4 GEMM kernel alignment requirements
+-            module.weight = Parameter(F.pad(module.weight,
++            padded_weight = Parameter(F.pad(module.weight,
+                                             (0, col_pad_size, 0, row_pad_size),
+                                             mode='constant',
+                                             value=0),
+                                       requires_grad=False)
++            replace_parameter_and_save_metadata(module, "weight", padded_weight,
++                                                module.rebuild_tensor_metadata)
+             weight_col_size = module.weight.size(1)
+             assert (
+                 weight_col_size * 2
+@@ -1632,8 +1760,6 @@ def post_load_weights(self, module: Linear):
+             scale_pad_col = fp4_utils.pad_up(
+                 (module.in_features + (col_pad_size * 2)) //
+                 module.scaling_vector_size, 4) - scale_cols
+-            # Pad weight_scale to match padded weight dimensions
+-            # Padding should be performed on unswizzled weight_scale tensor
+             if scale_pad_row != 0 or scale_pad_col != 0:
+                 weight_scale_unswizzle = unswizzle_sf(
+                     module.weight_scale.data, scale_rows,
+@@ -1644,10 +1770,13 @@ def post_load_weights(self, module: Linear):
+                     (0, scale_pad_col, 0, scale_pad_row),
+                     mode='constant',
+                     value=0)
+-                module.weight_scale = Parameter(
++                padded_weight_scale = Parameter(
+                     torch.ops.trtllm.block_scale_interleave(
+                         weight_scale_unswizzle_pad),
+                     requires_grad=False)
++                replace_parameter_and_save_metadata(
++                    module, "weight_scale", padded_weight_scale,
++                    module.rebuild_tensor_metadata)
+ 
+ 
+ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
+@@ -2659,6 +2788,8 @@ def create_weights(self):
+         if self._weights_created:
+             return
+ 
++        self.rebuild_tensor_metadata = {}
++
+         self.quant_method = self.get_quant_method(self.quant_config)
+         self.quant_method.create_weights(self, self.in_features,
+                                          self.out_features, self.has_bias,
+@@ -2820,8 +2951,12 @@ def load_weights(self,
+         assert self._weights_created
+ 
+         weight_mode = self.weights_loading_config.weight_mode
+-        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+-            assert allow_partial_loading is False, "allow_partial_loading is only supported for unquantized linear methods now"
++        if not isinstance(self.quant_method,
++                          (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
++                           NVFP4LinearMethod)):
++            assert allow_partial_loading is False, (
++                f"{type(self.quant_method).__name__} does not support "
++                "allow_partial_loading")
+         self.quant_method.load_weights(
+             self,
+             weights,
+diff --git a/tensorrt_llm/llmapi/llm_utils.py b/tensorrt_llm/llmapi/llm_utils.py
+index 5a6cb517caca..268ea304c618 100644
+--- a/tensorrt_llm/llmapi/llm_utils.py
++++ b/tensorrt_llm/llmapi/llm_utils.py
+@@ -489,6 +489,20 @@ def _update_from_hf_quant_config(self) -> bool:
+                         "Supported: 8.")
+ 
+                 quant_config.exclude_modules = hf_quant_config.get("ignore", [])
++            elif hf_quant_config.get("quant_method") == "nvfp4":
++                quant_config.quant_algo = QuantAlgo.NVFP4
++                group_size = hf_quant_config.get("group_size", 16)
++                assert group_size == 16, "NVFP4 only supports group_size=16"
++                quant_config.group_size = group_size
++                default_exclude = ['*.mlp.gate', 'lm_head']
++
++                hf_exclude_modules = hf_quant_config.get(
++                    'modules_to_not_convert', None)
++                if hf_exclude_modules is not None:
++                    quant_config.exclude_modules = list(
++                        dict.fromkeys(hf_exclude_modules + default_exclude))
++                else:
++                    quant_config.exclude_modules = default_exclude
+             else:
+                 raise NotImplementedError(
+                     f"Unsupported quantization_config: {hf_quant_config}.")
+diff --git a/tests/unittest/_torch/modules/moe/test_moe_backend.py b/tests/unittest/_torch/modules/moe/test_moe_backend.py
+index 3bb9853b2d06..aa8563731d1d 100644
+--- a/tests/unittest/_torch/modules/moe/test_moe_backend.py
++++ b/tests/unittest/_torch/modules/moe/test_moe_backend.py
+@@ -548,6 +548,14 @@ def test_moe_backend(
+         if hasattr(quantize_util, "weight_loading_mode"):
+             weight_loading_mode = quantize_util.weight_loading_mode
+ 
++        # Clear class-level permute indices cache between parametrized test cases
++        # to work around a B200-specific kernel bug (tactic [32,5] illegal memory access)
++        from tensorrt_llm._torch.modules.fused_moe.quantization import (
++            NVFP4TRTLLMGenFusedMoEBaseMethod,
++        )
++
++        NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
++
+         # Create backend first (needed for MXFP4_MXFP8 to get shapes)
+         backend = create_test_backend(
+             backend_type=backend_type,
+diff --git a/tests/unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py b/tests/unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py
+index 1a59fb13abf6..c22f29f30d0f 100644
+--- a/tests/unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py
++++ b/tests/unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py
+@@ -1,17 +1,27 @@
++import base64
++import pickle
+ import re
+-from typing import Callable
++from typing import Callable, List, Optional
+ 
+ import pytest
++import torch
+ from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
+     RefHFModelWithIPCHandles,
+     compare_logits,
+     run_generate,
+ )
+-from transformers import AutoTokenizer
++from torch.multiprocessing.reductions import reduce_tensor
++from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+ from utils.llm_data import llm_models_root
++from utils.torch_ref import RefHFModel
+ from utils.util import skip_pre_blackwell
+ 
+ from tensorrt_llm import LLM
++from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
++    _dequantize_nvfp4,
++    _quantize_nvfp4,
++)
++from tensorrt_llm._torch.utils import get_device_uuid
+ from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+ 
+ 
+@@ -23,7 +33,7 @@
+         ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
+     ],
+ )
+-def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
++def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
+     model_dir = str(llm_models_root() / model_dir)
+     fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+     additional_kwargs = {}
+@@ -83,7 +93,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
+         ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
+     ],
+ )
+-def test_llm_partial_update_weights_with_quant_config(model_dir, fp8_model_dir):
++def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
+     model_dir = str(llm_models_root() / model_dir)
+     fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+     additional_kwargs = {}
+@@ -152,3 +162,345 @@ def filter_fn(name: str) -> bool:
+ 
+     llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+     compare_logits(llm_logits, ref_logits)
++
++
++class RefNVFP4ModelWithIPCHandles(RefHFModel):
++    """Reference model that loads bf16 weights from HuggingFace, quantizes
++    them to NVFP4 format, and keeps a round-tripped bf16 model for reference
++    inference.
++
++    Since HuggingFace cannot run NVFP4 inference natively, this class:
++    1. Loads the bf16 model from HF
++    2. Quantizes each linear weight to NVFP4 using _quantize_nvfp4
++    3. Dequantizes back to bf16 and replaces model parameters (round-trip),
++       so the HF model can serve as a reference for logits comparison
++    4. Provides IPC handles with NVFP4 weight keys (weight, weight_scale, weight_scale_2)
++    """
++
++    NVFP4_BLOCK_SIZE = 16
++
++    # Patterns for determining which parameters to quantize
++    EXCLUDE_PATTERNS = [
++        "embed_tokens",
++        "lm_head",
++        "layernorm",
++        "norm",
++        "ln_",
++        "embeddings",
++        "mlp.gate.weight",  # MoE router
++    ]
++    INCLUDE_PATTERNS = [
++        "q_proj",
++        "k_proj",
++        "v_proj",
++        "o_proj",
++        "gate_proj",
++        "up_proj",
++        "down_proj",
++        "fc1",
++        "fc2",
++        "mlp",
++    ]
++
++    # Fusion groups: projections that TRT-LLM fuses together must share weight_scale_2.
++    FUSION_GROUPS = (
++        ("q_proj", "k_proj", "v_proj"),
++        ("gate_proj", "up_proj"),
++    )
++    _PROJ_TO_GROUP = {proj: group for group in FUSION_GROUPS for proj in group}
++
++    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: Optional[int] = None):
++        self.device_id = device_id
++        config = AutoConfig.from_pretrained(model_dir)
++        if num_hidden_layers is not None:
++            config.num_hidden_layers = num_hidden_layers
++        self.model = AutoModelForCausalLM.from_pretrained(
++            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
++        ).to(f"cuda:{device_id}")
++        self.all_weights = {}
++        self._dequantized_weights = {}
++        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
++        self._quantize_and_replicate_weights()
++
++    def _quantize_and_replicate_weights(self):
++        """Quantize linear weights to NVFP4 and replicate across devices.
++
++        Projections in the same fusion group (qkv, gate_up) share a unified
++        weight_scale_2 computed from their joint amax, matching the behavior
++        of verl's TRTLLMNVFP4QuantizerHelper.
++        """
++        # First pass: collect all params, buffer fusion groups
++        all_params = [
++            (name, param.detach().clone()) for name, param in self.model.named_parameters()
++        ]
++
++        # Buffer: {(layer_prefix, group): {proj_type: (name, tensor)}}
++        fusion_buffer: dict[tuple, dict] = {}
++        model_weights = []
++
++        for name, p in all_params:
++            if not self._should_quantize(name):
++                model_weights.append((name, p))
++                continue
++
++            proj_type, group = self._get_proj_info(name)
++            if proj_type is not None:
++                layer_prefix = name[: name.index(proj_type)].rstrip(".")
++                buf_key = (layer_prefix, group)
++                fusion_buffer.setdefault(buf_key, {})[proj_type] = (name, p)
++
++                # Flush when all members of the group are collected
++                if all(proj in fusion_buffer[buf_key] for proj in group):
++                    projs = fusion_buffer.pop(buf_key)
++                    model_weights.extend(self._quantize_fusion_group(group, projs))
++            else:
++                model_weights.extend(self._quantize_single_weight(name, p))
++
++        assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
++
++        self.all_weights[self.device_id] = model_weights
++        for i in range(torch.cuda.device_count()):
++            if i != self.device_id:
++                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
++
++        with torch.no_grad():
++            param_dict = dict(self.model.named_parameters())
++            for name, dequant_weight in self._dequantized_weights.items():
++                if name in param_dict:
++                    param_dict[name].copy_(dequant_weight)
++        del self._dequantized_weights
++
++    @classmethod
++    def _should_quantize(cls, name: str) -> bool:
++        """Determine whether to quantize a parameter to NVFP4."""
++        if not name.endswith(".weight"):
++            return False
++        name_lower = name.lower()
++        for pattern in cls.EXCLUDE_PATTERNS:
++            if pattern in name_lower:
++                return False
++        for pattern in cls.INCLUDE_PATTERNS:
++            if pattern in name_lower:
++                return True
++        return False
++
++    @classmethod
++    def _get_proj_info(cls, name: str):
++        """Return (proj_type, fusion_group) if param belongs to a fusion group."""
++        for proj, group in cls._PROJ_TO_GROUP.items():
++            if proj in name:
++                return proj, group
++        return None, None
++
++    def _quantize_single_weight(self, name: str, weight: torch.Tensor) -> List[tuple]:
++        """Quantize a single (non-fused) weight to NVFP4."""
++        return list(self._do_quantize(name, weight))
++
++    def _quantize_fusion_group(self, group: tuple, projs: dict) -> List[tuple]:
++        """Quantize a fusion group with unified weight_scale_2."""
++        # Compute joint amax across all members
++        all_amaxes = [v.float().abs().amax() for _, v in projs.values()]
++        unified_scale_2 = torch.stack(all_amaxes).amax() / (6.0 * 448.0)
++
++        results = []
++        for proj_type in group:
++            if proj_type in projs:
++                name, weight = projs[proj_type]
++                results.extend(self._do_quantize(name, weight, unified_scale_2))
++        return results
++
++    def _do_quantize(
++        self,
++        name: str,
++        weight: torch.Tensor,
++        weight_scale_2: Optional[torch.Tensor] = None,
++    ) -> List[tuple]:
++        """Core NVFP4 quantization. Returns [(name, packed), (name_scale, bs), (name_scale_2, s2)]."""
++        weight_float = weight.float()
++        if weight_scale_2 is None:
++            weight_scale_2 = weight_float.abs().amax().float() / (6.0 * 448.0)
++
++        packed_weight, block_scale = _quantize_nvfp4(
++            weight_float, self.NVFP4_BLOCK_SIZE, weight_scale_2
++        )
++        packed_uint8 = packed_weight.to(torch.uint8)
++        block_scale_fp8 = block_scale.to(torch.float8_e4m3fn)
++
++        self._dequantized_weights[name] = _dequantize_nvfp4(
++            packed_uint8,
++            block_scale_fp8,
++            weight_scale_2,
++            weight_float.shape,
++            torch.bfloat16,
++        )
++
++        return [
++            (name, packed_uint8),
++            (name + "_scale", block_scale_fp8),
++            (name + "_scale_2", weight_scale_2),
++        ]
++
++    def get_weight_ipc_handles_serialized(
++        self,
++        device_ids: Optional[List[int]] = None,
++        weight_filter: Optional[Callable[[str], bool]] = None,
++    ):
++        ret = {}
++        device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
++
++        for device in device_list:
++            all_handles = []
++            for item in self.all_weights[device]:
++                name, p = item
++                if weight_filter is not None and not weight_filter(name):
++                    continue
++                handle = reduce_tensor(p)
++                all_handles.append((name, handle))
++
++            serialized = base64.b64encode(pickle.dumps(all_handles)).decode("utf-8")
++            ret[self.device_uuid[device]] = serialized
++
++        return ret
++
++
++@skip_pre_blackwell
++@pytest.mark.parametrize(
++    "model_dir",
++    [
++        "Qwen3/Qwen3-30B-A3B",
++        "Qwen3/Qwen3-8B",
++    ],
++)
++@pytest.mark.parametrize(
++    "kv_cache_dtype",
++    [
++        "auto",
++        "fp8",
++    ],
++)
++def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
++    model_dir = str(llm_models_root() / model_dir)
++    num_hidden_layers = 1
++    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
++    tokenizer = AutoTokenizer.from_pretrained(model_dir)
++    kv_cache_config = KvCacheConfig(
++        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
++    )
++    llm = LLM(
++        model=model_dir,
++        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
++        tensor_parallel_size=2,
++        load_format="dummy",
++        pipeline_parallel_size=1,
++        kv_cache_config=kv_cache_config,
++        force_dynamic_quantization=True,
++        model_kwargs={
++            "num_hidden_layers": num_hidden_layers,
++            "quantization_config": {
++                "quant_method": "nvfp4",
++                "group_size": 16,
++            },
++        },
++    )
++
++    with llm:
++        prompts_texts = [
++            "Hello, my name is",
++            "The president of the United States is",
++            "The capital of France is",
++            "The future of AI is",
++        ]
++        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
++        del tokenizer
++        sampling_params = SamplingParams(
++            temperature=0, return_generation_logits=True, max_tokens=1024
++        )
++
++        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
++        llm._collective_rpc("update_weights", (ipc_handles,))
++        llm._collective_rpc("update_weights", (None,))
++
++        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
++        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
++        compare_logits(llm_logits, ref_logits, threshold=0.8)
++
++
++@skip_pre_blackwell
++@pytest.mark.parametrize(
++    "model_dir",
++    [
++        "Qwen3/Qwen3-30B-A3B",
++        "Qwen3/Qwen3-8B",
++    ],
++)
++@pytest.mark.parametrize(
++    "kv_cache_dtype",
++    [
++        "auto",
++        "fp8",
++    ],
++)
++def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
++    model_dir = str(llm_models_root() / model_dir)
++    num_hidden_layers = 1
++    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
++    tokenizer = AutoTokenizer.from_pretrained(model_dir)
++    kv_cache_config = KvCacheConfig(
++        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
++    )
++    llm = LLM(
++        model=model_dir,
++        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
++        tensor_parallel_size=2,
++        load_format="dummy",
++        pipeline_parallel_size=1,
++        kv_cache_config=kv_cache_config,
++        force_dynamic_quantization=True,
++        model_kwargs={
++            "num_hidden_layers": num_hidden_layers,
++            "quantization_config": {
++                "quant_method": "nvfp4",
++                "group_size": 16,
++            },
++        },
++    )
++
++    with llm:
++        prompts_texts = [
++            "Hello, my name is",
++            "The president of the United States is",
++            "The capital of France is",
++            "The future of AI is",
++        ]
++        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
++        del tokenizer
++
++        sampling_params = SamplingParams(
++            temperature=0, return_generation_logits=True, max_tokens=1024
++        )
++
++        def common_filter(filter_name: str) -> Callable[[str], bool]:
++            def filter_fn(name: str) -> bool:
++                return name.endswith(filter_name)
++
++            return filter_fn
++
++        # Generate filter_list from model weight keys by removing layer prefix
++        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
++        filter_set = set()
++        for name, _ in hf_model.all_weights[hf_model.device_id]:
++            suffix = layer_prefix_pattern.sub("", name)
++            filter_set.add(suffix)
++        filter_list = list(filter_set)
++
++        for filter_name in filter_list:
++            weight_filter = common_filter(filter_name=filter_name)
++            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
++                [0, 1], weight_filter=weight_filter
++            )
++            llm._collective_rpc("update_weights", (ipc_handles,))
++        llm._collective_rpc("update_weights", (None,))
++
++        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
++        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
++        compare_logits(llm_logits, ref_logits, threshold=0.8)

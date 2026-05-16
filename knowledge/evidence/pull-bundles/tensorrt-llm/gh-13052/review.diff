@@ -1,0 +1,991 @@
+diff --git a/benchmarks/bench_fused_dit_cross_head_qk_norm_rope.py b/benchmarks/bench_fused_dit_cross_head_qk_norm_rope.py
+new file mode 100644
+index 000000000000..70ae2d1e7af2
+--- /dev/null
++++ b/benchmarks/bench_fused_dit_cross_head_qk_norm_rope.py
+@@ -0,0 +1,218 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Micro-benchmark: fused cross-head QK Norm + RoPE vs split (separate norm + RoPE).
++
++Three baselines are compared:
++    1. Eager:   PyTorch eager-mode split norm + RoPE (many small CUDA kernels
++                launched via PyTorch dispatch).
++    2. Compile: `torch.compile`'d version of (1), where TorchInductor fuses the
++                elementwise + norm ops into a few large Triton kernels.
++    3. Fused:   Our single hand-written CUDA kernel that does cross-head RMSNorm
++                + RoPE in a single pass.
++
++Usage:
++    python benchmarks/bench_fused_dit_cross_head_qk_norm_rope.py
++"""
++
++import torch
++import torch._dynamo
++import torch.nn.functional as F
++
++import tensorrt_llm  # noqa: F401  # required to register torch.ops.trtllm.*
++
++# We benchmark many shape/mode combinations with a single torch.compile()'d
++# function; each unique input shape + static arg combo forces Dynamo to
++# recompile. Raise the cache limit so we don't silently fall back to eager.
++torch._dynamo.config.cache_size_limit = 64
++
++
++def _apply_interleaved_rope(x, cos, sin):
++    x_rot = torch.empty_like(x, dtype=torch.float32)
++    x_rot[:, 0::2] = -x[:, 1::2].float()
++    x_rot[:, 1::2] = x[:, 0::2].float()
++    return (x.float() * cos + x_rot * sin).to(x.dtype)
++
++
++def _apply_rotate_half_rope(x, cos, sin, head_dim, num_heads):
++    """rotate_half RoPE: pair (x[i], x[i + head_dim/2]) within each head."""
++    T = x.shape[0]
++    x_4d = x.view(T, num_heads, head_dim).float()
++    half = head_dim // 2
++    x1 = x_4d[..., :half]
++    x2 = x_4d[..., half:]
++    cos_4d = cos.view(T, num_heads, head_dim)
++    sin_4d = sin.view(T, num_heads, head_dim)
++    out = torch.empty_like(x_4d)
++    out[..., :half] = x1 * cos_4d[..., :half] - x2 * sin_4d[..., :half]
++    out[..., half:] = x2 * cos_4d[..., half:] + x1 * sin_4d[..., half:]
++    return out.reshape(T, -1).to(x.dtype)
++
++
++def split_norm_rope(
++    qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave
++):
++    """Baseline: separate RMSNorm + RoPE (current WAN path)."""
++    q_size = num_heads * head_dim
++    q = qkv[:, :q_size]
++    k = qkv[:, q_size : 2 * q_size]
++
++    q = F.rms_norm(q.float(), (q_size,), q_weight.float(), eps).to(qkv.dtype)
++    k = F.rms_norm(k.float(), (q_size,), k_weight.float(), eps).to(qkv.dtype)
++
++    num_tokens = qkv.shape[0]
++    cos_q = cos_emb.unsqueeze(1).expand(-1, num_heads, -1).reshape(num_tokens, q_size)
++    sin_q = sin_emb.unsqueeze(1).expand(-1, num_heads, -1).reshape(num_tokens, q_size)
++
++    if interleave:
++        q = _apply_interleaved_rope(q, cos_q, sin_q)
++        k = _apply_interleaved_rope(k, cos_q, sin_q)
++    else:
++        q = _apply_rotate_half_rope(q, cos_q, sin_q, head_dim, num_heads)
++        k = _apply_rotate_half_rope(k, cos_q, sin_q, head_dim, num_heads)
++
++    qkv[:, :q_size] = q
++    qkv[:, q_size : 2 * q_size] = k
++
++
++def fused_norm_rope(
++    qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave
++):
++    """Fused cross-head QK Norm + RoPE kernel."""
++    torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
++        qkv,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        interleave,
++    )
++
++
++def benchmark(fn, warmup=50, iters=200):
++    """Time GPU-side kernel work only using CUDA events.
++
++    fn() should perform the kernel call(s) on pre-allocated buffers; caller is
++    responsible for ensuring any in-place mutation does not affect timing
++    semantics (we do iters back-to-back calls on the same buffer).
++    """
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(iters):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) / iters
++
++
++def main():
++    device = "cuda"
++    configs = [
++        {"name": "WAN_1.3B_256tok", "num_heads": 12, "head_dim": 128, "num_tokens": 256},
++        {"name": "WAN_1.3B_4096tok", "num_heads": 12, "head_dim": 128, "num_tokens": 4096},
++        {"name": "WAN_14B_256tok", "num_heads": 40, "head_dim": 128, "num_tokens": 256},
++        {"name": "WAN_14B_4096tok", "num_heads": 40, "head_dim": 128, "num_tokens": 4096},
++        {"name": "WAN_14B_16384tok", "num_heads": 40, "head_dim": 128, "num_tokens": 16384},
++    ]
++
++    # TorchInductor Triton-fused version of the eager split path.
++    # Separate torch.compile() call per shape avoids graph-break costs being
++    # counted in-between shapes (Inductor caches compiled kernels by shape).
++    split_compiled = torch.compile(split_norm_rope, mode="reduce-overhead", dynamic=False)
++
++    # interleave=True  -> WAN-1 family (interleaved RoPE)
++    # interleave=False -> WAN-2 family (rotate_half RoPE)
++    for mode_name, interleave in [("interleave (WAN-1)", True), ("rotate_half (WAN-2)", False)]:
++        print(f"\n=== RoPE mode: {mode_name} ===")
++        header = (
++            f"{'Config':<22} {'Eager (ms)':>12} {'Compile (ms)':>14} {'Fused (ms)':>12} "
++            f"{'Fused/Eager':>12} {'Fused/Compile':>14}"
++        )
++        print(header)
++        print("-" * len(header))
++
++        for cfg in configs:
++            num_heads = cfg["num_heads"]
++            head_dim = cfg["head_dim"]
++            num_tokens = cfg["num_tokens"]
++            q_dim = num_heads * head_dim
++            hidden_size = 3 * q_dim
++
++            torch.random.manual_seed(42)
++            qkv_seed = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
++            q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
++            k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
++
++            half_dim = head_dim // 2
++            freqs = torch.randn(num_tokens, half_dim, device=device, dtype=torch.float32)
++            freqs = freqs.repeat_interleave(2, dim=-1)
++            cos_emb = freqs.cos()
++            sin_emb = freqs.sin()
++
++            # Pre-allocate one working buffer per path; benchmark() runs the
++            # kernel back-to-back on the same tensor (timing is independent of
++            # values).
++            qkv_eager_buf = qkv_seed.clone()
++            qkv_compile_buf = qkv_seed.clone()
++            qkv_fused_buf = qkv_seed.clone()
++
++            eager_ms = benchmark(
++                lambda: split_norm_rope(
++                    qkv_eager_buf,
++                    num_heads,
++                    head_dim,
++                    1e-6,
++                    q_weight,
++                    k_weight,
++                    cos_emb,
++                    sin_emb,
++                    interleave,
++                )
++            )
++            compile_ms = benchmark(
++                lambda: split_compiled(
++                    qkv_compile_buf,
++                    num_heads,
++                    head_dim,
++                    1e-6,
++                    q_weight,
++                    k_weight,
++                    cos_emb,
++                    sin_emb,
++                    interleave,
++                ),
++                warmup=100,  # first few calls trigger Inductor compilation
++            )
++            fused_ms = benchmark(
++                lambda: fused_norm_rope(
++                    qkv_fused_buf,
++                    num_heads,
++                    head_dim,
++                    1e-6,
++                    q_weight,
++                    k_weight,
++                    cos_emb,
++                    sin_emb,
++                    interleave,
++                )
++            )
++
++            speedup_eager = eager_ms / fused_ms
++            speedup_compile = compile_ms / fused_ms
++            print(
++                f"{cfg['name']:<22} {eager_ms:>12.4f} {compile_ms:>14.4f} {fused_ms:>12.4f} "
++                f"{speedup_eager:>11.2f}x {speedup_compile:>13.2f}x"
++            )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.cu b/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.cu
+index 641a11f4c614..d5690c81438a 100644
+--- a/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.cu
++++ b/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.cu
+@@ -247,6 +247,237 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
+ #undef LAUNCH_PER_HEAD_KERNEL
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////
++//
++// Cross-head QK Norm + RoPE kernel (WAN, LTX-2)
++//
++// One CTA per (token, Q-or-K). RMSNorm is computed across ALL heads combined
++// (norm dim = num_heads * head_dim), then RoPE is applied in-register.
++//
++// Grid:  (num_tokens, 2)   — blockIdx.y==0 → Q,  blockIdx.y==1 → K
++// Block: up to 1024 threads; each thread handles multiple bf16x2 pairs
++//        at stride blockDim.x.
++//
++// The packed QKV layout is [num_tokens, (Hq + Hk + Hv) * head_dim].
++// Only Q and K regions are read/written; V is untouched.
++//
++template <bool interleave>
++__global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
++    int const q_dim,                                                  // num_heads_q * head_dim
++    int const k_dim,                                                  // num_heads_k * head_dim
++    int const total_row,                                              // (Hq+Hk+Hv) * head_dim
++    int const head_dim, float const eps,
++    __nv_bfloat16 const* q_weight,                                    // [q_dim]
++    __nv_bfloat16 const* k_weight,                                    // [k_dim]
++    float const* cos_emb,                                             // [num_tokens, head_dim]
++    float const* sin_emb,                                             // [num_tokens, head_dim]
++    int const num_tokens)
++{
++    int const tokenIdx = blockIdx.x;
++    if (tokenIdx >= num_tokens)
++    {
++        return;
++    }
++    bool const isQ = (blockIdx.y == 0);
++    int const norm_dim = isQ ? q_dim : k_dim;
++    __nv_bfloat16 const* weight = isQ ? q_weight : k_weight;
++
++    // Base offset into packed QKV for this token's Q or K region
++    int64_t const baseOffset = static_cast<int64_t>(tokenIdx) * total_row + (isQ ? 0 : q_dim);
++
++    // ---- Step 1: Load elements and accumulate sum-of-squares ----
++    int const halfDim = norm_dim / 2; // number of bf16x2 pairs
++    float threadSumSq = 0.0f;
++
++    for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
++    {
++        int const elemIdx = i * 2;
++        __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
++        float2 valf = __bfloat1622float2(val);
++        threadSumSq += valf.x * valf.x + valf.y * valf.y;
++    }
++
++    // ---- Step 2: CTA-level reduction for sum-of-squares ----
++    float totalSumSq = tensorrt_llm::common::blockReduceSum(threadSumSq);
++
++    __shared__ float s_rms_rcp;
++    if (threadIdx.x == 0)
++    {
++        s_rms_rcp = rsqrtf(totalSumSq / static_cast<float>(norm_dim) + eps);
++    }
++    __syncthreads();
++    float const rms_rcp = s_rms_rcp;
++
++    // ---- Step 3: Apply norm weight and interleaved RoPE, then store ----
++    // cos/sin embeddings are [num_tokens, head_dim] and broadcast across heads.
++    int64_t const embBase = static_cast<int64_t>(tokenIdx) * head_dim;
++
++    // Reload from global memory rather than caching in registers: norm_dim can be
++    // very large (e.g. 40 heads * 128 = 5120), so hoarding per-thread register arrays
++    // would tank occupancy.  The second load likely hits L1/L2 cache from Step 1.
++    if constexpr (interleave)
++    {
++        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
++        {
++            int const elemIdx = i * 2;
++            //
++            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
++            __nv_bfloat162 w = *reinterpret_cast<__nv_bfloat162 const*>(&weight[elemIdx]);
++            float2 valf = __bfloat1622float2(val);
++            float2 wf = __bfloat1622float2(w);
++
++            float x0 = valf.x * rms_rcp * wf.x;
++            float x1 = valf.y * rms_rcp * wf.y;
++
++            // Interleaved RoPE: pair (x[2j], x[2j+1]) within each head
++            int const dimInHead0 = elemIdx % head_dim;
++            int const dimInHead1 = dimInHead0 + 1;
++
++            float cos0 = cos_emb[embBase + dimInHead0];
++            float sin0 = sin_emb[embBase + dimInHead0];
++            float cos1 = cos_emb[embBase + dimInHead1];
++            float sin1 = sin_emb[embBase + dimInHead1];
++
++            float out0 = x0 * cos0 - x1 * sin0;
++            float out1 = x1 * cos1 + x0 * sin1;
++
++            *reinterpret_cast<__nv_bfloat162*>(&qkv[baseOffset + elemIdx])
++                = __float22bfloat162_rn(make_float2(out0, out1));
++        }
++    }
++    else
++    {
++        // rotate_half requires a two-pass approach: within the same head, element i
++        // is paired with element i + head_dim/2, which is processed by a different
++        // thread.  We stage normalized values in shared memory so that Pass 2 can
++        // read partners without racing against other threads' RoPE-phase writes to
++        // global memory.
++        //
++        // Layout: s_norm[0..norm_dim) holds the post-normalize (pre-RoPE) values.
++        // Allocated as dynamic shared memory sized = norm_dim * sizeof(bf16).
++        extern __shared__ __nv_bfloat16 s_norm[];
++
++        // Pass 1: normalize all elements and store them to shared memory.
++        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
++        {
++            int const elemIdx = i * 2;
++            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
++            __nv_bfloat162 w = *reinterpret_cast<__nv_bfloat162 const*>(&weight[elemIdx]);
++            float2 valf = __bfloat1622float2(val);
++            float2 wf = __bfloat1622float2(w);
++
++            float x0 = valf.x * rms_rcp * wf.x;
++            float x1 = valf.y * rms_rcp * wf.y;
++
++            *reinterpret_cast<__nv_bfloat162*>(&s_norm[elemIdx]) = __float22bfloat162_rn(make_float2(x0, x1));
++        }
++        __syncthreads();
++
++        // Pass 2: apply rotate_half RoPE. Self + partner are both read from
++        // s_norm (read-only in this pass), and results are written to qkv in
++        // global memory. Since different threads write disjoint (elemIdx,
++        // elemIdx+1) pairs, and partner reads come from shared memory which is
++        // never written during Pass 2, there is no read/write race.
++        int const halfHead = head_dim / 2;
++        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
++        {
++            int const elemIdx = i * 2;
++
++            __nv_bfloat162 selfVal = *reinterpret_cast<__nv_bfloat162 const*>(&s_norm[elemIdx]);
++            float2 selfF = __bfloat1622float2(selfVal);
++            float x0 = selfF.x;
++            float x1 = selfF.y;
++
++            int const localDim0 = elemIdx % head_dim;
++            int const localDim1 = localDim0 + 1;
++            // elemIdx is always even (i*2) and head_dim is always even (it must be
++            // a power of 2: 64/128/256 for supported models), so head boundaries
++            // fall on even indices.  Therefore elemIdx and elemIdx+1 always belong
++            // to the same head and share the same head offset.
++            int const headOff = elemIdx - localDim0;
++
++            // Partner is head_dim/2 away within the same head
++            int pDim0 = (localDim0 < halfHead) ? (headOff + localDim0 + halfHead) : (headOff + localDim0 - halfHead);
++
++            // pDim0 is always even: localDim0 is even (elemIdx = i*2), halfHead is
++            // even (head_dim is a power of 2), and headOff is a multiple of
++            // head_dim.  So we can load the (pDim0, pDim0+1) partner pair as a
++            // single bf16x2 vector load from shared memory.
++            __nv_bfloat162 partnerVal = *reinterpret_cast<__nv_bfloat162 const*>(&s_norm[pDim0]);
++            float2 partnerF = __bfloat1622float2(partnerVal);
++            float p0 = partnerF.x;
++            float p1 = partnerF.y;
++
++            // First half: result = self * cos - partner * sin
++            // Second half: result = self * cos + partner * sin
++            // A single sign suffices for both elements: localDim0 is always even
++            // (elemIdx = i*2) and halfHead is always even (head_dim is power of 2),
++            // so the half-boundary (halfHead-1 / halfHead = odd/even) can never
++            // fall between localDim0 and localDim1.  Both are always in the same half.
++            float sign = (localDim0 < halfHead) ? -1.0f : 1.0f;
++
++            float cos0 = cos_emb[embBase + localDim0];
++            float sin0 = sin_emb[embBase + localDim0];
++            float cos1 = cos_emb[embBase + localDim1];
++            float sin1 = sin_emb[embBase + localDim1];
++
++            float out0 = x0 * cos0 + sign * p0 * sin0;
++            float out1 = x1 * cos1 + sign * p1 * sin1;
++
++            *reinterpret_cast<__nv_bfloat162*>(&qkv[baseOffset + elemIdx])
++                = __float22bfloat162_rn(make_float2(out0, out1));
++        }
++    }
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++void launchFusedDiTCrossHeadQKNormRope(void* qkv, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
++    int head_dim, float eps, void const* q_weight, void const* k_weight, float const* cos_emb, float const* sin_emb,
++    bool interleave, cudaStream_t stream)
++{
++    int const q_dim = num_heads_q * head_dim;
++    int const k_dim = num_heads_k * head_dim;
++    int const total_row = (num_heads_q + num_heads_k + num_heads_v) * head_dim;
++    int const max_dim = (q_dim > k_dim) ? q_dim : k_dim;
++
++    // Block size: enough threads to cover max_dim/2 bf16x2 pairs, capped at 1024
++    int const halfDim = max_dim / 2;
++    int blockSize = 256;
++    if (halfDim > 256)
++    {
++        blockSize = 512;
++    }
++    if (halfDim > 512)
++    {
++        blockSize = 1024;
++    }
++
++    dim3 grid(num_tokens, 2); // y=0 → Q, y=1 → K
++    dim3 block(blockSize);
++
++    // rotate_half requires shared memory to stage normalized values (avoids a
++    // read/write race on partner elements in global memory); the interleaved path
++    // computes each output pair from the thread's own values and needs no smem.
++    size_t const smem_bytes = interleave ? 0 : static_cast<size_t>(max_dim) * sizeof(__nv_bfloat16);
++
++#define LAUNCH_CROSS_HEAD_KERNEL(INTERLEAVE)                                                                           \
++    fusedDiTCrossHeadQKNormRopeKernel<INTERLEAVE>                                                                      \
++        <<<grid, block, smem_bytes, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), q_dim, k_dim, total_row,          \
++            head_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),                                           \
++            reinterpret_cast<__nv_bfloat16 const*>(k_weight), cos_emb, sin_emb, num_tokens)
++
++    if (interleave)
++    {
++        LAUNCH_CROSS_HEAD_KERNEL(true);
++    }
++    else
++    {
++        LAUNCH_CROSS_HEAD_KERNEL(false);
++    }
++#undef LAUNCH_CROSS_HEAD_KERNEL
++}
++
+ } // namespace kernels
+ 
+ TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.h b/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.h
+index 0fae4bc90c70..0c249b86a352 100644
+--- a/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.h
++++ b/cpp/tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.h
+@@ -53,6 +53,27 @@ void launchFusedDiTQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], i
+     int tokens_per_batch,                // seq_len per batch element for dual-stream; 0 = flat
+     cudaStream_t stream);
+ 
++// Fused cross-head QK Normalization + RoPE for Diffusion Transformers (DiT).
++//
++// Cross-head norm: one CTA per (token, Q-or-K), CTA-level shared-memory reduction.
++// For WAN, LTX-2, and other models using full-dim QK norm.
++//
++// Features:
++//   - Precomputed cos/sin embeddings (broadcast across heads)
++//   - Interleaved or rotate_half RoPE modes
++//
++// Operates in-place on the packed QKV tensor. Only Q and K are modified;
++// V is left untouched.
++
++void launchFusedDiTCrossHeadQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
++    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps,
++    void const* q_weight,                         // [num_heads_q * head_dim]
++    void const* k_weight,                         // [num_heads_k * head_dim]
++    float const* cos_emb,                         // [num_tokens, head_dim], float32
++    float const* sin_emb,                         // [num_tokens, head_dim], float32
++    bool interleave,                              // true = interleaved pairs, false = rotate_half
++    cudaStream_t stream);
++
+ } // namespace kernels
+ 
+ TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/thop/fusedDiTQKNormRopeOp.cpp b/cpp/tensorrt_llm/thop/fusedDiTQKNormRopeOp.cpp
+index caea3976b9e9..56dadf5f4290 100644
+--- a/cpp/tensorrt_llm/thop/fusedDiTQKNormRopeOp.cpp
++++ b/cpp/tensorrt_llm/thop/fusedDiTQKNormRopeOp.cpp
+@@ -98,6 +98,55 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
+         static_cast<int>(tokens_per_batch), stream);
+ }
+ 
++// Fused cross-head QK Norm + RoPE for Diffusion Transformers.
++// Full-dim norm for WAN, LTX-2 — norm computed across all heads combined.
++void fused_dit_cross_head_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim]
++    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
++    torch::Tensor& q_weight,                               // [num_heads_q * head_dim]
++    torch::Tensor& k_weight,                               // [num_heads_k * head_dim]
++    torch::Tensor& cos_emb,                                // [num_tokens, head_dim], float32
++    torch::Tensor& sin_emb,                                // [num_tokens, head_dim], float32
++    bool interleave)
++{
++    TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
++    TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D");
++    TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D");
++    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim]");
++    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim]");
++
++    CHECK_INPUT(qkv, torch::kBFloat16);
++    CHECK_INPUT(q_weight, torch::kBFloat16);
++    CHECK_INPUT(k_weight, torch::kBFloat16);
++    CHECK_INPUT(cos_emb, torch::kFloat32);
++    CHECK_INPUT(sin_emb, torch::kFloat32);
++
++    int64_t num_tokens = qkv.size(0);
++    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
++    TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
++    TORCH_CHECK(cos_emb.size(0) == num_tokens && cos_emb.size(1) == head_dim, "cos_emb must be [num_tokens, head_dim]");
++    TORCH_CHECK(sin_emb.size(0) == num_tokens && sin_emb.size(1) == head_dim, "sin_emb must be [num_tokens, head_dim]");
++
++    int64_t q_dim = num_heads_q * head_dim;
++    int64_t k_dim = num_heads_k * head_dim;
++    TORCH_CHECK(q_weight.size(0) == q_dim,
++        "Cross-head norm requires q_weight of size [num_heads_q * head_dim]. Got: ", q_weight.size(0),
++        ", expected: ", q_dim);
++    TORCH_CHECK(k_weight.size(0) == k_dim,
++        "Cross-head norm requires k_weight of size [num_heads_k * head_dim]. Got: ", k_weight.size(0),
++        ", expected: ", k_dim);
++
++    TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even for RoPE rotate_half. Got: ", head_dim);
++    TORCH_CHECK(q_dim % 2 == 0 && k_dim % 2 == 0, "q_dim and k_dim must be even for bf16x2 vectorized access");
++
++    auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
++
++    tensorrt_llm::kernels::launchFusedDiTCrossHeadQKNormRope(qkv.data_ptr(), static_cast<int>(num_tokens),
++        static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
++        static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
++        reinterpret_cast<float const*>(cos_emb.data_ptr()), reinterpret_cast<float const*>(sin_emb.data_ptr()),
++        interleave, stream);
++}
++
+ // Register the PyTorch operator schema
+ TORCH_LIBRARY_FRAGMENT(trtllm, m)
+ {
+@@ -107,12 +156,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
+         "Tensor? q_add_weight, Tensor? k_add_weight, "
+         "Tensor cos_emb, Tensor sin_emb, SymInt num_txt_tokens, "
+         "bool interleave, SymInt tokens_per_batch) -> ()");
++    m.def(
++        "fused_dit_cross_head_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, "
++        "int head_dim, float eps, Tensor q_weight, Tensor k_weight, "
++        "Tensor cos_emb, Tensor sin_emb, bool interleave) -> ()");
+ }
+ 
+ // Register the CUDA implementation
+ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+ {
+     m.impl("fused_dit_qk_norm_rope", &fused_dit_qk_norm_rope);
++    m.impl("fused_dit_cross_head_qk_norm_rope", &fused_dit_cross_head_qk_norm_rope);
+ }
+ 
+ } // namespace torch_ext
+diff --git a/tensorrt_llm/_torch/compilation/utils.py b/tensorrt_llm/_torch/compilation/utils.py
+index 04e7cce963d0..900175931fcb 100644
+--- a/tensorrt_llm/_torch/compilation/utils.py
++++ b/tensorrt_llm/_torch/compilation/utils.py
+@@ -82,6 +82,9 @@ def inplace_info():
+         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
+             1: "qkv"
+         },
++        torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope.default: {
++            1: "qkv"
++        },
+         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
+         {
+             1: "query",
+diff --git a/tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py b/tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py
+index 633532a41d97..eca63b945807 100644
+--- a/tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py
++++ b/tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py
+@@ -280,9 +280,9 @@ def __init__(
+             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
+         )
+ 
+-        # Self-attention with fused QKV
+-        # Default fuse_qk_norm_rope=False: flashinfer QKRMSNorm is faster for WAN's
+-        # full-dim norm. User can override via config.attention.fuse_qk_norm_rope=True.
++        # Self-attention with fused QKV.
++        # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
++        # to eliminate extra global memory round-trip between separate norm and RoPE.
+         self.attn1 = Attention(
+             hidden_size=hidden_size,
+             num_attention_heads=num_heads,
+@@ -290,7 +290,7 @@ def __init__(
+             qkv_mode=QKVMode.FUSE_QKV,
+             qk_norm=True,
+             eps=eps,
+-            fuse_qk_norm_rope=False,
++            fuse_qk_norm_rope=True,
+             config=model_config,
+             layer_idx=_layer_idx,
+         )
+diff --git a/tensorrt_llm/_torch/visual_gen/modules/attention.py b/tensorrt_llm/_torch/visual_gen/modules/attention.py
+index 07f43d8899c9..815bef713cee 100644
+--- a/tensorrt_llm/_torch/visual_gen/modules/attention.py
++++ b/tensorrt_llm/_torch/visual_gen/modules/attention.py
+@@ -67,11 +67,9 @@ def __init__(
+         self.bias = bias
+ 
+         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
+-        # Default: enable for per_head norm only (FLUX). Full-dim not yet supported.
+-        if fuse_qk_norm_rope is not None:
+-            self.fuse_qk_norm_rope = fuse_qk_norm_rope
+-        else:
+-            self.fuse_qk_norm_rope = qk_norm_mode != "full"
++        # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
++        # Defaults to False; models that want the fused kernel must pass True explicitly.
++        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
+         self.interleave = interleave
+ 
+         # Select compute backend (orthogonal to parallelism)
+@@ -256,7 +254,11 @@ def apply_qk_norm_rope(
+         q_add_weight: Optional[torch.Tensor] = None,
+         k_add_weight: Optional[torch.Tensor] = None,
+     ) -> None:
+-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor."""
++        """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
++
++        Dispatches to per-head kernel (FLUX) or cross-head kernel (WAN)
++        based on qk_norm_mode.
++        """
+         cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
+         sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
+ 
+@@ -268,29 +270,44 @@ def apply_qk_norm_rope(
+         cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
+         sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
+ 
+-        # Dual-stream batch correction: when B>1 and dual-stream is active,
+-        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
+-        # local position within each batch element for the text/image boundary.
+-        # 0 = no dual-stream (single-stream or batch=1).
+-        tokens_per_batch = S if num_txt_tokens > 0 else 0
+-
+-        torch.ops.trtllm.fused_dit_qk_norm_rope(
+-            qkv_2d,
+-            self.num_attention_heads,
+-            self.num_key_value_heads,
+-            self.num_key_value_heads,
+-            self.head_dim,
+-            self.eps,
+-            self.norm_q.weight,
+-            self.norm_k.weight,
+-            q_add_weight,
+-            k_add_weight,
+-            cos_tiled,
+-            sin_tiled,
+-            num_txt_tokens,
+-            self.interleave,
+-            tokens_per_batch,
+-        )
++        if self.qk_norm_mode == "full":
++            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
++                qkv_2d,
++                self.num_attention_heads,
++                self.num_key_value_heads,
++                self.num_key_value_heads,
++                self.head_dim,
++                self.eps,
++                self.norm_q.weight,
++                self.norm_k.weight,
++                cos_tiled,
++                sin_tiled,
++                self.interleave,
++            )
++        else:
++            # Dual-stream batch correction: when B>1 and dual-stream is active,
++            # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
++            # local position within each batch element for the text/image boundary.
++            # 0 = no dual-stream (single-stream or batch=1).
++            tokens_per_batch = S if num_txt_tokens > 0 else 0
++
++            torch.ops.trtllm.fused_dit_qk_norm_rope(
++                qkv_2d,
++                self.num_attention_heads,
++                self.num_key_value_heads,
++                self.num_key_value_heads,
++                self.head_dim,
++                self.eps,
++                self.norm_q.weight,
++                self.norm_k.weight,
++                q_add_weight,
++                k_add_weight,
++                cos_tiled,
++                sin_tiled,
++                num_txt_tokens,
++                self.interleave,
++                tokens_per_batch,
++            )
+ 
+     def _attn_impl(
+         self,
+diff --git a/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit_qk_norm_rope.py b/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit_qk_norm_rope.py
+index 0b79113dadb3..2310c3d68b9a 100644
+--- a/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit_qk_norm_rope.py
++++ b/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit_qk_norm_rope.py
+@@ -465,3 +465,270 @@ def test_per_head_v_unchanged(head_dim):
+         -1,
+     )
+     torch.testing.assert_close(qkv[:, -v_size:], v_original, rtol=0, atol=0)
++
++
++# ============================================================================
++# Cross-head norm reference implementation
++# ============================================================================
++
++
++@torch.inference_mode()
++def torch_ref_cross_head(
++    qkv,
++    num_heads_q,
++    num_heads_k,
++    num_heads_v,
++    head_dim,
++    eps,
++    q_weight,
++    k_weight,
++    cos_emb,
++    sin_emb,
++    interleave,
++):
++    """Reference: cross-head (full-dim) RMSNorm + RoPE (WAN pattern)."""
++    num_tokens = qkv.shape[0]
++    q_size = num_heads_q * head_dim
++    k_size = num_heads_k * head_dim
++
++    q = qkv[:, :q_size].clone()
++    k = qkv[:, q_size : q_size + k_size].clone()
++    v = qkv[:, q_size + k_size :].clone()
++
++    # Cross-head RMSNorm: norm over the full q_dim / k_dim dimension
++    q = F.rms_norm(q.float(), (q_size,), q_weight.float(), eps).to(qkv.dtype)
++    k = F.rms_norm(k.float(), (k_size,), k_weight.float(), eps).to(qkv.dtype)
++
++    # Expand cos/sin per head for RoPE
++    cos_q = cos_emb.unsqueeze(1).expand(-1, num_heads_q, -1).reshape(num_tokens, q_size)
++    sin_q = sin_emb.unsqueeze(1).expand(-1, num_heads_q, -1).reshape(num_tokens, q_size)
++    cos_k = cos_emb.unsqueeze(1).expand(-1, num_heads_k, -1).reshape(num_tokens, k_size)
++    sin_k = sin_emb.unsqueeze(1).expand(-1, num_heads_k, -1).reshape(num_tokens, k_size)
++
++    if interleave:
++        q = _apply_interleaved_rope(q, cos_q, sin_q)
++        k = _apply_interleaved_rope(k, cos_k, sin_k)
++    else:
++        q = _apply_rotate_half_rope(q, cos_q, sin_q, head_dim, num_heads_q)
++        k = _apply_rotate_half_rope(k, cos_k, sin_k, head_dim, num_heads_k)
++
++    return torch.cat([q.to(qkv.dtype), k.to(qkv.dtype), v], dim=1)
++
++
++def _call_cross_head_kernel(
++    qkv,
++    num_heads_q,
++    num_heads_k,
++    num_heads_v,
++    head_dim,
++    eps,
++    q_weight,
++    k_weight,
++    cos_emb,
++    sin_emb,
++    interleave=True,
++):
++    """Call the fused DiT cross-head QK Norm + RoPE kernel."""
++    torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
++        qkv,
++        num_heads_q,
++        num_heads_k,
++        num_heads_v,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        interleave,
++    )
++
++
++# ============================================================================
++# Cross-head norm tests (WAN pattern)
++# ============================================================================
++
++
++@pytest.mark.parametrize(
++    "num_heads,head_dim",
++    [
++        (12, 128),  # WAN 1.3B: hidden_size=1536
++        (40, 128),  # WAN 14B: hidden_size=5120
++    ],
++)
++@pytest.mark.parametrize("num_tokens", [1, 64, 512])
++def test_cross_head_interleaved(num_heads, head_dim, num_tokens):
++    """Cross-head norm + interleaved RoPE (WAN pattern)."""
++    device = "cuda"
++    torch.random.manual_seed(42)
++
++    hidden_size = 3 * num_heads * head_dim
++    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
++    qkv_copy = qkv.clone()
++
++    q_dim = num_heads * head_dim
++    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
++
++    _call_cross_head_kernel(
++        qkv,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        interleave=True,
++    )
++
++    ref = torch_ref_cross_head(
++        qkv_copy,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        True,
++    )
++    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)
++
++
++@pytest.mark.parametrize("num_heads", [12, 40])
++@pytest.mark.parametrize("num_tokens", [1, 64, 512])
++def test_cross_head_rotate_half(num_heads, num_tokens):
++    """Cross-head norm + rotate_half RoPE."""
++    device = "cuda"
++    head_dim = 128
++    torch.random.manual_seed(42)
++
++    hidden_size = 3 * num_heads * head_dim
++    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
++    qkv_copy = qkv.clone()
++
++    q_dim = num_heads * head_dim
++    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
++
++    _call_cross_head_kernel(
++        qkv,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        interleave=False,
++    )
++
++    ref = torch_ref_cross_head(
++        qkv_copy,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        False,
++    )
++    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)
++
++
++@pytest.mark.parametrize("num_heads", [12, 40])
++def test_cross_head_v_unchanged(num_heads):
++    """Verify V is not modified by cross-head kernel."""
++    device = "cuda"
++    head_dim = 128
++    num_tokens = 64
++    hidden_size = 3 * num_heads * head_dim
++
++    torch.random.manual_seed(0)
++    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
++    v_size = num_heads * head_dim
++    v_original = qkv[:, -v_size:].clone()
++
++    q_dim = num_heads * head_dim
++    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
++    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
++    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
++
++    _call_cross_head_kernel(
++        qkv,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++    )
++    torch.testing.assert_close(qkv[:, -v_size:], v_original, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("batch_size", [2, 4])
++def test_cross_head_batched(batch_size):
++    """Cross-head norm + interleaved RoPE with batch_size > 1.
++
++    Simulates the batch-flattening done by Attention.apply_qk_norm_rope.
++    """
++    device = "cuda"
++    num_heads = 12
++    head_dim = 128
++    num_tokens = 256
++
++    torch.random.manual_seed(42)
++    total_tokens = batch_size * num_tokens
++    hidden_size = 3 * num_heads * head_dim
++    qkv = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
++    qkv_copy = qkv.clone()
++
++    q_dim = num_heads * head_dim
++    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
++    cos_single, sin_single = _generate_cos_sin(num_tokens, head_dim, device)
++    cos_emb = cos_single.repeat(batch_size, 1)
++    sin_emb = sin_single.repeat(batch_size, 1)
++
++    _call_cross_head_kernel(
++        qkv,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++    )
++
++    ref = torch_ref_cross_head(
++        qkv_copy,
++        num_heads,
++        num_heads,
++        num_heads,
++        head_dim,
++        1e-6,
++        q_weight,
++        k_weight,
++        cos_emb,
++        sin_emb,
++        True,
++    )
++    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)

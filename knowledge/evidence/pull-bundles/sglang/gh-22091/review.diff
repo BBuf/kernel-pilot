@@ -1,0 +1,3188 @@
+diff --git a/python/sglang/jit_kernel/benchmark/diffusion/bench_diffusion_nvfp4_scaled_mm.py b/python/sglang/jit_kernel/benchmark/diffusion/bench_diffusion_nvfp4_scaled_mm.py
+new file mode 100644
+index 000000000000..b6eaaf1f6834
+--- /dev/null
++++ b/python/sglang/jit_kernel/benchmark/diffusion/bench_diffusion_nvfp4_scaled_mm.py
+@@ -0,0 +1,363 @@
++import argparse
++import csv
++import json
++import os
++import re
++import statistics
++from pathlib import Path
++from typing import Any, Callable
++
++import flashinfer
++import sgl_kernel
++import torch
++
++from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.utils import is_in_ci
++
++register_cuda_ci(
++    est_time=120,
++    suite="stage-b-kernel-benchmark-1-gpu-large",
++    disabled="standalone diffusion NVFP4 benchmark",
++)
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++REPO_ROOT = (
++    Path(os.environ["SGLANG_NVFP4_REPO_ROOT"])
++    if os.environ.get("SGLANG_NVFP4_REPO_ROOT")
++    else Path(__file__).resolve().parents[5]
++)
++DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "nvfp4_benchmarks"
++DEFAULT_SHAPE_LIBRARY = SCRIPT_DIR / "diffusion_nvfp4_shapes.json"
++DTYPE = DEFAULT_DTYPE
++WARMUP = 8
++ITERS = 20
++FLOAT4_E2M1_MAX = 6.0
++FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
++METHODS = ("cutlass", "flashinfer_auto", "flashinfer_cudnn")
++
++
++def benchmark_provider(
++    fn: Callable[[], torch.Tensor],
++    warmup: int = WARMUP,
++    iters: int = ITERS,
++) -> tuple[float, float, float]:
++    for _ in range(warmup):
++        y = fn()
++        del y
++    torch.cuda.synchronize()
++
++    times_ms: list[float] = []
++    for _ in range(iters):
++        start = torch.cuda.Event(enable_timing=True)
++        end = torch.cuda.Event(enable_timing=True)
++        start.record()
++        y = fn()
++        end.record()
++        end.synchronize()
++        times_ms.append(start.elapsed_time(end))
++        del y
++    return statistics.median(times_ms), max(times_ms), min(times_ms)
++
++
++def make_global_scale(x: torch.Tensor) -> torch.Tensor:
++    max_abs = torch.amax(x.abs()).clamp_min_(1e-6)
++    return (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / max_abs).to(torch.float32)
++
++
++def build_quantized_inputs(
++    m: int,
++    n: int,
++    k: int,
++    device: torch.device,
++    seed: int,
++) -> dict[str, Any]:
++    assert k % 16 == 0, f"NVFP4 requires k % 16 == 0, got k={k}"
++
++    gen = torch.Generator(device=device)
++    gen.manual_seed(seed)
++    x = torch.randn((m, k), device=device, dtype=DTYPE, generator=gen)
++    w = torch.randn((n, k), device=device, dtype=DTYPE, generator=gen)
++
++    x_global_scale = make_global_scale(x)
++    w_global_scale = make_global_scale(w)
++    alpha = (1.0 / (x_global_scale * w_global_scale)).to(torch.float32)
++
++    x_fp4, x_sf = flashinfer.fp4_quantize(x, x_global_scale)
++    w_fp4, w_sf = flashinfer.fp4_quantize(w, w_global_scale)
++    if x_sf.dtype == torch.uint8:
++        x_sf = x_sf.view(torch.float8_e4m3fn)
++    if w_sf.dtype == torch.uint8:
++        w_sf = w_sf.view(torch.float8_e4m3fn)
++
++    return {
++        "x_fp4": x_fp4,
++        "w_fp4": w_fp4,
++        "x_sf": x_sf,
++        "w_sf": w_sf,
++        "alpha": alpha,
++    }
++
++
++def make_shape_id(
++    model: str, shape_kind: str, prefix: str, m: int, n: int, k: int
++) -> str:
++    prefix_slug = re.sub(r"[^a-zA-Z0-9]+", "_", prefix).strip("_")
++    return f"{model}_{shape_kind}_{prefix_slug}_{m}x{n}x{k}"
++
++
++def load_shape_cases(shape_library: Path) -> list[dict[str, Any]]:
++    payload = json.loads(shape_library.read_text(encoding="utf-8"))
++    if not isinstance(payload, dict) or not payload:
++        raise RuntimeError(
++            f"Expected a non-empty model->shape list mapping in {shape_library}."
++        )
++
++    rows: list[dict[str, Any]] = []
++    for model, shapes in payload.items():
++        if not isinstance(shapes, list):
++            raise RuntimeError(
++                f"Expected {model} to map to a list of shapes in {shape_library}."
++            )
++        for shape in shapes:
++            m, n, k = (int(x) for x in shape["shape"])
++            count = int(shape["count"])
++            shape_kind = str(shape.get("kind", "actual_runtime_linear"))
++            prefix = str(shape.get("prefix", ""))
++            rows.append(
++                {
++                    "shape_id": make_shape_id(model, shape_kind, prefix, m, n, k),
++                    "source_model": model,
++                    "shape_kind": shape_kind,
++                    "runtime_prefix": prefix,
++                    "m": m,
++                    "n": n,
++                    "k": k,
++                    "count": count,
++                    "approx_flops": 2 * m * n * k * count,
++                }
++            )
++
++    if not rows:
++        raise RuntimeError(f"No shapes found in {shape_library}.")
++    return rows
++
++
++def split_csv_arg(text: str | None) -> set[str]:
++    if text is None or not text.strip():
++        return set()
++    return {item.strip() for item in text.split(",") if item.strip()}
++
++
++def select_shape_cases(
++    rows: list[dict[str, Any]],
++    *,
++    models: set[str],
++    shape_kinds: set[str],
++    top_k: int,
++    rank_by: str,
++) -> list[dict[str, Any]]:
++    filtered = [
++        row
++        for row in rows
++        if (not models or row["source_model"] in models)
++        and (not shape_kinds or row["shape_kind"] in shape_kinds)
++    ]
++    key = "approx_flops" if rank_by == "flops" else "count"
++    return sorted(filtered, key=lambda row: int(row[key]), reverse=True)[:top_k]
++
++
++def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
++    with output_path.open("w", newline="", encoding="utf-8") as f:
++        writer = csv.DictWriter(
++            f,
++            fieldnames=[
++                "shape_id",
++                "source_model",
++                "shape_kind",
++                "runtime_prefix",
++                "m",
++                "n",
++                "k",
++                "count",
++                "approx_flops",
++                "method",
++                "median_ms",
++                "min_ms",
++                "max_ms",
++                "tflops",
++            ],
++        )
++        writer.writeheader()
++        writer.writerows(rows)
++
++
++def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
++    shape_rows = []
++    seen_shape_ids = set()
++    for row in rows:
++        if row["shape_id"] in seen_shape_ids:
++            continue
++        seen_shape_ids.add(row["shape_id"])
++        shape_rows.append(row)
++
++    lines: list[str] = []
++    lines.append("# Diffusion NVFP4 Scaled MM Benchmark")
++    lines.append("")
++    lines.append("## Shape Cases")
++    lines.append("")
++    lines.append("| Shape ID | Model | Shape Kind | Calls | Shape `(M,N,K)` | Prefix |")
++    lines.append("|---|---|---|---:|---|---|")
++    for row in shape_rows:
++        lines.append(
++            f"| {row['shape_id']} | {row['source_model']} | {row['shape_kind']} | {row['count']} | `({row['m']}, {row['n']}, {row['k']})` | `{row['runtime_prefix']}` |"
++        )
++    lines.append("")
++
++    for shape_row in shape_rows:
++        shape_id = shape_row["shape_id"]
++        scoped = [row for row in rows if row["shape_id"] == shape_id]
++        lines.append(f"## {shape_id}")
++        lines.append("")
++        lines.append("| Method | Median ms | TFLOPS |")
++        lines.append("|---|---:|---:|")
++        for row in sorted(scoped, key=lambda item: float(item["median_ms"])):
++            lines.append(
++                f"| {row['method']} | {float(row['median_ms']):.4f} | {float(row['tflops']):.1f} |"
++            )
++        lines.append("")
++
++    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def run_shape_suite(shape_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    device = torch.device("cuda")
++    rows: list[dict[str, Any]] = []
++    for idx, shape in enumerate(shape_cases):
++        m = int(shape["m"])
++        n = int(shape["n"])
++        k = int(shape["k"])
++        quantized = build_quantized_inputs(m, n, k, device, seed=idx)
++
++        metadata = {
++            "shape_id": str(shape["shape_id"]),
++            "source_model": str(shape["source_model"]),
++            "shape_kind": str(shape["shape_kind"]),
++            "runtime_prefix": str(shape["runtime_prefix"]),
++            "m": m,
++            "n": n,
++            "k": k,
++            "count": int(shape["count"]),
++            "approx_flops": int(shape["approx_flops"]),
++        }
++
++        providers: dict[str, Callable[[], torch.Tensor]] = {
++            "cutlass": lambda: sgl_kernel.cutlass_scaled_fp4_mm(
++                quantized["x_fp4"],
++                quantized["w_fp4"],
++                quantized["x_sf"],
++                quantized["w_sf"],
++                quantized["alpha"],
++                DTYPE,
++            ),
++            "flashinfer_auto": lambda: flashinfer.mm_fp4(
++                quantized["x_fp4"],
++                quantized["w_fp4"].T,
++                quantized["x_sf"],
++                quantized["w_sf"].T,
++                quantized["alpha"],
++                DTYPE,
++                backend="auto",
++            ),
++            "flashinfer_cudnn": lambda: flashinfer.mm_fp4(
++                quantized["x_fp4"],
++                quantized["w_fp4"].T,
++                quantized["x_sf"],
++                quantized["w_sf"].T,
++                quantized["alpha"],
++                DTYPE,
++                backend="cudnn",
++            ),
++        }
++
++        for method in METHODS:
++            median_ms, max_ms, min_ms = benchmark_provider(providers[method])
++            rows.append(
++                {
++                    **metadata,
++                    "method": method,
++                    "median_ms": median_ms,
++                    "min_ms": min_ms,
++                    "max_ms": max_ms,
++                    "tflops": (2 * m * n * k) / (median_ms / 1e3) / 1e12,
++                }
++            )
++    return rows
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description="Benchmark diffusion NVFP4 GEMM backends on the captured diffusion shape library."
++    )
++    parser.add_argument(
++        "--models",
++        help="Comma-separated source_model filter. Default: all models in the JSON shape library.",
++    )
++    parser.add_argument(
++        "--shape-kinds",
++        help="Comma-separated shape_kind filter. Default: benchmark every shape kind in the JSON shape library.",
++    )
++    parser.add_argument(
++        "--top-k",
++        type=int,
++        default=64,
++        help="Benchmark the top-k shapes after filtering and ranking.",
++    )
++    parser.add_argument(
++        "--rank-by",
++        choices=["flops", "count"],
++        default="flops",
++        help="How to rank shapes before selecting top-k.",
++    )
++    parser.add_argument(
++        "--output-dir",
++        default=str(DEFAULT_OUTPUT_DIR),
++        help="Directory for CSV/Markdown outputs.",
++    )
++    args = parser.parse_args()
++
++    if is_in_ci():
++        print("Skipping bench_diffusion_nvfp4_scaled_mm.py in CI")
++        return
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA is required for NVFP4 scaled mm benchmarks.")
++    if not DEFAULT_SHAPE_LIBRARY.exists():
++        raise RuntimeError(
++            f"Shape library not found at {DEFAULT_SHAPE_LIBRARY}. "
++            "Commit or copy the generated diffusion_nvfp4_shapes.json first."
++        )
++
++    shape_cases = load_shape_cases(DEFAULT_SHAPE_LIBRARY)
++    selected_shapes = select_shape_cases(
++        shape_cases,
++        models=split_csv_arg(args.models),
++        shape_kinds=split_csv_arg(args.shape_kinds),
++        top_k=args.top_k,
++        rank_by=args.rank_by,
++    )
++    if not selected_shapes:
++        raise RuntimeError("No shapes matched the requested filters.")
++    rows = run_shape_suite(selected_shapes)
++
++    output_dir = Path(args.output_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++    csv_path = output_dir / "diffusion_nvfp4_scaled_mm.csv"
++    md_path = output_dir / "diffusion_nvfp4_scaled_mm_summary.md"
++    write_csv(rows, csv_path)
++    write_markdown(rows, md_path)
++    print(f"Wrote {csv_path}")
++    print(f"Wrote {md_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/jit_kernel/benchmark/diffusion/bench_norm_impls.py b/python/sglang/jit_kernel/benchmark/diffusion/bench_norm_impls.py
+index 7ef8ac832d95..557157f7f773 100644
+--- a/python/sglang/jit_kernel/benchmark/diffusion/bench_norm_impls.py
++++ b/python/sglang/jit_kernel/benchmark/diffusion/bench_norm_impls.py
+@@ -1,5 +1,3 @@
+-from __future__ import annotations
+-
+ import argparse
+ import csv
+ import functools
+diff --git a/python/sglang/jit_kernel/benchmark/diffusion/diffusion_nvfp4_shapes.json b/python/sglang/jit_kernel/benchmark/diffusion/diffusion_nvfp4_shapes.json
+new file mode 100644
+index 000000000000..767c873f2394
+--- /dev/null
++++ b/python/sglang/jit_kernel/benchmark/diffusion/diffusion_nvfp4_shapes.json
+@@ -0,0 +1,2676 @@
++{
++  "flux": [
++    {
++      "shape": [
++        4608,
++        3072,
++        15360
++      ],
++      "count": 38,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4608,
++        12288,
++        3072
++      ],
++      "count": 38,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4608,
++        3072,
++        3072
++      ],
++      "count": 114,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        3072,
++        3072
++      ],
++      "count": 57,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        10240,
++        4096
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        3072,
++        3072
++      ],
++      "count": 19,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_out.*"
++    },
++    {
++      "shape": [
++        512,
++        12288,
++        4096
++      ],
++      "count": 24,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        10240
++      ],
++      "count": 24,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        3072
++      ],
++      "count": 57,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        4096
++      ],
++      "count": 24,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        3072
++      ],
++      "count": 19,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        4096
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        77,
++        3072,
++        768
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.mlp.fc1"
++    },
++    {
++      "shape": [
++        77,
++        768,
++        3072
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.mlp.fc2"
++    },
++    {
++      "shape": [
++        77,
++        2304,
++        768
++      ],
++      "count": 12,
++      "kind": "runtime_fused_qkv",
++      "prefix": "clip.layers.*.self_attn.qkv_proj"
++    },
++    {
++      "shape": [
++        4096,
++        64,
++        3072
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        3072,
++        64
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        77,
++        768,
++        768
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.self_attn.out_proj"
++    }
++  ],
++  "flux2": [
++    {
++      "shape": [
++        4608,
++        55296,
++        6144
++      ],
++      "count": 48,
++      "kind": "runtime_fused_qkv_mlp",
++      "prefix": "single_transformer_blocks.*.attn.to_qkv_mlp_proj"
++    },
++    {
++      "shape": [
++        4608,
++        6144,
++        24576
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": "single_transformer_blocks.*.attn.to_out"
++    },
++    {
++      "shape": [
++        4096,
++        36864,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.ff.linear_in"
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        18432
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.ff.linear_out"
++    },
++    {
++      "shape": [
++        4096,
++        18432,
++        6144
++      ],
++      "count": 8,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "transformer_blocks.*.attn.packed_qkv"
++    },
++    {
++      "shape": [
++        4096,
++        12288,
++        6144
++      ],
++      "count": 8,
++      "kind": "synthetic_packed_kv",
++      "prefix": "transformer_blocks.*.attn.packed_kv"
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_k"
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_out.*"
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_q"
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_v"
++    },
++    {
++      "shape": [
++        512,
++        36864,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.ff_context.linear_in"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        18432
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.ff_context.linear_out"
++    },
++    {
++      "shape": [
++        512,
++        18432,
++        6144
++      ],
++      "count": 8,
++      "kind": "synthetic_packed_added_qkv",
++      "prefix": "transformer_blocks.*.attn.packed_qkv"
++    },
++    {
++      "shape": [
++        512,
++        12288,
++        6144
++      ],
++      "count": 8,
++      "kind": "synthetic_packed_kv",
++      "prefix": "transformer_blocks.*.attn.packed_kv"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.add_k_proj"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.add_q_proj"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.add_v_proj"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        6144
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        15360
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        6144,
++        128
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        128,
++        6144
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "proj_out"
++    },
++    {
++      "shape": [
++        1,
++        36864,
++        6144
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        18432,
++        6144
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    }
++  ],
++  "helios": [
++    {
++      "shape": [
++        11040,
++        5120,
++        5120
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        11040,
++        13824,
++        5120
++      ],
++      "count": 80,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        11040,
++        5120,
++        13824
++      ],
++      "count": 80,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        11040,
++        5120,
++        5120
++      ],
++      "count": 80,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        8640,
++        5120,
++        5120
++      ],
++      "count": 80,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        8640,
++        5120,
++        5120
++      ],
++      "count": 80,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        10240,
++        4096
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        12288,
++        4096
++      ],
++      "count": 48,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        10240
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        4096
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        8640,
++        64,
++        5120
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        30720,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        256
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    }
++  ],
++  "hunyuanvideo": [
++    {
++      "shape": [
++        27085,
++        21504,
++        3072
++      ],
++      "count": 40,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.single_blocks.*.linear1"
++    },
++    {
++      "shape": [
++        27085,
++        3072,
++        15360
++      ],
++      "count": 40,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.single_blocks.*.linear2"
++    },
++    {
++      "shape": [
++        27030,
++        3072,
++        12288
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.double_blocks.*.img_mlp.*"
++    },
++    {
++      "shape": [
++        27030,
++        12288,
++        3072
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.double_blocks.*.img_mlp.*.proj"
++    },
++    {
++      "shape": [
++        27030,
++        9216,
++        3072
++      ],
++      "count": 20,
++      "kind": "runtime_fused_qkv",
++      "prefix": "Hunyuan.double_blocks.*.img_attn_qkv"
++    },
++    {
++      "shape": [
++        27030,
++        3072,
++        3072
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.double_blocks.*.img_attn_proj"
++    },
++    {
++      "shape": [
++        150,
++        28672,
++        4096
++      ],
++      "count": 32,
++      "kind": "actual_runtime_linear",
++      "prefix": "llama.layers.*.mlp.gate_up_proj"
++    },
++    {
++      "shape": [
++        150,
++        4096,
++        14336
++      ],
++      "count": 32,
++      "kind": "actual_runtime_linear",
++      "prefix": "llama.layers.*.mlp.down_proj"
++    },
++    {
++      "shape": [
++        150,
++        6144,
++        4096
++      ],
++      "count": 32,
++      "kind": "runtime_fused_qkv",
++      "prefix": "llama.layers.*.self_attn.qkv_proj"
++    },
++    {
++      "shape": [
++        150,
++        4096,
++        4096
++      ],
++      "count": 32,
++      "kind": "actual_runtime_linear",
++      "prefix": "llama.layers.*.self_attn.o_proj"
++    },
++    {
++      "shape": [
++        55,
++        12288,
++        3072
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        55,
++        3072,
++        12288
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        55,
++        9216,
++        3072
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        55,
++        3072,
++        3072
++      ],
++      "count": 20,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        27030,
++        64,
++        3072
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.final_layer.linear"
++    },
++    {
++      "shape": [
++        55,
++        3072,
++        12288
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.refiner_blocks.*.mlp.*"
++    },
++    {
++      "shape": [
++        55,
++        12288,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.refiner_blocks.*.mlp.*.proj"
++    },
++    {
++      "shape": [
++        55,
++        9216,
++        3072
++      ],
++      "count": 2,
++      "kind": "runtime_fused_qkv",
++      "prefix": "Hunyuan.txt_in.refiner_blocks.*.self_attn_qkv"
++    },
++    {
++      "shape": [
++        1,
++        18432,
++        3072
++      ],
++      "count": 40,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        46,
++        3072,
++        768
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.mlp.fc1"
++    },
++    {
++      "shape": [
++        46,
++        768,
++        3072
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.mlp.fc2"
++    },
++    {
++      "shape": [
++        1,
++        9216,
++        3072
++      ],
++      "count": 40,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        55,
++        3072,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.refiner_blocks.*.self_attn_proj"
++    },
++    {
++      "shape": [
++        46,
++        2304,
++        768
++      ],
++      "count": 12,
++      "kind": "runtime_fused_qkv",
++      "prefix": "clip.layers.*.self_attn.qkv_proj"
++    },
++    {
++      "shape": [
++        55,
++        3072,
++        4096
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.input_embedder"
++    },
++    {
++      "shape": [
++        46,
++        768,
++        768
++      ],
++      "count": 12,
++      "kind": "actual_runtime_linear",
++      "prefix": "clip.layers.*.self_attn.out_proj"
++    },
++    {
++      "shape": [
++        1,
++        6144,
++        3072
++      ],
++      "count": 3,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        3072
++      ],
++      "count": 3,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        4096
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.c_embedder.*.proj"
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        3072
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.txt_in.c_embedder.*"
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        3072
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.vector_in.*"
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        256
++      ],
++      "count": 3,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        1,
++        3072,
++        768
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": "Hunyuan.vector_in.*.proj"
++    }
++  ],
++  "ltx": [
++    {
++      "shape": [
++        6144,
++        4096,
++        4096
++      ],
++      "count": 384,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        4096,
++        16384
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        16384,
++        4096
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        4096,
++        4096
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        2048,
++        4096
++      ],
++      "count": 288,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        4096,
++        2048
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1024,
++        4096,
++        4096
++      ],
++      "count": 194,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1024,
++        2048,
++        2048
++      ],
++      "count": 194,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        2048,
++        2048
++      ],
++      "count": 672,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        2048,
++        8192
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        8192,
++        2048
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        2048,
++        2048
++      ],
++      "count": 288,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1024,
++        4096,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1024,
++        2048,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        128,
++        4096
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        6144,
++        4096,
++        128
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        24576,
++        4096
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        4096,
++        4096
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        16384,
++        4096
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        128,
++        2048
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        126,
++        2048,
++        128
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        12288,
++        2048
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        2048,
++        2048
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        8192,
++        2048
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        4096,
++        256
++      ],
++      "count": 6,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        2048,
++        256
++      ],
++      "count": 6,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    }
++  ],
++  "mova-720p": [
++    {
++      "shape": [
++        44100,
++        5120,
++        5120
++      ],
++      "count": 3040,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        44100,
++        5120,
++        5120
++      ],
++      "count": 1760,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        44100,
++        13824,
++        5120
++      ],
++      "count": 640,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        44100,
++        5120,
++        13824
++      ],
++      "count": 640,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        44100,
++        1536,
++        5120
++      ],
++      "count": 960,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 1280,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        2560,
++        4096
++      ],
++      "count": 384,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        4096
++      ],
++      "count": 192,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        1536,
++        1536
++      ],
++      "count": 960,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        2560
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        176400,
++        64,
++        5120
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        101,
++        5120,
++        1536
++      ],
++      "count": 960,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        101,
++        8960,
++        1536
++      ],
++      "count": 480,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        101,
++        1536,
++        8960
++      ],
++      "count": 480,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        101,
++        1536,
++        1536
++      ],
++      "count": 2400,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        1024
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        101,
++        1536,
++        1536
++      ],
++      "count": 1440,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        512,
++        1536,
++        4096
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        512,
++        1536,
++        1536
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        30720,
++        5120
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        403,
++        128,
++        1536
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        5120
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        9216,
++        1536
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        1536,
++        1536
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        256
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        1,
++        1536,
++        256
++      ],
++      "count": 16,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    }
++  ],
++  "qwen": [
++    {
++      "shape": [
++        4096,
++        3072,
++        3072
++      ],
++      "count": 720,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        3072,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_out.*"
++    },
++    {
++      "shape": [
++        47,
++        3072,
++        3072
++      ],
++      "count": 360,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        19,
++        3072,
++        3072
++      ],
++      "count": 360,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        47,
++        3072,
++        3072
++      ],
++      "count": 120,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        19,
++        3072,
++        3072
++      ],
++      "count": 120,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        1,
++        18432,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.img_mod"
++    },
++    {
++      "shape": [
++        1,
++        18432,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.txt_mod"
++    }
++  ],
++  "qwen-edit": [
++    {
++      "shape": [
++        8308,
++        3072,
++        3072
++      ],
++      "count": 720,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        8308,
++        3072,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_out.*"
++    },
++    {
++      "shape": [
++        195,
++        3072,
++        3072
++      ],
++      "count": 360,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        189,
++        3072,
++        3072
++      ],
++      "count": 360,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        195,
++        3072,
++        3072
++      ],
++      "count": 120,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        189,
++        3072,
++        3072
++      ],
++      "count": 120,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.attn.to_add_out"
++    },
++    {
++      "shape": [
++        2,
++        18432,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.img_mod"
++    },
++    {
++      "shape": [
++        1,
++        18432,
++        3072
++      ],
++      "count": 240,
++      "kind": "actual_runtime_linear",
++      "prefix": "transformer_blocks.*.txt_mod"
++    }
++  ],
++  "wan-i2v": [
++    {
++      "shape": [
++        15792,
++        15360,
++        5120
++      ],
++      "count": 320,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "blocks.*.attn1.packed_qkv"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        13824
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*"
++    },
++    {
++      "shape": [
++        15792,
++        13824,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*.proj"
++    },
++    {
++      "shape": [
++        15792,
++        10240,
++        5120
++      ],
++      "count": 320,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn1.packed_kv"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_k"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_out.*"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_q"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_v"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_out.*"
++    },
++    {
++      "shape": [
++        15792,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_q"
++    },
++    {
++      "shape": [
++        512,
++        10240,
++        5120
++      ],
++      "count": 320,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn2.packed_kv"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_k"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 320,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_v"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 384,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        4096
++      ],
++      "count": 192,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        5120
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        2048
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        31584,
++        64,
++        5120
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "proj_out"
++    },
++    {
++      "shape": [
++        1,
++        30720,
++        5120
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        5120
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        256
++      ],
++      "count": 8,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    }
++  ],
++  "wan-t2v": [
++    {
++      "shape": [
++        37800,
++        15360,
++        5120
++      ],
++      "count": 160,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "blocks.*.attn1.packed_qkv"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        13824
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*"
++    },
++    {
++      "shape": [
++        37800,
++        13824,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*.proj"
++    },
++    {
++      "shape": [
++        37800,
++        10240,
++        5120
++      ],
++      "count": 160,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn1.packed_kv"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_k"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_out.*"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_q"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_v"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_out.*"
++    },
++    {
++      "shape": [
++        37800,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_q"
++    },
++    {
++      "shape": [
++        512,
++        10240,
++        5120
++      ],
++      "count": 160,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn2.packed_kv"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 384,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        4096
++      ],
++      "count": 192,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_k"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 160,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_v"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        5120
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        2048
++      ],
++      "count": 192,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        75600,
++        64,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "proj_out"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        512,
++        5120,
++        4096
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        1,
++        30720,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        5120
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        1,
++        5120,
++        256
++      ],
++      "count": 4,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    }
++  ],
++  "wan-ti2v": [
++    {
++      "shape": [
++        18144,
++        3072,
++        14336
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*"
++    },
++    {
++      "shape": [
++        18144,
++        14336,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.ffn.net.*.proj"
++    },
++    {
++      "shape": [
++        18144,
++        9216,
++        3072
++      ],
++      "count": 60,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "blocks.*.attn1.packed_qkv"
++    },
++    {
++      "shape": [
++        18144,
++        6144,
++        3072
++      ],
++      "count": 60,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn1.packed_kv"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_k"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_out.*"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_q"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn1.to_v"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_out.*"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_q"
++    },
++    {
++      "shape": [
++        512,
++        10240,
++        4096
++      ],
++      "count": 96,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        18144,
++        18432,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        12288,
++        4096
++      ],
++      "count": 48,
++      "kind": "runtime_fused_qkv",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.qkv_proj"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        10240
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        3072
++      ],
++      "count": 60,
++      "kind": "synthetic_packed_kv",
++      "prefix": "blocks.*.attn2.packed_kv"
++    },
++    {
++      "shape": [
++        512,
++        4096,
++        4096
++      ],
++      "count": 48,
++      "kind": "actual_runtime_linear",
++      "prefix": ".encoder.blocks.*.self_attn.SelfAttention.o_proj"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_k"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        3072
++      ],
++      "count": 60,
++      "kind": "actual_runtime_linear",
++      "prefix": "blocks.*.attn2.to_v"
++    },
++    {
++      "shape": [
++        18144,
++        3072,
++        256
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        18144,
++        192,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "proj_out"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        4096
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "0.proj"
++    },
++    {
++      "shape": [
++        512,
++        3072,
++        3072
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "2"
++    }
++  ],
++  "zimage": [
++    {
++      "shape": [
++        4128,
++        20480,
++        3840
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4128,
++        11520,
++        3840
++      ],
++      "count": 30,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "layers.*.attention.packed_qkv"
++    },
++    {
++      "shape": [
++        4128,
++        3840,
++        10240
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4128,
++        7680,
++        3840
++      ],
++      "count": 30,
++      "kind": "synthetic_packed_kv",
++      "prefix": "layers.*.attention.packed_kv"
++    },
++    {
++      "shape": [
++        4128,
++        3840,
++        3840
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": "layers.*.attention.to_k"
++    },
++    {
++      "shape": [
++        4128,
++        3840,
++        3840
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": "layers.*.attention.to_out.*"
++    },
++    {
++      "shape": [
++        4128,
++        3840,
++        3840
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": "layers.*.attention.to_q"
++    },
++    {
++      "shape": [
++        4128,
++        3840,
++        3840
++      ],
++      "count": 30,
++      "kind": "actual_runtime_linear",
++      "prefix": "layers.*.attention.to_v"
++    },
++    {
++      "shape": [
++        512,
++        19456,
++        2560
++      ],
++      "count": 36,
++      "kind": "actual_runtime_linear",
++      "prefix": "qwen3.layers.*.mlp.gate_up_proj"
++    },
++    {
++      "shape": [
++        4096,
++        20480,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        2560,
++        9728
++      ],
++      "count": 36,
++      "kind": "actual_runtime_linear",
++      "prefix": "qwen3.layers.*.mlp.down_proj"
++    },
++    {
++      "shape": [
++        4096,
++        11520,
++        3840
++      ],
++      "count": 2,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "noise_refiner.*.attention.packed_qkv"
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        10240
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        512,
++        6144,
++        2560
++      ],
++      "count": 36,
++      "kind": "runtime_fused_qkv",
++      "prefix": "qwen3.layers.*.self_attn.qkv_proj"
++    },
++    {
++      "shape": [
++        4096,
++        7680,
++        3840
++      ],
++      "count": 2,
++      "kind": "synthetic_packed_kv",
++      "prefix": "noise_refiner.*.attention.packed_kv"
++    },
++    {
++      "shape": [
++        512,
++        2560,
++        4096
++      ],
++      "count": 36,
++      "kind": "actual_runtime_linear",
++      "prefix": "qwen3.layers.*.self_attn.o_proj"
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "noise_refiner.*.attention.to_k"
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "noise_refiner.*.attention.to_out.*"
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "noise_refiner.*.attention.to_q"
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "noise_refiner.*.attention.to_v"
++    },
++    {
++      "shape": [
++        32,
++        20480,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        32,
++        11520,
++        3840
++      ],
++      "count": 2,
++      "kind": "synthetic_packed_qkv",
++      "prefix": "context_refiner.*.attention.packed_qkv"
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        10240
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        32,
++        7680,
++        3840
++      ],
++      "count": 2,
++      "kind": "synthetic_packed_kv",
++      "prefix": "context_refiner.*.attention.packed_kv"
++    },
++    {
++      "shape": [
++        4128,
++        64,
++        3840
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        4096,
++        3840,
++        64
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "context_refiner.*.attention.to_k"
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "context_refiner.*.attention.to_out.*"
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "context_refiner.*.attention.to_q"
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        3840
++      ],
++      "count": 2,
++      "kind": "actual_runtime_linear",
++      "prefix": "context_refiner.*.attention.to_v"
++    },
++    {
++      "shape": [
++        32,
++        3840,
++        2560
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        15360,
++        256
++      ],
++      "count": 32,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        3840,
++        256
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        256,
++        1024
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    },
++    {
++      "shape": [
++        1,
++        1024,
++        256
++      ],
++      "count": 1,
++      "kind": "actual_runtime_linear",
++      "prefix": ""
++    }
++  ]
++}
+diff --git a/python/sglang/multimodal_gen/envs.py b/python/sglang/multimodal_gen/envs.py
+index ff9c5b9acf92..3ff53deb4cb5 100644
+--- a/python/sglang/multimodal_gen/envs.py
++++ b/python/sglang/multimodal_gen/envs.py
+@@ -277,6 +277,7 @@ def _getter():
+     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
+         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
+     ),
++    # FlashInfer FP4 GEMM backend for the generic diffusion NVFP4 fallback.
+     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
+         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+     ),
+diff --git a/python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py b/python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py
+index 23c60043ed2e..2d738de2582c 100644
+--- a/python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py
++++ b/python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py
+@@ -20,7 +20,6 @@
+     _patch_nunchaku_scales,
+ )
+ from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+-from sglang.multimodal_gen.runtime.platforms import current_platform
+ from sglang.multimodal_gen.runtime.server_args import ServerArgs
+ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+@@ -134,14 +133,6 @@ def _maybe_adjust_flux2_nvfp4_fallback_defaults(
+         if quant_name != "modelopt_fp4":
+             return
+ 
+-        use_best_perf_kit = getattr(
+-            current_platform,
+-            "should_use_modelopt_fp4_best_performance_kit",
+-            None,
+-        )
+-        if callable(use_best_perf_kit) and use_best_perf_kit():
+-            return
+-
+         weights_path = os.path.basename(server_args.transformer_weights_path or "")
+         if not weights_path.endswith("-mixed.safetensors") or server_args.tp_size <= 1:
+             return
+@@ -150,10 +141,10 @@ def _maybe_adjust_flux2_nvfp4_fallback_defaults(
+             server_args.dit_cpu_offload = False
+             server_args.text_encoder_cpu_offload = False
+             logger.warning(
+-                "FLUX.2 mixed NVFP4 is using the generic ModelOpt FP4 fallback with "
+-                "tp_size=%d; disabling dit/text-encoder CPU offload to avoid TP "
+-                "all-gather launch failures. Override the offload flags explicitly if "
+-                "you need the old behavior.",
++                "FLUX.2 mixed NVFP4 is using the ModelOpt FP4 path with tp_size=%d; "
++                "disabling dit/text-encoder CPU offload to avoid TP all-gather "
++                "launch failures. Override the offload flags explicitly if you need "
++                "the old behavior.",
+                 server_args.tp_size,
+             )
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/platforms/cuda.py b/python/sglang/multimodal_gen/runtime/platforms/cuda.py
+index 085a8bf3b38e..f729292752f8 100644
+--- a/python/sglang/multimodal_gen/runtime/platforms/cuda.py
++++ b/python/sglang/multimodal_gen/runtime/platforms/cuda.py
+@@ -122,15 +122,25 @@ def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+ 
+     @classmethod
+     @lru_cache(maxsize=1)
+-    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+-        if cls.is_blackwell():
+-            try:
+-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
++    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
++        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
++        if backend is None:
++            return "cudnn" if cls.is_blackwell() else "auto"
+ 
+-                return flashinfer_mm_fp4, "cudnn"
+-            except ImportError:
+-                pass
++        backend = backend.lower()
++        if backend not in {"auto", "cudnn"}:
++            logger.warning(
++                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
++                "Falling back to %r.",
++                backend,
++                "cudnn" if cls.is_blackwell() else "auto",
++            )
++            return "cudnn" if cls.is_blackwell() else "auto"
++        return backend
+ 
++    @classmethod
++    @lru_cache(maxsize=1)
++    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+         try:
+             from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+ 
+@@ -141,7 +151,7 @@ def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+         try:
+             from flashinfer import mm_fp4 as flashinfer_mm_fp4
+ 
+-            return flashinfer_mm_fp4, "auto"
++            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+         except ImportError:
+             return None, None
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/platforms/interface.py b/python/sglang/multimodal_gen/runtime/platforms/interface.py
+index 67ec6faf0348..594f9fbd7323 100644
+--- a/python/sglang/multimodal_gen/runtime/platforms/interface.py
++++ b/python/sglang/multimodal_gen/runtime/platforms/interface.py
+@@ -208,20 +208,8 @@ def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+         return None, None
+ 
+     @classmethod
+-    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
+-        return False
+-
+-    @classmethod
+-    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+-        return False
+-
+-    @classmethod
+-    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+-        return False
+-
+-    @classmethod
+-    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
+-        pass
++    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
++        return "auto"
+ 
+     @classmethod
+     def get_local_torch_device(cls) -> torch.device:

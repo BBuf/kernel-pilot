@@ -1,0 +1,607 @@
+diff --git a/examples/auto_deploy/model_registry/configs/gemma4_moe.yaml b/examples/auto_deploy/model_registry/configs/gemma4_moe.yaml
+index d31ba340bc9f..5e0a30d1b15e 100644
+--- a/examples/auto_deploy/model_registry/configs/gemma4_moe.yaml
++++ b/examples/auto_deploy/model_registry/configs/gemma4_moe.yaml
+@@ -26,3 +26,5 @@ transforms:
+     enabled: true
+   fuse_gemms:
+     enabled: true
++  multi_stream_moe:
++    enabled: true
+diff --git a/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py b/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
+index 5d7a9aa276a9..d2ebbdc7643b 100644
+--- a/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
++++ b/tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py
+@@ -345,6 +345,22 @@ def prepare(self) -> None:
+         gm = GraphModule(model, copy.deepcopy(model.graph))
+ 
+         self.split_info = split_graph_at_dynamic_ops(gm)
++
++        # When multi-stream transforms reclassify ALL static partitions as
++        # dynamic (e.g. multi_stream_moe + multi_stream_mla_attn on every
++        # layer), there are zero capturable static segments.  Piecewise CUDA
++        # graphs are impossible — fall back to eager execution for
++        # prefill/mixed batches (monolithic CG still handles decode).
++        if not self.split_info.static_submod_indices:
++            ad_logger.warning(
++                "PiecewiseCapturedGraph: no static partitions after splitting "
++                "(%d dynamic). Piecewise CUDA graphs disabled — prefill/mixed "
++                "batches will run eagerly.",
++                len(self.split_info.dynamic_submod_indices),
++            )
++            self._is_prepared = True
++            return
++
+         self.split_gm = self.split_info.split_gm
+ 
+         graph_pool = torch.cuda.graph_pool_handle()
+@@ -408,6 +424,17 @@ def prepare(self) -> None:
+             self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
+         )
+         current_static_runner: Optional[ADPiecewiseRunner] = None
++        # Fallback runner: the first available static runner.  When
++        # multi-stream transforms reclassify the initial static partition(s)
++        # as dynamic (e.g. record_event_passthrough from multi_stream_mla_attn)
++        # AND the static partitions between metadata-prep and attention have
++        # no CUDA ops (skipped), there is no *preceding* static runner for the
++        # first attention op.  In that case we fall back to the nearest
++        # *following* static runner — any runner in the shared graph pool can
++        # host the pre-allocated output buffer.
++        fallback_runner: Optional[ADPiecewiseRunner] = None
++        if runner_by_idx:
++            fallback_runner = runner_by_idx[min(runner_by_idx)]
+         num_metadata_wrapped = 0
+         for idx in all_submod_indices:
+             if idx in runner_by_idx:
+@@ -430,15 +457,23 @@ def prepare(self) -> None:
+                         )
+                     continue
+ 
+-                assert current_static_runner is not None, (
+-                    f"Dynamic {submod_name} has no preceding static runner — "
++                effective_runner = current_static_runner or fallback_runner
++                assert effective_runner is not None, (
++                    f"Dynamic {submod_name} has no static runner available — "
+                     f"cannot allocate out= buffer for stable output addresses"
+                 )
++                if current_static_runner is None:
++                    ad_logger.info(
++                        "PiecewiseCapturedGraph: %s has no preceding static "
++                        "runner, using fallback runner (submod_%d)",
++                        submod_name,
++                        min(runner_by_idx),
++                    )
+ 
+                 _inject_out_param(submod)
+                 wrapper = DynamicOpWrapper(
+                     submod,
+-                    preceding_runner=current_static_runner,
++                    preceding_runner=effective_runner,
+                     dynamic_submod_id=idx,
+                 )
+                 setattr(self.split_gm, submod_name, wrapper)
+diff --git a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
+index e5d87e78e2cd..94338e86e536 100644
+--- a/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
++++ b/tensorrt_llm/_torch/auto_deploy/compile/piecewise_utils.py
+@@ -85,6 +85,20 @@
+     "auto_deploy::cuda_cached_causal_conv1d",
+ ]
+ 
++# Multi-stream passthrough functions that switch the CUDA current stream.
++# Static partitions containing these functions cannot be captured as CUDA
++# graphs because the host-side stream synchronization required for
++# correctness (caller_stream.synchronize) is not capturable.  Such
++# partitions are reclassified as dynamic so they run eagerly.
++_STREAM_SWITCH_FUNCTION_NAMES = frozenset(
++    {
++        "begin_aux_stream_passthrough",
++        "end_aux_stream_passthrough",
++        "wait_aux_stream_passthrough",
++        "record_event_passthrough",
++    }
++)
++
+ 
+ def _get_all_dynamic_op_names() -> Set[str]:
+     """Return the full set of dynamic op qualified names."""
+@@ -192,11 +206,17 @@ def needs_out_buffer(submod: nn.Module) -> bool:
+ 
+     Inplace ops (mutate input, return None) don't produce new tensors.
+     Metadata prep ops are handled by MetadataWrapper (stable output addresses).
+-    Both are skipped — only attention/SSM/delta/logits ops need out= buffers.
++    Multi-stream partitions reclassified as dynamic run eagerly and manage
++    their own output tensors — they do not need out= buffers.
++    All of these are skipped — only attention/SSM/delta/logits ops need out= buffers.
+     """
+     if not isinstance(submod, GraphModule):
+         return True
+ 
++    # Multi-stream partitions (reclassified from static) do not need out= buffers.
++    if _submod_has_stream_switch(submod):
++        return False
++
+     for node in submod.graph.nodes:
+         if node.op == "call_function" and is_dynamic_cached_op(node):
+             op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
+@@ -231,6 +251,16 @@ def is_metadata_prep(submod: nn.Module) -> bool:
+ # ---------------------------------------------------------------------------
+ 
+ 
++def _submod_has_stream_switch(submod: GraphModule) -> bool:
++    """Return True if *submod* contains a multi-stream passthrough function."""
++    for node in submod.graph.nodes:
++        if node.op == "call_function":
++            func_name = getattr(node.target, "__name__", "")
++            if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
++                return True
++    return False
++
++
+ @dataclass
+ class SplitInfo:
+     """Metadata about a split GraphModule."""
+@@ -317,6 +347,26 @@ def partition_fn(node: Node) -> int:
+ 
+     submod_names.sort(key=lambda n: int(n.split("_")[1]))
+ 
++    # Reclassify static partitions that contain multi-stream passthrough
++    # functions as dynamic.  These partitions switch the CUDA current stream
++    # at runtime, which requires a host-side caller_stream.synchronize() for
++    # correctness with MLIR-fused Triton kernels.  Since synchronize() cannot
++    # be called during CUDA graph capture, such partitions must run eagerly.
++    num_reclassified = 0
++    for name in submod_names:
++        pid = int(name.split("_")[1])
++        if pid in dynamic_partitions:
++            continue
++        submod = getattr(split_gm, name)
++        if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
++            dynamic_partitions.add(pid)
++            num_reclassified += 1
++    if num_reclassified:
++        ad_logger.info(
++            f"Piecewise split: reclassified {num_reclassified} static partition(s) "
++            "as dynamic (contain multi-stream passthrough ops)"
++        )
++
+     dynamic_indices = []
+     static_indices = []
+     for name in submod_names:
+diff --git a/tensorrt_llm/_torch/auto_deploy/transform/library/gather_logits_before_lm_head.py b/tensorrt_llm/_torch/auto_deploy/transform/library/gather_logits_before_lm_head.py
+index bb30e1a2dac7..cb72a44a7b69 100644
+--- a/tensorrt_llm/_torch/auto_deploy/transform/library/gather_logits_before_lm_head.py
++++ b/tensorrt_llm/_torch/auto_deploy/transform/library/gather_logits_before_lm_head.py
+@@ -62,12 +62,21 @@ def _apply(
+             node_to_gather = lm_head_node.all_input_nodes[0]
+             self._log_info(f"Found LM head node: {lm_head_node.name}")
+         else:
+-            # Walk backward through elementwise/unary ops (e.g. softcapping: div, tanh, mul)
+-            # to find the actual lm_head linear node.
++            # Walk backward through SINGLE-INPUT elementwise/unary ops
++            # (e.g. Gemma4 softcapping: linear → div → tanh → mul) to find the
++            # actual lm_head linear node.  Only follow nodes that have exactly
++            # one tensor input to avoid branching into the model body (e.g.
++            # residual adds, fused allreduce+norm ops).
+             current = lm_head_node
+             while current is not None and not is_linear_op(current):
+-                inputs = current.all_input_nodes
+-                current = inputs[0] if len(inputs) >= 1 else None
++                tensor_inputs = [n for n in current.all_input_nodes if n.op != "get_attr"]
++                if len(tensor_inputs) != 1:
++                    # Multi-input or no-input node — stop walking; the lm_head
++                    # is not in this graph (common for VLMs where only the text
++                    # backbone is exported and the lm_head is applied externally).
++                    current = None
++                    break
++                current = tensor_inputs[0]
+ 
+             if current is not None and is_linear_op(current):
+                 node_to_gather = current.all_input_nodes[0]
+@@ -76,7 +85,10 @@ def _apply(
+                 )
+             else:
+                 node_to_gather = lm_head_node
+-                self._log_info("lm_head node is not linear, using it as the node to gather")
++                self._log_info(
++                    f"lm_head linear not in graph; inserting gather before "
++                    f"output node ({lm_head_node.name})"
++                )
+ 
+         # Add logits_gather_mask as input in the graph and the sequence info interface
+         logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "token_gather_indices")
+diff --git a/tensorrt_llm/_torch/auto_deploy/utils/multi_stream_utils.py b/tensorrt_llm/_torch/auto_deploy/utils/multi_stream_utils.py
+index 2c7b17da9030..2c1601c05e97 100644
+--- a/tensorrt_llm/_torch/auto_deploy/utils/multi_stream_utils.py
++++ b/tensorrt_llm/_torch/auto_deploy/utils/multi_stream_utils.py
+@@ -156,6 +156,19 @@ def begin_aux_stream_passthrough(
+     # which is NOT ``torch.cuda.default_stream()``.
+     caller_stream = torch.cuda.current_stream(device)
+     cuda_stream_manager._caller_streams[device] = caller_stream
++    # Synchronize the caller stream before switching to aux.  The GPU-side
++    # event wait (aux_stream.wait_event) alone is NOT sufficient when
++    # MLIR-generated Triton kernels precede this point: their interaction
++    # with PyTorch's CUDA caching allocator can cause the allocator to
++    # recycle memory that the aux stream still needs, leading to illegal
++    # memory accesses or silent data corruption.  A CPU-side synchronize
++    # ensures all caller-stream GPU work has retired before aux-stream
++    # allocations begin.
++    # NOTE: this cannot be called during CUDA graph capture.  The cudagraph
++    # path must rely on event-based sync only; a separate fix is needed
++    # there (see TRTLLM multi_stream_moe + MLIR tracking).
++    if not torch.cuda.is_current_stream_capturing():
++        caller_stream.synchronize()
+     # Record where the caller's stream has reached so aux knows when data is ready.
+     main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
+     main_event.record(caller_stream)
+diff --git a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
+index c9a9ac6eadeb..3735a9057237 100644
+--- a/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
++++ b/tests/unittest/auto_deploy/singlegpu/compile/test_piecewise_utils.py
+@@ -27,9 +27,19 @@
+     _CACHED_SSM_OPS,
+     _LOGITS_GATHER_OPS,
+     _METADATA_PREP_OPS,
++    _PERSISTENT_BUFFER_OPS,
++    _STREAM_SWITCH_FUNCTION_NAMES,
+     _get_all_dynamic_op_names,
++    _submod_has_stream_switch,
+     is_dynamic_cached_op,
++    needs_out_buffer,
+     split_graph_at_dynamic_ops,
++    submod_has_cuda_ops,
++)
++from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
++    begin_aux_stream_passthrough,
++    end_aux_stream_passthrough,
++    wait_aux_stream_passthrough,
+ )
+ 
+ # ============================================================================
+@@ -103,6 +113,48 @@ def _build_graphmodule_with_ops(dynamic_op_names=None):
+     return gm
+ 
+ 
++def _build_graphmodule_with_stream_switch_ops(dynamic_op_names=None):
++    """Build a GraphModule with a dynamic op followed by a static region containing stream-switch ops.
++
++    The graph simulates a piecewise-split scenario where attention (dynamic) is
++    followed by a MoE layer with multi-stream passthrough functions:
++
++        x -> relu -> [dyn_op_0] -> relu -> begin_aux -> relu -> end_aux -> relu -> output
++
++    The region after the dynamic op contains begin_aux and end_aux, which should
++    cause that static partition to be reclassified as dynamic.
++    """
++    if dynamic_op_names is None:
++        dynamic_op_names = []
++
++    graph = Graph()
++    x = graph.placeholder("x")
++
++    relu_node = graph.call_function(torch.relu, args=(x,))
++    prev = relu_node
++
++    # Insert dynamic ops (e.g., attention)
++    for idx, dyn_name in enumerate(dynamic_op_names):
++        fake_target = _FakeOpOverload(dyn_name)
++        dyn_node = graph.create_node(
++            "call_function", fake_target, args=(prev,), name=f"dyn_op_{idx}"
++        )
++        relu_after = graph.call_function(torch.relu, args=(dyn_node,))
++        prev = relu_after
++
++    # Static region with stream-switch ops (simulates multi_stream_moe transform output)
++    begin_node = graph.call_function(begin_aux_stream_passthrough, args=(prev,))
++    shared_expert = graph.call_function(torch.relu, args=(begin_node,))
++    end_node = graph.call_function(end_aux_stream_passthrough, args=(shared_expert,))
++    post = graph.call_function(torch.relu, args=(end_node,))
++
++    graph.output(post)
++
++    root = nn.Module()
++    gm = GraphModule(root, graph)
++    return gm
++
++
+ # ============================================================================
+ # Tests for is_dynamic_cached_op
+ # ============================================================================
+@@ -255,3 +307,202 @@ def test_split_submodules_are_named_correctly(self):
+ 
+         for i in range(info.num_submodules):
+             assert hasattr(info.split_gm, f"submod_{i}"), f"Missing submod_{i}"
++
++    def test_stream_switch_partition_reclassified_as_dynamic(self):
++        """Static partitions containing stream-switch ops should be reclassified as dynamic."""
++        gm = _build_graphmodule_with_stream_switch_ops(
++            dynamic_op_names=["auto_deploy::flashinfer_attention_mha_with_cache"],
++        )
++        info = split_graph_at_dynamic_ops(gm)
++
++        # The split should have: static (relu) | dynamic (attn) | dynamic (reclassified:
++        # relu + begin_aux + relu + end_aux + relu) | — but the exact layout depends
++        # on the partition numbering.  Just check that the stream-switch partition ended
++        # up in the dynamic list.
++        assert len(info.dynamic_submod_indices) >= 2, (
++            f"Expected at least 2 dynamic partitions (1 attention + 1 reclassified), "
++            f"got {len(info.dynamic_submod_indices)}"
++        )
++
++        # Verify the reclassified partition contains a stream-switch op
++        found_reclassified = False
++        for idx in info.dynamic_submod_indices:
++            submod = getattr(info.split_gm, f"submod_{idx}")
++            if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
++                found_reclassified = True
++                break
++        assert found_reclassified, (
++            "No reclassified stream-switch partition found in dynamic indices"
++        )
++
++    def test_no_stream_switch_ops_no_reclassification(self):
++        """Partitions without stream-switch ops should remain static."""
++        gm = _build_graphmodule_with_ops(
++            dynamic_op_names=["auto_deploy::flashinfer_attention_mha_with_cache"]
++        )
++        info = split_graph_at_dynamic_ops(gm)
++
++        # Only 1 dynamic partition (the attention op itself)
++        assert len(info.dynamic_submod_indices) == 1
++
++
++# ============================================================================
++# Tests for stream-switch detection and needs_out_buffer
++# ============================================================================
++
++
++class TestStreamSwitchDetection:
++    """Tests for _submod_has_stream_switch and needs_out_buffer with reclassified partitions."""
++
++    def test_stream_switch_not_individually_dynamic(self):
++        """Stream-switch functions are NOT individually dynamic ops.
++
++        They are detected at the partition level via _submod_has_stream_switch,
++        and the *entire containing partition* is reclassified as dynamic by
++        split_graph_at_dynamic_ops.  This test documents the design: individual
++        passthrough functions do not match is_dynamic_cached_op.
++        """
++        for func in (
++            begin_aux_stream_passthrough,
++            end_aux_stream_passthrough,
++            wait_aux_stream_passthrough,
++        ):
++            node = _make_mock_node("call_function", target=func)
++            assert is_dynamic_cached_op(node) is False, (
++                f"{func.__name__} should NOT be individually dynamic — "
++                "the partition-level reclassification handles it"
++            )
++
++    def test_submod_has_stream_switch_positive(self):
++        """_submod_has_stream_switch returns True for submodules with passthrough ops."""
++        graph = Graph()
++        x = graph.placeholder("x")
++        # Insert a begin_aux_stream_passthrough call
++        node = graph.call_function(begin_aux_stream_passthrough, args=(x,))
++        graph.output(node)
++        gm = GraphModule(nn.Module(), graph)
++        assert _submod_has_stream_switch(gm) is True
++
++    def test_submod_has_stream_switch_negative(self):
++        """_submod_has_stream_switch returns False for submodules without passthrough ops."""
++        graph = Graph()
++        x = graph.placeholder("x")
++        node = graph.call_function(torch.relu, args=(x,))
++        graph.output(node)
++        gm = GraphModule(nn.Module(), graph)
++        assert _submod_has_stream_switch(gm) is False
++
++    def test_needs_out_buffer_false_for_stream_switch_partition(self):
++        """Reclassified stream-switch partitions should not need out= buffers."""
++        graph = Graph()
++        x = graph.placeholder("x")
++        begin = graph.call_function(begin_aux_stream_passthrough, args=(x,))
++        relu = graph.call_function(torch.relu, args=(begin,))
++        end = graph.call_function(end_aux_stream_passthrough, args=(relu,))
++        graph.output(end)
++        gm = GraphModule(nn.Module(), graph)
++        assert needs_out_buffer(gm) is False
++
++    def test_stream_switch_function_names_complete(self):
++        """All exported passthrough functions should be in the detection set."""
++        for func in (
++            begin_aux_stream_passthrough,
++            end_aux_stream_passthrough,
++            wait_aux_stream_passthrough,
++        ):
++            assert func.__name__ in _STREAM_SWITCH_FUNCTION_NAMES, (
++                f"{func.__name__} missing from _STREAM_SWITCH_FUNCTION_NAMES"
++            )
++
++
++# ============================================================================
++# Tests for stream-switch reclassification + no preceding static runner
++# ============================================================================
++
++
++def _build_graphmodule_stream_switch_before_dynamic():
++    """Build a GraphModule simulating multi_stream_mla_attn + trtllm attention.
++
++    Layout:
++        record_event → relu → [persistent_buf_op] → view → [attention_op] → relu → output
++
++    After splitting:
++        submod_0 (static, has record_event → reclassified as dynamic)
++        submod_1 (dynamic, persistent buffer op — no out= needed)
++        submod_2 (static, trivial view only — no CUDA ops, skipped)
++        submod_3 (dynamic, attention — needs out=)
++        submod_4 (static, relu — has CUDA ops → gets runner)
++
++    This simulates the GLM-4.7-Flash + trtllm + multi_stream_mla_attn scenario.
++    """
++    from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import record_event_passthrough
++
++    graph = Graph()
++    x = graph.placeholder("x")
++
++    # Partition 0: static with stream switch → will be reclassified as dynamic
++    rec = graph.call_function(record_event_passthrough, args=(x,))
++    relu0 = graph.call_function(torch.relu, args=(rec,))
++
++    # Partition 1: persistent buffer dynamic op
++    persistent_target = _FakeOpOverload(_PERSISTENT_BUFFER_OPS[0])
++    persistent_node = graph.create_node(
++        "call_function", persistent_target, args=(relu0,), name="persistent_buf"
++    )
++
++    # Partition 2: trivial static (only a view, no CUDA ops)
++    view_node = graph.call_method("view", args=(persistent_node, -1))
++
++    # Partition 3: attention dynamic op (needs out= buffer)
++    attn_target = _FakeOpOverload(_CACHED_ATTENTION_OPS[0])
++    attn_node = graph.create_node("call_function", attn_target, args=(view_node,), name="attn_op")
++
++    # Partition 4: static with CUDA ops
++    relu_final = graph.call_function(torch.relu, args=(attn_node,))
++    graph.output(relu_final)
++
++    root = nn.Module()
++    return GraphModule(root, graph)
++
++
++class TestStreamSwitchBeforeDynamic:
++    """Tests for stream-switch reclassification with no preceding static runner.
++
++    Covers the scenario where stream-switch ops reclassify the first
++    partition and a dynamic attention op has no preceding static runner.
++    """
++
++    def test_first_partition_reclassified_leaves_attention_without_preceding_runner(self):
++        """Verify the problematic partition layout.
++
++        First partition reclassified, trivial static between metadata and
++        attention, attention needs out=.
++        """
++        gm = _build_graphmodule_stream_switch_before_dynamic()
++        info = split_graph_at_dynamic_ops(gm)
++
++        # The stream-switch partition should be reclassified as dynamic
++        reclassified_found = False
++        for idx in info.dynamic_submod_indices:
++            submod = getattr(info.split_gm, f"submod_{idx}")
++            if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
++                reclassified_found = True
++                break
++        assert reclassified_found, "Stream-switch partition should be reclassified"
++
++        # Find the attention partition (should need out= buffer)
++        attn_found = False
++        for idx in info.dynamic_submod_indices:
++            submod = getattr(info.split_gm, f"submod_{idx}")
++            if isinstance(submod, GraphModule) and needs_out_buffer(submod):
++                attn_found = True
++                # Verify no preceding static partition has CUDA ops
++                preceding_static_has_runner = False
++                for s_idx in info.static_submod_indices:
++                    if s_idx < idx:
++                        s_submod = getattr(info.split_gm, f"submod_{s_idx}")
++                        if submod_has_cuda_ops(s_submod):
++                            preceding_static_has_runner = True
++                if not preceding_static_has_runner:
++                    break  # Found the problematic case
++        assert attn_found, "Should have an attention partition needing out= buffer"
+diff --git a/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gather_logits_before_lm_head.py b/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gather_logits_before_lm_head.py
+index a3f40d081054..1583b7c598d4 100644
+--- a/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gather_logits_before_lm_head.py
++++ b/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gather_logits_before_lm_head.py
+@@ -45,6 +45,29 @@ def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
+         return logits
+ 
+ 
++class NoLmHeadModel(torch.nn.Module):
++    """Model without lm_head (like a VLM text backbone exported separately).
++
++    Simulates the Qwen3.5 MoE scenario where only the text backbone is exported
++    and the lm_head is applied externally.  The graph output is the final norm
++    output, preceded by a residual add (multi-input node that stops the backward walk).
++    """
++
++    def __init__(self, hidden_size: int = 128):
++        super().__init__()
++        self.linear1 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
++        self.linear2 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
++        self.norm = torch.nn.LayerNorm(hidden_size, device="cuda", dtype=torch.float16)
++
++    def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
++        residual = hidden_states
++        hidden_states = self.linear1(hidden_states)
++        # Residual add: multi-input node that should stop the backward walk
++        hidden_states = hidden_states + residual
++        hidden_states = self.norm(hidden_states)
++        return hidden_states
++
++
+ class SoftcapLMHeadModel(torch.nn.Module):
+     """Model with LM head followed by softcapping (like Gemma4)."""
+ 
+@@ -367,6 +390,60 @@ def test_transform_skips_when_disabled(self):
+             "Gather op should not be in graph"
+         )
+ 
++    def test_transform_no_lm_head_in_graph(self):
++        """Test that gather is placed at output when lm_head is not in the graph.
++
++        VLMs like Qwen3.5 MoE export only the text backbone; the lm_head is
++        applied externally by the executor.  The backward walk must NOT traverse
++        into the model body (e.g. to an attention o_proj linear) and instead
++        place the gather right before the output node so the external lm_head
++        receives gathered hidden states.
++        """
++        hidden_size = 128
++        batch_size = 4
++        max_batch_size = 8
++        model = NoLmHeadModel(hidden_size).cuda()
++
++        hidden_states = torch.randn(batch_size, 1, hidden_size, device="cuda", dtype=torch.float16)
++        logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
++        seq_len = torch.ones(batch_size, dtype=torch.long, device="cuda")
++
++        gm = torch_export_to_gm(
++            model,
++            args=(hidden_states, logit_gather_ids, seq_len),
++            dynamic_shapes=None,
++            clone=True,
++        )
++
++        # Apply transform
++        cm = self._create_cached_sequence_interface(max_batch_size)
++        transform_config = {
++            "gather_logits_before_lm_head": {
++                "stage": "post_load_fusion",
++                "max_batch_size": max_batch_size,
++            }
++        }
++        optimizer = InferenceOptimizer(None, transform_config)
++        gm_transformed = optimizer(cm, gm)
++
++        # Gather op should be inserted in the graph
++        assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
++
++        # Verify forward pass — the model outputs hidden_size (not vocab_size)
++        token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
++        batch_info = BatchInfo()
++        batch_info.update_tokens_gather_info(batch_size, False)
++        batch_info_host = batch_info.serialize()
++        output = gm_transformed(
++            hidden_states,
++            logit_gather_ids,
++            seq_len,
++            token_gather_indices=token_gather_indices,
++            batch_info_host=batch_info_host,
++        )
++        # Model has no lm_head, so output is [batch, 1, hidden_size]
++        assert output.shape == (batch_size, 1, hidden_size)
++
+     def test_transform_with_softcapping(self):
+         """Test that gather is placed BEFORE lm_head when softcapping follows it.
+ 

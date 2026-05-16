@@ -1,0 +1,1047 @@
+diff --git a/include/triton/Conversion/TritonGPUToLLVM/Utility.h b/include/triton/Conversion/TritonGPUToLLVM/Utility.h
+index 067e3c0463aa..bb3a9be9788e 100644
+--- a/include/triton/Conversion/TritonGPUToLLVM/Utility.h
++++ b/include/triton/Conversion/TritonGPUToLLVM/Utility.h
+@@ -600,6 +600,21 @@ SmallVector<SmallVector<Value>>
+ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+             Attribute layout, RankedTensorType type, bool withCTAOffset);
+ 
++SmallVector<SmallVector<Value>>
++emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
++            const LinearLayout &layout, RankedTensorType type,
++            bool withCTAOffset);
++
++// Compute per-element shared-memory pointers for a local atomic/ldst update by
++// replacing `coords[*][axis]` with `idxValues[*]` and mapping the resulting
++// logical coordinates back to shared-memory offsets.
++SmallVector<Value> computeLocalPtrs(Location loc,
++                                    triton::gpu::MemDescType memDescTy,
++                                    SharedMemoryObject smemObj, Type llvmElemTy,
++                                    ArrayRef<Value> idxValues,
++                                    ArrayRef<SmallVector<Value>> coords,
++                                    unsigned axis, RewriterBase &rewriter);
++
+ // Calculates the required interval chunking and padding logical-shift values
+ // for shared memory padding, depending on elements' bit width and whether
+ // offsets count the number of bytes or number of elements.
+diff --git a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td
+index 9c9f8bf1515d..45a83acf41af 100644
+--- a/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td
++++ b/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td
+@@ -461,6 +461,44 @@ def TTG_LocalScatterOp : TTG_Op<"local_scatter"> {
+   let hasVerifier = 1;
+ }
+ 
++def TTG_LocalAtomicScatterAddOp : TTG_Op<"local_atomic_scatter_add", [
++  DeclareOpInterfaceMethods<InferTypeOpInterface>,
++  TypesMatchWith<"result type matches values type", "values", "result", "$_self">,
++  OptionalTypesMatchWith<"mask type matches values type",
++                 "values", "mask", "getI1SameShape($_self)">
++]> {
++  let summary = "Atomically scatter-add elements into shared memory along a specified axis";
++
++  let description = [{
++    Atomically scatter-adds elements to a shared memory descriptor using an indices tensor
++    along a single specified axis. The values tensor has the same shape as the
++    indices tensor and the result returns the previous values observed at each
++    updated location.
++
++    For each input position I, the operation atomically updates dst where the
++    coordinate at the axis is replaced by indices[I]:
++      dst[I[0], ..., indices[I], ..., I[n]] += values[I]
++
++    If mask is present, the update is performed only for positions where
++    mask[I] is true. Masked-off positions do not update shared memory and return
++    an undefined old value.
++  }];
++  let arguments = (ins
++    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$dst,
++    TT_Tensor:$values,
++    TT_IntTensor:$indices,
++    Optional<I1Tensor>:$mask,
++    I32Attr:$axis
++  );
++  let results = (outs TT_Tensor:$result);
++
++  let assemblyFormat = [{
++    $dst `[` $indices `]` `,` $values (`,` $mask^)? attr-dict `:`
++    functional-type(operands, results)
++  }];
++  let hasVerifier = 1;
++}
++
+ def TTG_PredicateStageOp: TTG_Op<"predicate_stage",
+                                 [Pure, AllTypesMatch<["iv", "ub", "step"]>]> {
+   let summary = "pipeliner stage predicate";
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 9dea1c928d46..9c89b3c499e8 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -117,8 +117,9 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
+     return elems * getBitwidth(srcTy) / 8;
+   }
+-  if (isa<AtomicRMWOp, AtomicCASOp, tti::ExperimentalGSanAtomicRMWOp,
+-          tti::ExperimentalGSanAtomicCASOp>(op)) {
++  if (isa<gpu::LocalAtomicScatterAddOp, AtomicRMWOp, AtomicCASOp,
++          tti::ExperimentalGSanAtomicRMWOp, tti::ExperimentalGSanAtomicCASOp>(
++          op)) {
+     auto value = op->getOperand(0);
+     auto smemShape = getRepShapeForAtomic(op->getResult(0));
+     auto elems = getNumScratchElements(smemShape);
+diff --git a/lib/Analysis/Membar.cpp b/lib/Analysis/Membar.cpp
+index e63730be39b1..68bde7b5826e 100644
+--- a/lib/Analysis/Membar.cpp
++++ b/lib/Analysis/Membar.cpp
+@@ -341,8 +341,10 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
+       isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
+     }
+ 
+-    if (!curBlockInfo.syncReadSlices.empty() ||
+-        !curBlockInfo.syncWriteSlices.empty()) {
++    bool hasExplicitSharedDeps = !curBlockInfo.syncReadSlices.empty() ||
++                                 !curBlockInfo.syncWriteSlices.empty();
++    if (hasExplicitSharedDeps &&
++        !isa<triton::gpu::LocalAtomicScatterAddOp>(op)) {
+       llvm::report_fatal_error(
+           "scratch buffer operations should not have any shared memory "
+           "dependencies");
+diff --git a/lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp
+index caddeddabf7e..de0b8d8aae32 100644
+--- a/lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp
+@@ -6,6 +6,7 @@
+ #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
+ #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
++#include "triton/Tools/LayoutUtils.h"
+ 
+ namespace {
+ 
+@@ -24,90 +25,14 @@ lowerLocalScGt(Location loc, MLIRContext *ctx, MemDescType memDescTy,
+                const TargetInfoBase &targetInfo) {
+   auto b = TritonLLVMOpBuilder(loc, rewriter);
+   bool isScatter = !storeVals.empty();
+-
+-  // Get the shared memory layout (linear component for padded layouts)
+-  auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
+-                          ? paddedLinearLayout(memDescTy)
+-                          : toLinearLayout(memDescTy);
+-  LinearLayout invSharedLayout = sharedLayout.invert();
+-
+-  // Get layout dimension names for all dims
+-  SmallVector<StringAttr> allDims;
+-  for (unsigned dim = 0, rank = memDescTy.getRank(); dim < rank; ++dim) {
+-    allDims.push_back(str_attr("dim" + Twine(dim)));
+-  }
+-
+-  auto kOffset = str_attr("offset");
+-
+-  // Get the subslice affine offset (non-zero for memdesc subslices)
+-  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+-  auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
++  SmallVector<Value> ptrs = computeLocalPtrs(
++      loc, memDescTy, smemObj, llvmElemTy, idxValues, coords, axis, rewriter);
+ 
+   SmallVector<Value> results;
+-  if (!isScatter) {
++  if (!isScatter)
+     results.resize(coords.size());
+-  }
+-
+-  for (auto [i, idxVal] : llvm::enumerate(idxValues)) {
+-    // Convert index to i32 if needed
+-    Value idx = idxVal;
+-    unsigned idxWidth = idx.getType().getIntOrFloatBitWidth();
+-    if (idxWidth > 32) {
+-      idx = b.trunc(i32_ty, idx);
+-    } else if (idxWidth < 32) {
+-      idx = b.zext(i32_ty, idx);
+-    }
+-
+-    // Copy coordinates and replace the axis coordinate with the index value
+-    SmallVector<Value> indices(coords[i]);
+-    indices[axis] = idx;
+-
+-    // Apply inverted shared layout to compute offset
+-    SmallVector<std::pair<StringAttr, Value>> inputs;
+-    for (unsigned dim = 0; dim < indices.size(); ++dim) {
+-      inputs.push_back({allDims[dim], indices[dim]});
+-    }
+-
+-    auto outputs = applyLinearLayout(loc, rewriter, invSharedLayout, inputs);
+-
+-    // Extract the offset value
+-    Value offset = nullptr;
+-    for (auto [name, value] : outputs) {
+-      if (name == kOffset) {
+-        offset = value;
+-        break;
+-      }
+-    }
+-    assert(offset && "expected offset output from inverted shared layout");
+-
+-    // For subslices, the physical offset is computed as:
+-    //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
+-    //
+-    // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
+-    // enforces:
+-    // 1. Subslice offsets must be multiples of the tile size
+-    // 2. Subslice offsets must map to power-of-2 physical offsets
+-    //
+-    // These constraints ensure the bit ranges of L⁻¹(coords) and
+-    // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
+-    offset = b.xor_(offset, affineOffset);
+-
+-    // Add padding offset for padded layouts (non-linear component)
+-    Value ptr;
+-    if (isPaddedEncoding(memDescTy.getEncoding())) {
+-      // Convert offset to bytes for padding calculation
+-      Value offsetBytes = b.mul(offset, b.i32_val(bitwidth / 8));
+-      auto shifts = getPaddedSharedShifts(memDescTy.getEncoding(), bitwidth,
+-                                          /*offsetInBytes=*/true);
+-      // GEP in bytes: base + offset*elemSize + padOffset
+-      Value totalOffset = applyPadding(loc, rewriter, offsetBytes, shifts);
+-      ptr = b.gep(smemObj.getBase().getType(), i8_ty, smemObj.getBase(),
+-                  totalOffset);
+-    } else {
+-      ptr = b.gep(smemObj.getBase().getType(), llvmElemTy, smemObj.getBase(),
+-                  offset);
+-    }
+ 
++  for (auto [i, ptr] : llvm::enumerate(ptrs)) {
+     if (isScatter) {
+       targetInfo.storeShared(rewriter, loc, ptr, storeVals[i], b.true_val());
+     } else {
+@@ -434,6 +359,7 @@ struct LocalScatterOpConversion
+ private:
+   const TargetInfoBase &targetInfo;
+ };
++
+ } // namespace
+ 
+ void mlir::triton::populateMemoryOpToLLVMPatterns(
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 56c110f25a30..0b0157c8fba5 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -492,13 +492,11 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
+ // Refactored emitIndices function using applyLinearLayoutVec
+ SmallVector<SmallVector<Value>>
+ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+-            Attribute layout, RankedTensorType type, bool withCTAOffset) {
++            const LinearLayout &ll, RankedTensorType type, bool withCTAOffset) {
+   auto b = TritonLLVMOpBuilder(loc, rewriter);
+   MLIRContext *ctx = rewriter.getContext();
+   auto shape = type.getShape();
+ 
+-  LinearLayout ll = triton::gpu::toLinearLayout(shape, layout);
+-
+   StringAttr kRegister = str_attr("register");
+   StringAttr kLane = str_attr("lane");
+   StringAttr kWarp = str_attr("warp");
+@@ -535,6 +533,105 @@ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+   return ret;
+ }
+ 
++SmallVector<SmallVector<Value>>
++emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
++            Attribute layout, RankedTensorType type, bool withCTAOffset) {
++  LinearLayout ll = triton::gpu::toLinearLayout(type.getShape(), layout);
++  return emitIndices(loc, rewriter, target, ll, type, withCTAOffset);
++}
++
++SmallVector<Value> computeLocalPtrs(Location loc,
++                                    triton::gpu::MemDescType memDescTy,
++                                    SharedMemoryObject smemObj, Type llvmElemTy,
++                                    ArrayRef<Value> idxValues,
++                                    ArrayRef<SmallVector<Value>> coords,
++                                    unsigned axis, RewriterBase &rewriter) {
++  MLIRContext *ctx = memDescTy.getContext();
++  auto b = TritonLLVMOpBuilder(loc, rewriter);
++
++  // Get the shared memory layout (linear component for padded layouts)
++  auto sharedLayout = triton::gpu::isPaddedEncoding(memDescTy.getEncoding())
++                          ? paddedLinearLayout(memDescTy)
++                          : toLinearLayout(memDescTy);
++  LinearLayout invSharedLayout = sharedLayout.invert();
++
++  // Get layout dimension names for all dims
++  SmallVector<StringAttr> allDims;
++  for (unsigned dim = 0, rank = memDescTy.getRank(); dim < rank; ++dim)
++    allDims.push_back(str_attr("dim" + Twine(dim)));
++
++  auto kOffset = str_attr("offset");
++  // Get the subslice affine offset (non-zero for memdesc subslices)
++  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
++  auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
++
++  SmallVector<Value> ptrs;
++  ptrs.reserve(coords.size());
++
++  for (auto [i, idxVal] : llvm::enumerate(idxValues)) {
++    Value idx = idxVal;
++    unsigned idxWidth = idx.getType().getIntOrFloatBitWidth();
++    // Convert index to i32 if needed
++    if (idxWidth > 32) {
++      idx = b.trunc(i32_ty, idx);
++    } else if (idxWidth < 32) {
++      idx = b.zext(i32_ty, idx);
++    }
++
++    // Copy coordinates and replace the axis coordinate with the index value
++    SmallVector<Value> indices(coords[i]);
++    indices[axis] = idx;
++
++    // Apply inverted shared layout to compute offset
++    SmallVector<std::pair<StringAttr, Value>> inputs;
++    for (unsigned dim = 0; dim < indices.size(); ++dim)
++      inputs.push_back({allDims[dim], indices[dim]});
++
++    auto outputs = applyLinearLayout(loc, rewriter, invSharedLayout, inputs);
++
++    // Extract the offset value
++    Value offset = nullptr;
++    for (auto [name, value] : outputs) {
++      if (name == kOffset) {
++        offset = value;
++        break;
++      }
++    }
++    assert(offset && "expected offset output from inverted shared layout");
++
++    // For subslices, the physical offset is computed as:
++    //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
++    //
++    // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
++    // enforces:
++    // 1. Subslice offsets must be multiples of the tile size
++    // 2. Subslice offsets must map to power-of-2 physical offsets
++    //
++    // These constraints ensure the bit ranges of L⁻¹(coords) and
++    // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
++    offset = b.xor_(offset, affineOffset);
++
++    // Add padding offset for padded layouts (non-linear component)
++    Value ptr;
++    if (triton::gpu::isPaddedEncoding(memDescTy.getEncoding())) {
++      // Convert offset to bytes for padding calculation
++      Value offsetBytes = b.mul(offset, b.i32_val(bitwidth / 8));
++      auto shifts = getPaddedSharedShifts(memDescTy.getEncoding(), bitwidth,
++                                          /*offsetInBytes=*/true);
++      // GEP in bytes: base + offset*elemSize + padOffset
++      Value totalOffset = applyPadding(loc, rewriter, offsetBytes, shifts);
++      ptr = b.gep(smemObj.getBase().getType(), i8_ty, smemObj.getBase(),
++                  totalOffset);
++    } else {
++      ptr = b.gep(smemObj.getBase().getType(), llvmElemTy, smemObj.getBase(),
++                  offset);
++    }
++    ptrs.push_back(ptr);
++  }
++
++  return ptrs;
++}
++
+ SmallVector<std::pair<unsigned, unsigned>>
+ getPaddedSharedShifts(Attribute enc, unsigned bitwidth, bool offsetInBytes) {
+   auto padded = triton::gpu::getPaddedEncoding(enc);
+diff --git a/lib/Dialect/TritonGPU/IR/Ops.cpp b/lib/Dialect/TritonGPU/IR/Ops.cpp
+index 43f3d2c72f8a..6c3a110a0378 100644
+--- a/lib/Dialect/TritonGPU/IR/Ops.cpp
++++ b/lib/Dialect/TritonGPU/IR/Ops.cpp
+@@ -882,6 +882,65 @@ LogicalResult LocalScatterOp::verify() {
+   return success();
+ }
+ 
++// LocalAtomicScatterAddOp
++LogicalResult LocalAtomicScatterAddOp::verify() {
++  auto dstTy = getDst().getType();
++  auto valuesTy = cast<RankedTensorType>(getValues().getType());
++  auto indicesTy = cast<RankedTensorType>(getIndices().getType());
++  auto maskTy = getMask() ? cast<RankedTensorType>(getMask().getType())
++                          : RankedTensorType();
++  Type valuesEltTy = valuesTy.getElementType();
++  unsigned axis = getAxis();
++
++  if (!dstTy.getMutableMemory())
++    return emitOpError("Cannot store into immutable memory");
++
++  // Local atomic scatter add only supports shared-memory memdescs.
++  if (!isa<SharedEncodingTrait>(dstTy.getEncoding())) {
++    return emitError("destination must have shared memory encoding");
++  }
++
++  // Match Triton's existing atomic add type support.
++  if (!valuesEltTy.isIntOrFloat()) {
++    return emitError("values must have integer or floating element type");
++  }
++
++  // Verify indices tensor has integer element type
++  if (!indicesTy.getElementType().isInteger()) {
++    return emitError("indices must have integer element type");
++  }
++
++  if (failed(verifySharedMemoryRank(*this, valuesTy, dstTy, "values")))
++    return failure();
++
++  // Verify values, indices, and mask have the same shape/rank.
++  if (valuesTy.getShape() != indicesTy.getShape()) {
++    return emitError("values shape must match indices shape");
++  }
++  if (maskTy && valuesTy.getShape() != maskTy.getShape()) {
++    return emitError("values shape must match mask shape");
++  }
++
++  // Verify axis is valid
++  if (axis >= dstTy.getRank()) {
++    return emitError("axis ")
++           << axis << " is out of bounds for destination rank "
++           << dstTy.getRank();
++  }
++
++  // Verify values, indices, and result have the same layout
++  if (valuesTy.getEncoding() != indicesTy.getEncoding()) {
++    return emitError("values must have the same layout as indices");
++  }
++  if (maskTy && valuesTy.getEncoding() != maskTy.getEncoding()) {
++    return emitError("values must have the same layout as mask");
++  }
++  if (dstTy.getElementType() != valuesEltTy) {
++    return emitError("values element type must match destination element type");
++  }
++  return success();
++}
++
+ // AsyncCopyGlobalToLocalOp
+ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
+   if (!getResult().getType().getMutableMemory())
+diff --git a/python/src/gluon_ir.cc b/python/src/gluon_ir.cc
+index a3534d7b4346..3df00b44b4b7 100644
+--- a/python/src/gluon_ir.cc
++++ b/python/src/gluon_ir.cc
+@@ -711,6 +711,12 @@ void init_gluon_ir(py::module &&m) {
+              self.create<ttg::LocalScatterOp>(memDesc, values, indices,
+                                               axisAttr);
+            })
++      .def("create_local_atomic_scatter_add",
++           [](GluonOpBuilder &self, Value memDesc, Value values, Value indices,
++              std::optional<Value> mask, int32_t axis) -> Value {
++             return self.create<ttg::LocalAtomicScatterAddOp>(
++                 memDesc, values, indices, mask.value_or(Value()), axis);
++           })
+       .def("get_shared_bank_conflicts",
+            [](GluonOpBuilder &self, Attribute regLayoutAttr,
+               Attribute sharedLayoutAttr, std::vector<int64_t> &shape,
+diff --git a/python/test/gluon/test_core.py b/python/test/gluon/test_core.py
+index 975af144b236..d762c4e2c93c 100644
+--- a/python/test/gluon/test_core.py
++++ b/python/test/gluon/test_core.py
+@@ -2560,6 +2560,124 @@ def test_shared_scatter(N, M):
+     torch.testing.assert_close(output, expected)
+ 
+ 
++@gluon.jit
++def shared_atomic_scatter_add_kernel(
++    values_ptr,
++    indices_ptr,
++    mask_ptr,
++    old_ptr,
++    final_ptr,
++    N: ttgl.constexpr,
++    M: ttgl.constexpr,
++    axis: ttgl.constexpr,
++    dtype: ttgl.constexpr,
++    use_mask: ttgl.constexpr,
++    use_constant_values: ttgl.constexpr,
++    RHS_N: ttgl.constexpr,
++    RHS_M: ttgl.constexpr,
++    layout_2d: ttgl.constexpr,
++    layout_rhs: ttgl.constexpr,
++    shared_layout: ttgl.constexpr,
++):
++    indices_x = ttgl.arange(0, N, layout=ttgl.SliceLayout(dim=1, parent=layout_2d))
++    indices_y = ttgl.arange(0, M, layout=ttgl.SliceLayout(dim=0, parent=layout_2d))
++    offsets_2d = indices_x[:, None] * M + indices_y[None, :]
++    rhs_x = ttgl.arange(0, RHS_N, layout=ttgl.SliceLayout(dim=1, parent=layout_rhs))
++    rhs_y = ttgl.arange(0, RHS_M, layout=ttgl.SliceLayout(dim=0, parent=layout_rhs))
++    offsets_rhs = rhs_x[:, None] * RHS_M + rhs_y[None, :]
++
++    smem = ttgl.allocate_shared_memory(dtype, [N, M], layout=shared_layout)
++    smem.store(ttgl.zeros([N, M], dtype, layout=layout_2d))
++
++    indices = ttgl.load(indices_ptr + offsets_rhs)
++    if use_constant_values:
++        # Cover the all-ones RHS path; int32 can lower to atom.inc on NVIDIA.
++        values = ttgl.full([RHS_N, RHS_M], 1, dtype, layout_rhs)
++    else:
++        values = ttgl.load(values_ptr + offsets_rhs)
++
++    if use_mask:
++        mask = ttgl.load(mask_ptr + offsets_rhs)
++        old = smem.atomic_scatter_add(values, indices, axis=axis, mask=mask)
++    else:
++        old = smem.atomic_scatter_add(values, indices, axis=axis)
++    ttgl.store(old_ptr + offsets_rhs, old)
++    final = smem.load(layout=layout_2d)
++
++    ttgl.store(final_ptr + offsets_2d, final)
++
++
++@pytest.mark.parametrize("use_mask,torch_dtype,gluon_dtype", [
++    pytest.param(False, torch.int32, ttgl.int32, id="unmasked_int32"),
++    pytest.param(False, torch.float16, ttgl.float16, id="unmasked_float16"),
++    pytest.param(False, torch.float32, ttgl.float32, id="unmasked_float32"),
++    pytest.param(True, torch.int32, ttgl.int32, id="masked_int32"),
++    pytest.param(True, torch.float32, ttgl.float32, id="masked_float32"),
++])
++@pytest.mark.parametrize("use_constant_values", [
++    pytest.param(False, id="loaded_values"),
++    pytest.param(True, id="constant_values"),
++])
++@pytest.mark.parametrize("N,M,axis,rhs_shape", [
++    pytest.param(16, 32, 1, (16, 2), id="axis1_rhs_cols"),
++    pytest.param(32, 16, 0, (2, 16), id="axis0_rhs_rows"),
++])
++def test_shared_atomic_scatter_add(use_mask, torch_dtype, gluon_dtype, use_constant_values, N, M, axis, rhs_shape):
++    if is_hip_cdna() or is_hip_rdna():
++        pytest.skip("Shared atomic_scatter_add is not supported on AMD")
++
++    device = torch.device("cuda")
++    rhs_n, rhs_m = rhs_shape
++
++    if use_constant_values:
++        values = torch.ones(rhs_shape, dtype=torch_dtype, device=device)
++    else:
++        values = torch.arange(rhs_n * rhs_m, dtype=torch.int32, device=device).reshape(rhs_shape)
++        values = (values % 7 + 1).to(torch_dtype)
++    torch.manual_seed(23 if use_mask else 17)
++    upper = M if axis == 1 else N
++    indices = torch.randint(0, upper, rhs_shape, dtype=torch.int32, device=device)
++    old = torch.empty(rhs_shape, dtype=torch_dtype, device=device)
++    final = torch.empty((N, M), dtype=torch_dtype, device=device)
++    expected = torch.zeros((N, M), dtype=torch_dtype, device=device)
++
++    layout_2d = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[THREADS_PER_WARP // 4, 4],
++                                   warps_per_cta=[4, 1], order=[1, 0])
++    layout_rhs = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[THREADS_PER_WARP // 4, 4],
++                                    warps_per_cta=[4, 1], order=[1, 0])
++    shared_layout = ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
++
++    if use_mask:
++        mask = (torch.arange(rhs_n * rhs_m, device=device).reshape(rhs_shape) % 3) != 0
++        rhs = torch.where(mask, values, torch.zeros_like(values))
++    else:
++        mask = torch.empty(rhs_shape, dtype=torch.bool, device=device)
++        rhs = values
++    expected.scatter_add_(axis, indices.long(), rhs)
++
++    shared_atomic_scatter_add_kernel[(1, )](
++        values,
++        indices,
++        mask,
++        old,
++        final,
++        N=N,
++        M=M,
++        axis=axis,
++        dtype=gluon_dtype,
++        use_mask=use_mask,
++        use_constant_values=use_constant_values,
++        RHS_N=rhs_n,
++        RHS_M=rhs_m,
++        layout_2d=layout_2d,
++        layout_rhs=layout_rhs,
++        shared_layout=shared_layout,
++        num_warps=4,
++    )
++
++    torch.testing.assert_close(final, expected, atol=0, rtol=0)
++
++
+ # ============================================================================
+ # Multi-warp Tests
+ # ============================================================================
+diff --git a/python/test/gluon/test_frontend.py b/python/test/gluon/test_frontend.py
+index 8efe3e5b1455..3b6b51affe4f 100644
+--- a/python/test/gluon/test_frontend.py
++++ b/python/test/gluon/test_frontend.py
+@@ -216,6 +216,28 @@ def test_shared_memory(target):
+ """)
+ 
+ 
++@filecheck_test
++@gluon.jit
++def test_shared_atomic_scatter_add():
++    # CHECK: [[SMEM:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<8x32xi32
++    # CHECK: [[INDICES:%.*]] = arith.addi
++    # CHECK: [[VALUES:%.*]] = arith.constant dense<1> : tensor<8x32xi32, #blocked>
++    # CHECK: [[MASK:%.*]] = arith.constant dense<true> : tensor<8x32xi1, #blocked>
++    # CHECK: ttg.local_atomic_scatter_add [[SMEM]][[[INDICES]]], [[VALUES]], [[MASK]] {axis = 1 : i32} : (!ttg.memdesc<8x32xi32, #shared, #smem, mutable>, tensor<8x32xi32, #blocked>, tensor<8x32xi32, #blocked>, tensor<8x32xi1, #blocked>) -> tensor<8x32xi32, #blocked>
++    shape: ttgl.constexpr = [8, 32]
++    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
++    smem_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2)
++
++    smem = ttgl.allocate_shared_memory(ttgl.int32, shape, smem_layout)
++    smem.store(ttgl.zeros(shape, ttgl.int32, layout))
++
++    cols = ttgl.arange(0, shape[1], layout=ttgl.SliceLayout(0, layout))[None, :]
++    indices = cols + ttgl.zeros(shape, ttgl.int32, layout)
++    values = ttgl.full(shape, 1, ttgl.int32, layout)
++    mask = ttgl.full(shape, True, ttgl.int1, layout)
++    old = smem.atomic_scatter_add(values, indices, axis=1, mask=mask)  # noqa: F841
++
++
+ @gluon.jit
+ def tensor_memory_kernel(layout: ttgl.constexpr, tmem_layout: ttgl.constexpr):
+     XBLOCK: ttgl.constexpr = tmem_layout.block[0]
+diff --git a/python/triton/experimental/gluon/language/_core.py b/python/triton/experimental/gluon/language/_core.py
+index 79d1563d7557..642b7d4f1e4c 100644
+--- a/python/triton/experimental/gluon/language/_core.py
++++ b/python/triton/experimental/gluon/language/_core.py
+@@ -344,6 +344,36 @@ def scatter(self, values, indices, axis, _semantic: GluonSemantic = None):
+         axis = _unwrap_if_constexpr(axis)
+         return _semantic.shared_scatter(self, values, indices, axis)
+ 
++    @builtin
++    def atomic_scatter_add(self, values, indices, axis, mask=None, _semantic: GluonSemantic = None) -> tensor:
++        """
++        Atomically scatter-add elements to shared memory along a specified axis using an indices tensor.
++
++        For each input position I, the operation reads the previous value from dst where the
++        coordinate at the scatter axis is replaced by indices[I], adds values[I], then writes
++        the updated result back to shared memory.
++
++        Args:
++            values (tensor): Tensor with values to add (same shape as indices).
++            indices (tensor): Tensor specifying which indices to update along the axis.
++            axis (int): The axis along which to update values.
++            mask (tensor, optional): Boolean tensor selecting which elements to update.
++
++        Returns:
++            tensor: Gluon tensor with the values observed before the update.
++
++        Note:
++            This operation currently uses relaxed memory semantics. Users are responsible
++            for inserting mbarrier synchronization themselves.
++        """
++        values = _unwrap_if_constexpr(values)
++        indices = _unwrap_if_constexpr(indices)
++        axis = _unwrap_if_constexpr(axis)
++        mask = _unwrap_if_constexpr(mask)
++        if mask is not None:
++            mask = _semantic.to_tensor(mask)
++        return _semantic.shared_atomic_scatter_add(self, values, indices, axis, mask)
++
+     def slice(self, start, length, dim=0, _semantic: GluonSemantic = None) -> shared_memory_descriptor:
+         """
+         Create a subview of shared memory by slicing along a given dimension.
+diff --git a/python/triton/experimental/gluon/language/_semantic.py b/python/triton/experimental/gluon/language/_semantic.py
+index d1fad3c0753e..b98eebddb140 100644
+--- a/python/triton/experimental/gluon/language/_semantic.py
++++ b/python/triton/experimental/gluon/language/_semantic.py
+@@ -308,6 +308,36 @@ def shared_scatter(self, mem_desc, values, indices, axis):
+ 
+         self.builder.create_local_scatter(mem_desc.handle, values.handle, indices.handle, axis)
+ 
++    def shared_atomic_scatter_add(self, mem_desc, values, indices, axis, mask):
++        _check(isinstance(indices, ttgl.tensor),
++               lambda: f"expected 'indices' to be a tensor, but got a {type(indices)}")
++        _check(isinstance(axis, int), lambda: f"expected 'axis' to be an int, but got a {type(axis)}")
++        _check(isinstance(values, ttgl.tensor), lambda: f"expected 'values' to be a tensor, but got a {type(values)}")
++        _check(
++            len(indices.shape) == mem_desc.rank,
++            lambda: f"indices rank must match memdesc rank: got {len(indices.shape)} and {mem_desc.rank}")
++        _check(0 <= axis < mem_desc.rank, lambda: f"axis {axis} is out of bounds for memdesc rank {mem_desc.rank}")
++        _check(indices.dtype.is_int(), lambda: f"indices must have integer dtype, got {indices.dtype}")
++        _check(values.shape == indices.shape,
++               lambda: f"values must have the same shape as indices: got {values.shape} and {indices.shape}")
++        _check(values.type.layout == indices.type.layout, lambda: "values must have the same layout as indices")
++        _check(
++            values.dtype == mem_desc.dtype,
++            lambda: f"values element type must match destination element type: got {values.dtype} and {mem_desc.dtype}")
++        if mask is not None:
++            if not isinstance(mask.type, ttgl.distributed_type):
++                mask = self.splat(mask, values.shape, values.type.layout)
++            _check(mask.dtype == ttgl.int1, lambda: f"mask must have boolean dtype, got {mask.dtype}")
++            _check(mask.shape == values.shape,
++                   lambda: f"mask must have the same shape as values: got {mask.shape} and {values.shape}")
++            _check(mask.type.layout == values.type.layout, lambda: "mask must have the same layout as values")
++
++        mask_handle = mask.handle if mask is not None else None
++        handle = self.builder.create_local_atomic_scatter_add(mem_desc.handle, values.handle, indices.handle,
++                                                              mask_handle, axis)
++        ret_ty = ttgl.distributed_type(mem_desc.dtype, values.shape, values.type.layout)
++        return ttgl.tensor(handle, ret_ty)
++
+     def bank_conflicts(self, distr_ty, shared_ty):
+         if not isinstance(distr_ty, ttgl.distributed_type):
+             raise TypeError(
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 28483e84e6a1..df9a000fd0dc 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -2177,6 +2177,100 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ // -----
+ 
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: test_local_atomic_scatter_add
++  // CHECK: llvm.inline_asm has_side_effects asm_dialect = att
++  // CHECK-SAME: atom.shared.add.u32
++  // CHECK-SAME: "=r,r,r,b"
++  tt.func public @test_local_atomic_scatter_add(%arg0: tensor<1xi32, #blocked>, %arg1: tensor<1xi32, #blocked>) {
++    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    %1 = ttg.local_atomic_scatter_add %0[%arg0], %arg1 {axis = 0 : i32} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>, tensor<1xi32, #blocked>, tensor<1xi32, #blocked>) -> tensor<1xi32, #blocked>
++    %2 = ttg.local_alloc {allocation.offset = 4 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    ttg.local_store %1, %2 : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: test_local_atomic_inc_masked
++  // CHECK: llvm.inline_asm has_side_effects asm_dialect = att
++  // CHECK-SAME: atom.shared.inc.u32
++  // CHECK-SAME: "=r,r,b"
++  tt.func public @test_local_atomic_inc_masked(%arg0: tensor<1xi32, #blocked>, %mask: tensor<1xi1, #blocked>) {
++    %c1 = arith.constant dense<1> : tensor<1xi32, #blocked>
++    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    %1 = ttg.local_atomic_scatter_add %0[%arg0], %c1, %mask {axis = 0 : i32} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>, tensor<1xi32, #blocked>, tensor<1xi32, #blocked>, tensor<1xi1, #blocked>) -> tensor<1xi32, #blocked>
++    %2 = ttg.local_alloc {allocation.offset = 4 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    ttg.local_store %1, %2 : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: test_local_atomic_scatter_add_i32_masked
++  // CHECK: llvm.inline_asm has_side_effects asm_dialect = att
++  // CHECK-SAME: atom.shared.add.u32
++  // CHECK-SAME: "=r,r,r,b"
++  tt.func public @test_local_atomic_scatter_add_i32_masked(%arg0: tensor<1xi32, #blocked>, %arg1: tensor<1xi32, #blocked>, %mask: tensor<1xi1, #blocked>) {
++    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    %1 = ttg.local_atomic_scatter_add %0[%arg0], %arg1, %mask {axis = 0 : i32} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>, tensor<1xi32, #blocked>, tensor<1xi32, #blocked>, tensor<1xi1, #blocked>) -> tensor<1xi32, #blocked>
++    %2 = ttg.local_alloc {allocation.offset = 4 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    ttg.local_store %1, %2 : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: test_local_atomic_scatter_add_f32_masked
++  // CHECK: llvm.inline_asm has_side_effects asm_dialect = att
++  // CHECK-SAME: atom.shared.add.f32
++  // CHECK-SAME: "=r,r,r,b"
++  tt.func public @test_local_atomic_scatter_add_f32_masked(%arg0: tensor<1xi32, #blocked>, %arg1: tensor<1xf32, #blocked>, %mask: tensor<1xi1, #blocked>) {
++    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xf32, #shared, #smem, mutable>
++    %1 = ttg.local_atomic_scatter_add %0[%arg0], %arg1, %mask {axis = 0 : i32} : (!ttg.memdesc<1xf32, #shared, #smem, mutable>, tensor<1xf32, #blocked>, tensor<1xi32, #blocked>, tensor<1xi1, #blocked>) -> tensor<1xf32, #blocked>
++    %2 = ttg.local_alloc {allocation.offset = 4 : i32} : () -> !ttg.memdesc<1xf32, #shared, #smem, mutable>
++    ttg.local_store %1, %2 : tensor<1xf32, #blocked> -> !ttg.memdesc<1xf32, #shared, #smem, mutable>
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: test_local_atomic_inc_dead
++  // CHECK: llvm.inline_asm has_side_effects asm_dialect = att
++  // CHECK-SAME: red.shared.inc.u32
++  tt.func public @test_local_atomic_inc_dead(%arg0: tensor<1xi32, #blocked>) {
++    %c1 = arith.constant dense<1> : tensor<1xi32, #blocked>
++    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
++    %1 = ttg.local_atomic_scatter_add %0[%arg0], %c1 {axis = 0 : i32} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>, tensor<1xi32, #blocked>, tensor<1xi32, #blocked>) -> tensor<1xi32, #blocked>
++    tt.return
++  }
++}
++
++// -----
++
+ #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK-LABEL: print_ptr
+diff --git a/test/TritonGPU/invalid.mlir b/test/TritonGPU/invalid.mlir
+index 667b4d4b2991..d4af8c348436 100644
+--- a/test/TritonGPU/invalid.mlir
++++ b/test/TritonGPU/invalid.mlir
+@@ -171,6 +171,19 @@ tt.func public @subview_along_swizzling(%arg0: !ttg.memdesc<8x16xf32, #shared, #
+ 
+ // -----
+ 
++#linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16]], warp = [], block = []}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++tt.func public @local_atomic_scatter_add_immutable_dst(%values: tensor<32xi32, #linear>,
++                                                       %indices: tensor<32xi32, #linear>,
++                                                       %dst: !ttg.memdesc<32xi32, #shared, #smem>) attributes {"ttg.num-warps" = 1 : i32} {
++    // expected-error @+1 {{Cannot store into immutable memory}}
++    %0 = ttg.local_atomic_scatter_add %dst[%indices], %values {axis = 0 : i32} : (!ttg.memdesc<32xi32, #shared, #smem>, tensor<32xi32, #linear>, tensor<32xi32, #linear>) -> tensor<32xi32, #linear>
++    tt.return
++}
++
++// -----
++
+ #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+ #shared1d = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0]}>
+ #smem = #ttg.shared_memory
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/MemoryOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/MemoryOpToLLVM.cpp
+index 46c3b7f71533..37816b8a0b05 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/MemoryOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/MemoryOpToLLVM.cpp
+@@ -1,9 +1,12 @@
+ #include "Dialect/NVGPU/IR/Dialect.h"
+ #include "PatternTritonGPUOpToLLVM.h"
+ #include "TargetInfo.h"
++#include "TritonNVIDIAGPUToLLVM/AtomicPTXBuilder.h"
++#include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
+ #include "Utility.h"
+ #include "mlir/Conversion/LLVMCommon/Pattern.h"
+ #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "triton/Analysis/Allocation.h"
+ #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+@@ -19,6 +22,138 @@ using namespace mlir::triton::gpu;
+ using namespace mlir::triton::NVIDIA;
+ using namespace mlir::LLVM::NVIDIA;
+ 
++bool isConstI32OneTensor(Value value) {
++  DenseElementsAttr constant;
++  return matchPattern(value, m_Constant(&constant)) &&
++         constant.getElementType().isInteger(32) &&
++         llvm::all_of(constant.getValues<APInt>(),
++                      [](const APInt &value) { return value.isOne(); });
++}
++
++struct LocalAtomicScatterAddInfo {
++  RankedTensorType valuesTy;
++  Type llvmElemTy;
++  LinearLayout regLayout;
++  ColumnAction removeBroadcast;
++  Value threadPred;
++  SmallVector<Value> values;
++  SmallVector<Value> maskValues;
++  SmallVector<Value> ptrs;
++};
++
++FailureOr<LocalAtomicScatterAddInfo>
++prepareLocalAtomicScatterAdd(triton::gpu::LocalAtomicScatterAddOp op, Value dst,
++                             Value indices, Value inputValues, Value mask,
++                             ConversionPatternRewriter &rewriter,
++                             const NVIDIA::TargetInfo &targetInfo,
++                             const LLVMTypeConverter *typeConverter) {
++  auto loc = op.getLoc();
++  auto valuesTy = cast<RankedTensorType>(op.getValues().getType());
++  auto memDescTy = cast<MemDescType>(op.getDst().getType());
++  if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
++          memDescTy.getEncoding())) {
++    return failure();
++  }
++
++  auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
++  auto smemObj =
++      LLVM::getSharedMemoryObjectFromStruct(loc, dst, llvmElemTy, rewriter);
++  SmallVector<Value> idxValues = unpackLLElements(loc, indices, rewriter);
++  SmallVector<Value> values = unpackLLElements(loc, inputValues, rewriter);
++  SmallVector<Value> maskValues;
++  if (mask)
++    maskValues = unpackLLElements(loc, mask, rewriter);
++
++  LinearLayout regLayout = toLinearLayout(valuesTy);
++  auto freeVarMasks = regLayout.getFreeVariableMasks();
++  auto removeBroadcast = actionRemoveBroadcastedRegs(regLayout);
++  Value threadPred =
++      emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
++  LinearLayout activeRegLayout = regLayout;
++  if (!removeBroadcast.isIdentity()) {
++    activeRegLayout = removeBroadcast.apply(regLayout);
++    values = removeBroadcast.apply(values);
++    idxValues = removeBroadcast.apply(idxValues);
++    if (!maskValues.empty())
++      maskValues = removeBroadcast.apply(maskValues);
++  }
++  SmallVector<SmallVector<Value>> srcIndices =
++      emitIndices(loc, rewriter, targetInfo, activeRegLayout, valuesTy,
++                  /*withCTAOffset=*/true);
++
++  SmallVector<Value> ptrs =
++      computeLocalPtrs(loc, memDescTy, smemObj, llvmElemTy, idxValues,
++                       srcIndices, op.getAxis(), rewriter);
++
++  return LocalAtomicScatterAddInfo{valuesTy,        llvmElemTy, regLayout,
++                                   removeBroadcast, threadPred, values,
++                                   maskValues,      ptrs};
++}
++
++Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
++                    Value ptr, bool returnOld, Value pred = Value()) {
++  PTXBuilder ptxBuilder;
++  // PTX atom/red.inc resets to 0 only when the old value reaches the bound, so
++  // using UINT32_MAX makes it equivalent to a wrapping increment-by-1.
++  auto *boundOpr = ptxBuilder.newConstantOperand("0xffffffff");
++  if (!returnOld) {
++    auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
++    auto &red = *ptxBuilder.create("red");
++    red.shared().o("inc").o("u32");
++    red(ptrOpr, boundOpr).maybePredicate(pred, "b");
++    return ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
++  }
++
++  auto *dstOpr = ptxBuilder.newOperand("=r", /*init=*/true);
++  auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
++  auto &atom = *ptxBuilder.create("atom");
++  atom.shared().o("inc").o("u32");
++  atom(dstOpr, ptrOpr, boundOpr).maybePredicate(pred, "b");
++  return ptxBuilder.launch(rewriter, loc, i32_ty);
++}
++
++FailureOr<Value> emitSharedAtomicAdd(ConversionPatternRewriter &rewriter,
++                                     Location loc, Type valueElemTy, Value ptr,
++                                     Value value, bool returnOld, Value pred) {
++  unsigned valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
++  if (valueElemNBits != 16 && valueElemNBits != 32 && valueElemNBits != 64)
++    return failure();
++
++  std::string tyId = getPtxRegisterSizeCode(valueElemNBits, /*isFloat=*/false);
++  std::string addOp = "add";
++  std::string suffix;
++  if (isa<IntegerType>(valueElemTy)) {
++    if (valueElemNBits < 32)
++      return failure();
++    suffix = "u" + std::to_string(valueElemNBits);
++  } else if (isa<FloatType>(valueElemTy)) {
++    addOp += valueElemNBits == 16 ? ".noftz" : "";
++    suffix =
++        (valueElemTy.isBF16() ? "bf" : "f") + std::to_string(valueElemNBits);
++  } else {
++    return failure();
++  }
++
++  if (!returnOld) {
++    PTXBuilder ptxBuilder;
++    auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
++    auto *valOpr = ptxBuilder.newOperand(value, tyId);
++    auto &red = *ptxBuilder.create("red");
++    red.shared().o(addOp).o(suffix);
++    red(ptrOpr, valOpr).maybePredicate(pred, "b");
++    return ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
++  }
++
++  PTXBuilder ptxBuilder;
++  auto *dstOpr = ptxBuilder.newOperand("=" + tyId, /*init=*/true);
++  auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
++  auto *valOpr = ptxBuilder.newOperand(value, tyId);
++  auto &atom = *ptxBuilder.create("atom");
++  atom.shared().o(addOp).o(suffix);
++  atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred, "b");
++  return ptxBuilder.launch(rewriter, loc, valueElemTy);
++}
++
+ LogicalResult lowerLdStMatrix(
+     Location loc, const LinearLayout &regLayout, MemDescType memDescType,
+     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
+@@ -183,6 +318,73 @@ struct LocalStoreOpConversion
+     return success();
+   }
+ 
++private:
++  const NVIDIA::TargetInfo &targetInfo;
++};
++
++struct LocalAtomicScatterAddOpConversion
++    : public ConvertOpToLLVMPattern<triton::gpu::LocalAtomicScatterAddOp> {
++public:
++  LocalAtomicScatterAddOpConversion(const LLVMTypeConverter &converter,
++                                    const NVIDIA::TargetInfo &targetInfo,
++                                    PatternBenefit benefit = 1)
++      : ConvertOpToLLVMPattern<triton::gpu::LocalAtomicScatterAddOp>(converter,
++                                                                     benefit),
++        targetInfo(targetInfo) {}
++
++  LogicalResult
++  matchAndRewrite(triton::gpu::LocalAtomicScatterAddOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto loc = op.getLoc();
++    auto b = TritonLLVMOpBuilder(loc, rewriter);
++    auto lowering = prepareLocalAtomicScatterAdd(
++        op, adaptor.getDst(), adaptor.getIndices(), adaptor.getValues(),
++        op.getMask() ? adaptor.getMask() : Value(), rewriter, targetInfo,
++        getTypeConverter());
++    if (failed(lowering))
++      return failure();
++    LocalAtomicScatterAddInfo &info = *lowering;
++
++    bool isI32Inc = info.valuesTy.getElementType().isInteger(32) &&
++                    isConstI32OneTensor(op.getValues());
++    bool returnOld = !op.getResult().use_empty();
++
++    SmallVector<Value> results;
++    if (returnOld)
++      results.reserve(info.ptrs.size());
++    for (auto [i, ptrAndValue] :
++         llvm::enumerate(llvm::zip(info.ptrs, info.values))) {
++      auto [ptr, value] = ptrAndValue;
++      Value pred =
++          maybeAnd(rewriter, loc, info.threadPred,
++                   info.maskValues.empty() ? Value() : info.maskValues[i]);
++      if (isI32Inc) {
++        Value result = emitSharedInc(rewriter, loc, ptr, returnOld, pred);
++        if (returnOld)
++          results.push_back(result);
++        continue;
++      }
++      auto old = emitSharedAtomicAdd(rewriter, loc, info.llvmElemTy, ptr, value,
++                                     returnOld, pred);
++      if (failed(old))
++        return failure();
++      if (returnOld)
++        results.push_back(*old);
++    }
++
++    if (!returnOld) {
++      rewriter.eraseOp(op);
++      return success();
++    }
++
++    if (!info.removeBroadcast.isIdentity())
++      results = broadcastAs(results, info.regLayout);
++    finalizeTensorAtomicResults(op, info.valuesTy, rewriter, results,
++                                info.llvmElemTy, b, info.threadPred, targetInfo,
++                                getTypeConverter());
++    return success();
++  }
++
+ private:
+   const NVIDIA::TargetInfo &targetInfo;
+ };
+@@ -196,6 +398,8 @@ void mlir::triton::NVIDIA::populateMemoryOpToLLVMPatterns(
+                                        benefit.getBenefit() + 1);
+   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo,
+                                        benefit.getBenefit() + 1);
++  patterns.add<LocalAtomicScatterAddOpConversion>(typeConverter, targetInfo,
++                                                  benefit.getBenefit() + 1);
+   patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo,
+                                       benefit.getBenefit() + 1);
+   mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,

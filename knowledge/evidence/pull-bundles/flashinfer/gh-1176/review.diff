@@ -1,0 +1,267 @@
+diff --git a/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp b/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp
+index 0311409e54..6a9d32adbd 100644
+--- a/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp
++++ b/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -105,12 +105,28 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
+ 
+   return {valueE2M1, scaleFP8SF};
+ }
++
++void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
++                            int64_t m, int64_t n) {
++  CHECK_TH_CUDA(unswizzled_sf);
++  CHECK_CONTIGUOUS(unswizzled_sf);
++  CHECK_TH_CUDA(swizzled_sf);
++  CHECK_CONTIGUOUS(swizzled_sf);
++  CHECK_INPUT_TYPE(unswizzled_sf, c10::ScalarType::Byte);
++  CHECK_INPUT_TYPE(swizzled_sf, c10::ScalarType::Byte);
++
++  TORCH_CHECK(unswizzled_sf.sizes() == swizzled_sf.sizes(),
++              "Input and output tensors must have the same shape");
++
++  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
++  tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(
++      b, m, n, reinterpret_cast<uint8_t const*>(unswizzled_sf.data_ptr()),
++      reinterpret_cast<uint8_t*>(swizzled_sf.data_ptr()), mMultiProcessorCount,
++      at::cuda::getCurrentCUDAStream(unswizzled_sf.get_device()));
++}
+ }  // namespace torch_ext
+ 
+ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+-  m.def(
+-      "fp4_quantize(Tensor input, Tensor globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
+-      "swizzedLayout=True) "
+-      "-> (Tensor, Tensor)",
+-      &torch_ext::fp4_quantize);
++  m.def("fp4_quantize", &torch_ext::fp4_quantize);
++  m.def("fp4_swizzle_blockscale", &torch_ext::fp4_swizzle_blockscale);
+ }
+diff --git a/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.h b/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.h
+index 3934e1576c..236a2a1f7b 100644
+--- a/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.h
++++ b/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.h
+@@ -25,4 +25,7 @@ namespace torch_ext {
+ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
+                                                 at::Tensor const& globalScale, int64_t sfVecSize,
+                                                 bool sfUseUE8M0, bool isSfSwizzledLayout);
+-}
++
++void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
++                            int64_t m, int64_t n);
++}  // namespace torch_ext
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index 983bca84f4..af78d7a3b7 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -47,7 +47,7 @@
+     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
+ )
+ from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+-from .fp4_quantization import fp4_quantize
++from .fp4_quantization import fp4_quantize, fp4_swizzle_blockscale
+ from .fused_moe import cutlass_fused_moe
+ from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
+ from .gemm import bmm_fp8 as bmm_fp8
+diff --git a/flashinfer/fp4_quantization.py b/flashinfer/fp4_quantization.py
+index 0b3f1172c8..1a6ce13045 100644
+--- a/flashinfer/fp4_quantization.py
++++ b/flashinfer/fp4_quantization.py
+@@ -11,6 +11,35 @@
+ from .utils import register_custom_op, register_fake_op
+ 
+ 
++def _pad_scale_factors(
++    unswizzled_sf: torch.Tensor, m: int, n: int, sf_vec_size: int = 16
++) -> torch.Tensor:
++    """Pad scale factors tensor to meet alignment requirements.
++
++    Args:
++        unswizzled_sf (torch.Tensor): Input scale factors tensor with dtype uint8.
++        m (int): M dimension.
++        n (int): N dimension.
++        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
++
++    Returns:
++        torch.Tensor: Padded scale factors tensor.
++    """
++    factor = sf_vec_size * 4
++    padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
++    padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
++
++    # Pad the input tensor to [padded_row, padded_col // scaling_vector_size]
++    pad_rows = padded_row - m
++    pad_cols = (padded_col - n) // sf_vec_size
++    if pad_rows == 0 and pad_cols == 0:
++        return unswizzled_sf
++    else:
++        return torch.nn.functional.pad(
++            unswizzled_sf, (0, pad_cols, 0, pad_rows), mode="constant", value=0
++        ).contiguous()
++
++
+ def gen_fp4_quantization_sm100_module() -> JitSpec:
+     return gen_jit_spec(
+         "fp4_quantization_sm100",
+@@ -90,9 +119,48 @@ def _fake_fp4_quantize_sm100(
+             input.new_empty([m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+         )
+ 
++    @register_custom_op(
++        "flashinfer::fp4_swizzle_blockscale_sm100",
++        mutates_args=("swizzled_sf",),
++    )
++    def fp4_swizzle_blockscale_sm100(
++        unswizzled_sf: torch.Tensor,
++        swizzled_sf: torch.Tensor,
++        b: int,
++        m: int,
++        n: int,
++    ) -> None:
++        """Swizzle block scale tensor for FP4 format.
++
++        Args:
++            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8.
++            swizzled_sf (torch.Tensor): output tensor for swizzled block scale with dtype uint8.
++            b (int): Batch dimension.
++            m (int): M dimension.
++            n (int): N dimension.
++        """
++        module.fp4_swizzle_blockscale(
++            unswizzled_sf,
++            swizzled_sf,
++            b,
++            m,
++            n,
++        )
++
++    @register_fake_op("flashinfer::fp4_swizzle_blockscale_sm100")
++    def _fake_fp4_swizzle_blockscale_sm100(
++        unswizzled_sf: torch.Tensor,
++        swizzled_sf: torch.Tensor,
++        b: int,
++        m: int,
++        n: int,
++    ) -> None:
++        pass
++
+     # Register the module
+     return SimpleNamespace(
+         fp4_quantize_sm100=fp4_quantize_sm100,
++        fp4_swizzle_blockscale_sm100=fp4_swizzle_blockscale_sm100,
+     )
+ 
+ 
+@@ -139,3 +207,41 @@ def fp4_quantize(
+     )
+     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+     return x_q, sf
++
++
++def fp4_swizzle_blockscale(
++    unswizzled_sf: torch.Tensor, m: int, n: int, sf_vec_size: int = 16
++) -> torch.Tensor:
++    """Swizzle block scale tensor for FP4 format.
++
++    This function swizzles the block scale tensor to optimize memory access patterns
++    for FP4 operations. The output needs to be padded in the m dimension to be a multiple of 128.
++
++    Args:
++        unswizzled_sf (torch.Tensor): Input tensor with dtype uint8.
++        m (int): M dimension.
++        n (int): N dimension.
++        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
++
++    Returns:
++        torch.Tensor: Swizzled tensor with the same shape as input.
++
++    Raises:
++        AssertionError: If input dtype is not uint8.
++    """
++    # TODO(shuw): check input dtype is uint8
++    assert (
++        unswizzled_sf.dtype == torch.uint8
++    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
++    assert sf_vec_size == 16, f"Currently only support sf_vec_size 16!"
++    padded_input_sf = _pad_scale_factors(unswizzled_sf, m, n, sf_vec_size)
++    out = torch.empty_like(padded_input_sf)
++    o_m, o_n = out.shape
++    get_fp4_quantization_sm100_module().fp4_swizzle_blockscale_sm100(
++        padded_input_sf,
++        out,
++        1,
++        o_m,
++        o_n,
++    )
++    return out
+diff --git a/tests/test_fp4_quantize.py b/tests/test_fp4_quantize.py
+index b09f2fb166..bc1d4bd55b 100644
+--- a/tests/test_fp4_quantize.py
++++ b/tests/test_fp4_quantize.py
+@@ -3,7 +3,7 @@
+ import pytest
+ import torch
+ 
+-from flashinfer import fp4_quantize
++from flashinfer import fp4_quantize, fp4_swizzle_blockscale
+ from flashinfer.utils import is_sm100a_supported
+ 
+ DTYPES = [torch.float16, torch.bfloat16]
+@@ -234,5 +234,51 @@ def test_scale_swizzling(
+     assert_equal(ref_unswizzled_scale, unswizzled_scale)
+ 
+ 
++@pytest.mark.parametrize("shape", SHAPES)
++@pytest.mark.parametrize("seed", SEEDS)
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@torch.inference_mode()
++def test_fp4_swizzle_blockscale(
++    shape: tuple[int, int],
++    seed: int,
++    device: str,
++) -> None:
++    """Test the fp4_swizzle_blockscale function directly."""
++    if not is_sm100a_supported(torch.device("cuda")):
++        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
++    torch.set_default_device(device)
++    torch.manual_seed(seed)
++
++    m, n = shape
++    sf_vec_size = BLOCK_SIZE
++
++    # Create a test scale factors tensor with uint8 dtype
++    # The shape should be [m, n // sf_vec_size] for scale factors
++    scale_shape = (m, n // sf_vec_size)
++    unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
++
++    # Test the swizzling function
++    swizzled_sf = fp4_swizzle_blockscale(unswizzled_sf, m, n, sf_vec_size)
++
++    # Compare against the reference implementation
++    ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)
++
++    # Basic checks
++    assert swizzled_sf.dtype == torch.uint8, f"Expected uint8, got {swizzled_sf.dtype}"
++    assert swizzled_sf.device == unswizzled_sf.device, "Device mismatch"
++
++    # Check that the output has the expected padded shape
++    factor = sf_vec_size * 4
++    padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
++    padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
++    expected_shape = (padded_row, padded_col // sf_vec_size)
++
++    assert (
++        swizzled_sf.shape == expected_shape
++    ), f"Expected shape {expected_shape}, got {swizzled_sf.shape}"
++    assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
++    assert_equal(swizzled_sf, ref_swizzled_sf)
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])

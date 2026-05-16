@@ -1,0 +1,240 @@
+diff --git a/python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh b/python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh
+index aadcc495f51e..4f24b09736e1 100644
+--- a/python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh
++++ b/python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh
+@@ -35,23 +35,95 @@ __global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
+ 
+   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
+ 
+-  void* output_ptr = nullptr;
+-  Storage output_vec;
+   for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
+     const auto input_ptr = pointer::offset<Float>(input, i * input_stride);
++    const auto output_ptr = pointer::offset<Float>(output, i * output_stride);
+     const auto input_vec = gmem.load(input_ptr);
+     const auto weight_vec = gmem.load(weight_ptr);
+-    if (output_ptr != nullptr) {
+-      gmem.store(output_ptr, output_vec);
+-    }
+-    output_ptr = pointer::offset<Float>(output, i * output_stride);
+-    output_vec = norm::apply_norm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
++    const auto output_vec = norm::apply_norm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
++    gmem.store(output_ptr, output_vec);
+   }
+-  gmem.store(output_ptr, output_vec);
+ 
+   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
+ }
+ 
++template <int64_t kDim, bool kUsePDL, typename Float>
++__global__ void rmsnorm_warp(const RMSNormParams __grid_constant__ params) {
++  using namespace device;
++  using Storage = norm::StorageType<Float, kDim>;
++
++  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
++  const auto gmem = tile::Memory<Storage>::warp();
++
++  PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
++
++  for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
++    const auto input_ptr = pointer::offset<Float>(input, i * input_stride);
++    const auto output_ptr = pointer::offset<Float>(output, i * output_stride);
++    const auto input_vec = gmem.load(input_ptr);
++    const auto weight_vec = gmem.load(weight_ptr);
++    const auto output_vec = norm::apply_norm_warp<kDim>(input_vec, weight_vec, eps);
++    gmem.store(output_ptr, output_vec);
++  }
++
++  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
++}
++
++template <int64_t kDim, bool kUsePDL, typename DType>
++struct RMSNormWarpKernel {
++  static_assert(host::norm::is_config_supported<DType, kDim>(), "Unsupported norm configuration");
++  static_assert(kDim <= 256, "Use RMSNormKernel for hidden sizes > 256");
++  static constexpr auto kernel = rmsnorm_warp<kDim, kUsePDL, DType>;
++
++  static void
++  run(const tvm::ffi::TensorView input,
++      const tvm::ffi::TensorView weight,
++      const tvm::ffi::TensorView output,
++      float eps) {
++    using namespace host;
++    auto N = SymbolicSize{"num_tokens"};
++    auto D = SymbolicSize{"hidden_size"};
++    auto SI = SymbolicSize{"input_stride"};
++    auto SO = SymbolicSize{"output_stride"};
++    auto device = SymbolicDevice{};
++    D.set_value(kDim);
++    device.set_options<kDLCUDA>();
++
++    TensorMatcher({N, D})  // input
++        .with_strides({SI, 1})
++        .with_dtype<DType>()
++        .with_device(device)
++        .verify(input);
++    TensorMatcher({D})  // weight
++        .with_dtype<DType>()
++        .with_device(device)
++        .verify(weight);
++    TensorMatcher({N, D})  // output
++        .with_strides({SO, 1})
++        .with_dtype<DType>()
++        .with_device(device)
++        .verify(output);
++
++    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
++    const auto params = RMSNormParams{
++        .input = input.data_ptr(),
++        .weight = weight.data_ptr(),
++        .output = output.data_ptr(),
++        .input_stride = SI.unwrap(),
++        .output_stride = SO.unwrap(),
++        .num_tokens = num_tokens,
++        .eps = eps,
++    };
++
++    static constexpr uint32_t kNumThreads = device::kWarpThreads;
++    static const uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, kNumThreads);
++    static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
++    const auto num_blocks = std::min<uint32_t>(num_tokens, max_occupancy * kNumSM);
++    LaunchKernel(num_blocks, kNumThreads, device.unwrap())  //
++        .enable_pdl(kUsePDL)(kernel, params);
++  }
++};
++
+ template <int64_t kDim, bool kUsePDL, typename DType>
+ struct RMSNormKernel {
+   static_assert(host::norm::should_use_cta<DType, kDim>(), "Hidden size invalid for RMSNorm");
+diff --git a/python/sglang/jit_kernel/norm.py b/python/sglang/jit_kernel/norm.py
+index 6fad55c44eb7..3366f3871a67 100644
+--- a/python/sglang/jit_kernel/norm.py
++++ b/python/sglang/jit_kernel/norm.py
+@@ -31,14 +31,33 @@ def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
+     )
+ 
+ 
++_RMSNORM_WARP_SIZES = frozenset({64, 128, 256})
++_RMSNORM_MAX_HIDDEN_SIZE = 8192
++
++
++def _is_supported_rmsnorm_hidden_size(hidden_size: int) -> bool:
++    return hidden_size in _RMSNORM_WARP_SIZES or (
++        hidden_size > 256
++        and hidden_size % 256 == 0
++        and hidden_size <= _RMSNORM_MAX_HIDDEN_SIZE
++    )
++
++
++def _rmsnorm_kernel_class(hidden_size: int) -> str:
++    if hidden_size in _RMSNORM_WARP_SIZES:
++        return "RMSNormWarpKernel"
++    return "RMSNormKernel"
++
++
+ @cache_once
+ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
+     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
++    kernel_class = f"{_rmsnorm_kernel_class(hidden_size)}<{args}>"
+     return load_jit(
+         "rmsnorm",
+         *args,
+         cuda_files=["elementwise/rmsnorm.cuh"],
+-        cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
++        cuda_wrappers=[("rmsnorm", f"{kernel_class}::run")],
+     )
+ 
+ 
+@@ -104,6 +123,12 @@ def rmsnorm(
+ ) -> None:
+     output = output if output is not None else input
+     hidden_size = input.size(-1)
++    if not _is_supported_rmsnorm_hidden_size(hidden_size):
++        raise RuntimeError(
++            f"jit rmsnorm: unsupported hidden_size={hidden_size}. "
++            f"Supported: {sorted(_RMSNORM_WARP_SIZES)}, and multiples of 256 in "
++            f"(256, {_RMSNORM_MAX_HIDDEN_SIZE}]."
++        )
+     module = _jit_rmsnorm_module(hidden_size, input.dtype)
+     module.rmsnorm(input, weight, output, eps)
+ 
+diff --git a/python/sglang/jit_kernel/tests/test_norm_jit.py b/python/sglang/jit_kernel/tests/test_norm_jit.py
+index 271c5c947026..2df0ab8ff177 100644
+--- a/python/sglang/jit_kernel/tests/test_norm_jit.py
++++ b/python/sglang/jit_kernel/tests/test_norm_jit.py
+@@ -3,13 +3,21 @@
+ import pytest
+ import torch
+ 
+-# JIT rmsnorm: fp16/bf16 only; hidden_size must be a multiple of 256, > 256, and <=8192
+-RMSNORM_HIDDEN_SIZES = [512, 1024, 3072, 3584, 4096, 8192]
++# JIT rmsnorm: fp16/bf16 only
++# - Warp norm path (one warp per token):  hidden_size in {64, 128, 256}
++# - CTA norm path (multi-warp per token): hidden_size is a multiple of 256, > 256, and <=8192
++RMSNORM_HIDDEN_SIZES = [64, 128, 256, 512, 1024, 3072, 3584, 4096, 8192]
+ 
+ # JIT fused_add_rmsnorm: fp16/bf16 only; hidden_size % 8 == 0, <=8192
+ FUSED_ADD_RMSNORM_HIDDEN_SIZES = [1024, 3072, 3584, 4096, 8192]
+ 
+-BS_LIST = [1, 19, 99, 989]
++BS_LIST = [
++    1,
++    19,
++    99,
++    989,
++    8192,
++]  # 8192 ensures num_tokens > max_occupancy * kNumSM on any GPU
+ 
+ 
+ def _jit_rmsnorm(input, weight, output, eps):
+@@ -81,5 +89,50 @@ def test_fused_add_rmsnorm_jit(batch_size, hidden_size, dtype):
+     torch.testing.assert_close(r_jit, r_ref, rtol=1e-2, atol=1e-2)
+ 
+ 
++@pytest.mark.parametrize(
++    ("hidden_size", "expected"),
++    [
++        (0, False),
++        (64, True),
++        (128, True),
++        (256, True),
++        (512, True),
++        (8192, True),
++        (16384, False),
++    ],
++)
++def test_rmsnorm_hidden_size_support(hidden_size, expected):
++    from sglang.jit_kernel.norm import _is_supported_rmsnorm_hidden_size
++
++    assert _is_supported_rmsnorm_hidden_size(hidden_size) is expected
++
++
++@pytest.mark.parametrize(
++    ("hidden_size", "expected"),
++    [
++        (64, "RMSNormWarpKernel"),
++        (128, "RMSNormWarpKernel"),
++        (256, "RMSNormWarpKernel"),
++        (512, "RMSNormKernel"),
++        (8192, "RMSNormKernel"),
++    ],
++)
++def test_rmsnorm_kernel_dispatch(hidden_size, expected):
++    from sglang.jit_kernel.norm import _rmsnorm_kernel_class
++
++    assert _rmsnorm_kernel_class(hidden_size) == expected
++
++
++@pytest.mark.parametrize("hidden_size", [0, 16384])
++def test_rmsnorm_rejects_unsupported_hidden_size(hidden_size):
++    from sglang.jit_kernel.norm import rmsnorm
++
++    x = torch.randn(1, hidden_size)
++    w = torch.randn(hidden_size)
++
++    with pytest.raises(RuntimeError, match=f"unsupported hidden_size={hidden_size}"):
++        rmsnorm(x, w)
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__])

@@ -1,0 +1,807 @@
+diff --git a/cpp/tensorrt_llm/kernels/heuristicTopKDecode.cu b/cpp/tensorrt_llm/kernels/heuristicTopKDecode.cu
+index f73a36c2cbf7..d306cb1818e9 100644
+--- a/cpp/tensorrt_llm/kernels/heuristicTopKDecode.cu
++++ b/cpp/tensorrt_llm/kernels/heuristicTopKDecode.cu
+@@ -18,9 +18,10 @@
+ 
+ #include "tensorrt_llm/common/assert.h"
+ #include "tensorrt_llm/common/config.h"
++#include "tensorrt_llm/common/envUtils.h"
+ 
+-// Import heuristicTopKJob (__device__ __noinline__) and all helpers.
+-// heuristicTopKJob is independently optimized by ptxas, matching standalone
++// Import gvrTopKJob (__device__ __noinline__, the GVR micro-kernel) and
++// all helpers. gvrTopKJob is independently optimized by ptxas, matching standalone
+ // SASS quality regardless of the caller's prologue code.
+ #include "tensorrt_llm/kernels/heuristic_topk.cuh"
+ 
+@@ -34,12 +35,13 @@ namespace
+ {
+ 
+ using heuristic_topk::BLOCK_SIZE;
+-using heuristic_topk::heuristicTopKJob;
++using heuristic_topk::gvrTopKJob;
+ using heuristic_topk::KernelSmem;
+ using heuristic_topk::TOP_K;
+ 
+-// Multi-row kernel: thin wrapper that computes per-row parameters,
+-// then calls heuristicTopKJob (independently optimized device function).
++// heuristicTopKMultiRowKernel — outer multi-row launch wrapper (1 CTA per row).
++// Computes per-row parameters, then dispatches to the GVR micro-kernel
++// (gvrTopKJob, single-CTA single-row, independently optimized device function).
+ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
+     int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
+     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
+@@ -69,13 +71,19 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float
+             outputValues[i] = -FLT_MAX;
+             outputIndices[i] = -1;
+         }
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++        cudaTriggerProgrammaticLaunchCompletion();
++#endif
+         return;
+     }
+ 
+     // +1 accounts for the temporal shift: prev_topk indices were computed at
+     // seq_len-1, but the current step has one additional KV token appended.
+     int const preIdxOffset = (rowIdx % next_n) + 1;
+-    heuristicTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
++    gvrTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    cudaTriggerProgrammaticLaunchCompletion();
++#endif
+ }
+ 
+ } // anonymous namespace
+@@ -102,8 +110,19 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
+     TLLM_CHECK_WITH_INFO(stride0 % 4 == 0 || numRows <= 1,
+         "heuristicTopKDecode requires logits stride0 divisible by 4 for multi-row launch");
+ 
+-    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(
+-        logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK, preIdxStride, preIdxCount);
++    cudaLaunchConfig_t config;
++    config.gridDim = numRows;
++    config.blockDim = BLOCK_SIZE;
++    config.dynamicSmemBytes = smemSize;
++    config.stream = stream;
++    cudaLaunchAttribute attrs[1];
++    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
++    config.numAttrs = 1;
++    config.attrs = attrs;
++
++    cudaLaunchKernelEx(&config, heuristicTopKMultiRowKernel, logits, seqLens, preIdx, scratchValues, outIndices,
++        stride0, next_n, topK, preIdxStride, preIdxCount);
+ }
+ 
+ } // namespace kernels
+diff --git a/cpp/tensorrt_llm/kernels/heuristic_topk.cuh b/cpp/tensorrt_llm/kernels/heuristic_topk.cuh
+index 67bb27a01d59..b472e68ef8f4 100644
+--- a/cpp/tensorrt_llm/kernels/heuristic_topk.cuh
++++ b/cpp/tensorrt_llm/kernels/heuristic_topk.cuh
+@@ -15,28 +15,36 @@
+  */
+ 
+ // ============================================================================
+-// heuristic_topk.cuh — V2e: V2d + OPT5 (safety-guard done!=1) +
+-//                           OPT6 (NUM_BINS=2048 + parallel Phase 4b K-th bin search) +
+-//                           OPT7 (Phase 3 sub-pass 1 elimination via per-thread count cache)
+-// Heuristic-Guided TopK — Sort-Free, Histogram-Based Selection
+-// Optimised for NVIDIA B200 (Blackwell, sm_100), single thread-block kernel
++// heuristic_topk.cuh — Heuristic-Guided Top-K (Sort-Free, Histogram-Based)
+ //
+-// V2d: ballot-free Phase 3, skip-4a, skip-PassA, 256-bin, snap≤3
+-//      OPT3 (__ldg), OPT4 (redux.sync)
+-// V2e: +OPT5 (skip Phase 3 blockCountGE re-scan when done==1)
+-//      +OPT6 (NUM_BINS=2048 + parallel 2-step K-th bin search in Phase 4b)
+-//      +OPT7 (reuse per-thread counts cached by last blockCountGE; eliminates
+-//             Phase 3 sub-pass 1 full-N rescan)
++// Outer name: "heuristic" (algorithm family + public dispatcher / launchers).
++// Inner name: "gvr" (Guess-Verify-Refine) — the single-CTA single-row
++//             micro-kernel implementing the algorithm of:
++//   "Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding
++//    on Blackwell via Temporal Correlation"
+ //
+-// Define HEURISTIC_TOPK_PROFILE before including to enable per-phase printf.
+-// Shared memory: ~59 KB (no CUB dependency)
++// Optimised for NVIDIA B200 (Blackwell, sm_100), single thread-block kernel.
++//
++// GVR phase mapping:
++//   P1 (preIdx stats)               ┐  Guess: estimate the K-th-value
++//   P2 (secant threshold search)    ┘  threshold from previous-step top-K
++//                                      indices, then refine the guess via
++//                                      count-only secant iterations.
++//   P3 (collect)                    — Verify: scatter the elements that
++//                                      pass the guessed threshold into
++//                                      shared memory and confirm the
++//                                      candidate count is in the safe band.
++//   P4 (histogram snap + partition) — Refine: 2048-bin histogram snap to
++//                                      the exact K-th value, then partition
++//                                      the candidates into the output set.
+ // ============================================================================
+ 
+ #pragma once
+ 
+ #include <cfloat>
+ #include <cstdint>
+-#include <cstdio> // for snap convergence warning printf
++#include <cstdio>  // for snap convergence warning printf
++#include <cstdlib> // for std::getenv (PDL launcher env-gate)
+ #include <cuda_runtime.h>
+ 
+ namespace heuristic_topk
+@@ -254,154 +262,94 @@ __device__ __forceinline__ void blockFusedSnapIter(KernelSmem* smem, int count,
+ // for this function independently from the caller, matching standalone SASS.
+ // ============================================================================
+ 
+-__device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, int const N,
+-    int const* __restrict__ preIdx, int const M, int const topK, float* __restrict__ outputValues,
+-    int* __restrict__ outputIndices, KernelSmem* smem, int const preIdxOffset = 0)
++__device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int const N, int const* __restrict__ preIdx,
++    int const M, int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, KernelSmem* smem,
++    int const preIdxOffset = 0)
+ {
+     int const tid = threadIdx.x;
+     int const warp_id = tid / WARP_SIZE;
+     int const lane = tid & (WARP_SIZE - 1);
+     unsigned const full_mask = 0xffffffffu;
+ 
+-    // ================================================================
+-    // Phase 1 — Min/Max/Mean of pre-indexed values
+-    // ================================================================
+-
+-    float local_min = FLT_MAX;
+-    float local_max = -FLT_MAX;
+-    float local_sum = 0.0f;
+-    int local_cnt = 0;
+-    for (int i = tid; i < M; i += BLOCK_SIZE)
+     {
+-        int idx = __ldg(&preIdx[i]) + preIdxOffset;
+-        if (idx >= 0 && idx < N)
++        // ================================================================
++        // Phase 1 (GVR Guess, part 1) — Min/Max/Mean of pre-indexed values
++        // ================================================================
++
++        float local_min = FLT_MAX;
++        float local_max = -FLT_MAX;
++        float local_sum = 0.0f;
++        int local_cnt = 0;
++        for (int i = tid; i < M; i += BLOCK_SIZE)
+         {
+-            float v = __ldg(&input[idx]);
+-            local_min = fminf(local_min, v);
+-            local_max = fmaxf(local_max, v);
+-            local_sum += v;
+-            local_cnt++;
++            int idx = __ldg(&preIdx[i]) + preIdxOffset;
++            if (idx >= 0 && idx < N)
++            {
++                float v = __ldg(&input[idx]);
++                local_min = fminf(local_min, v);
++                local_max = fmaxf(local_max, v);
++                local_sum += v;
++                local_cnt++;
++            }
+         }
+-    }
+ 
+-    float wmin = warpReduceMin(local_min);
+-    float wmax = warpReduceMax(local_max);
+-    float wsum = local_sum;
++        float wmin = warpReduceMin(local_min);
++        float wmax = warpReduceMax(local_max);
++        float wsum = local_sum;
+ #pragma unroll
+-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+-        wsum += __shfl_down_sync(0xffffffffu, wsum, off);
+-    int wcnt = warpReduceSum(local_cnt);
++        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
++            wsum += __shfl_down_sync(0xffffffffu, wsum, off);
++        int wcnt = warpReduceSum(local_cnt);
+ 
+-    if (lane == 0)
+-    {
+-        smem->histogram[warp_id] = __float_as_int(wmin);
+-        smem->histogram[NUM_WARPS + warp_id] = __float_as_int(wmax);
+-        smem->histogram[NUM_WARPS * 2 + warp_id] = __float_as_int(wsum);
+-        smem->histogram[NUM_WARPS * 3 + warp_id] = wcnt;
+-    }
+-    __syncthreads();
+-
+-    if (tid == 0)
+-    {
+-        float pmin = FLT_MAX, pmax = -FLT_MAX, psum = 0.0f;
+-        int pcnt = 0;
+-        for (int w = 0; w < NUM_WARPS; w++)
++        if (lane == 0)
+         {
+-            pmin = fminf(pmin, __int_as_float(smem->histogram[w]));
+-            pmax = fmaxf(pmax, __int_as_float(smem->histogram[NUM_WARPS + w]));
+-            psum += __int_as_float(smem->histogram[NUM_WARPS * 2 + w]);
+-            pcnt += smem->histogram[NUM_WARPS * 3 + w];
++            smem->histogram[warp_id] = __float_as_int(wmin);
++            smem->histogram[NUM_WARPS + warp_id] = __float_as_int(wmax);
++            smem->histogram[NUM_WARPS * 2 + warp_id] = __float_as_int(wsum);
++            smem->histogram[NUM_WARPS * 3 + warp_id] = wcnt;
+         }
+-        float pmean = (pcnt > 0) ? psum / (float) pcnt : (pmin + pmax) * 0.5f;
+-
+-        smem->pmax_saved = pmax;
+-        smem->threshold = pmean;
+-        smem->val_lo = pmin;
+-        smem->val_hi = pmax;
+-        smem->cnt_lo = M + M / 4;
+-        smem->cnt_hi = 1;
+-        smem->done = 0;
+-    }
+-    __syncthreads();
++        __syncthreads();
+ 
+-    if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
+-    {
+         if (tid == 0)
+-            for (int i = 0; i < topK && i < N; i++)
++        {
++            float pmin = FLT_MAX, pmax = -FLT_MAX, psum = 0.0f;
++            int pcnt = 0;
++            for (int w = 0; w < NUM_WARPS; w++)
+             {
+-                outputIndices[i] = i;
+-                outputValues[i] = input[i];
++                pmin = fminf(pmin, __int_as_float(smem->histogram[w]));
++                pmax = fmaxf(pmax, __int_as_float(smem->histogram[NUM_WARPS + w]));
++                psum += __int_as_float(smem->histogram[NUM_WARPS * 2 + w]);
++                pcnt += smem->histogram[NUM_WARPS * 3 + w];
+             }
+-        return;
+-    }
+-
+-    // ================================================================
+-    // Phase 2 — Interpolation threshold search
+-    // ================================================================
+-
+-    blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
+-
+-    if (tid == 0)
+-    {
+-        int c = smem->cand_count;
+-        if (c >= TOP_K && c <= MAX_CANDIDATES)
+-            smem->done = 1;
+-        else if (c > MAX_CANDIDATES)
+-        {
+-            smem->val_lo = smem->threshold;
+-            smem->cnt_lo = c;
++            float pmean = (pcnt > 0) ? psum / (float) pcnt : (pmin + pmax) * 0.5f;
++
++            smem->pmax_saved = pmax;
++            smem->threshold = pmean;
++            smem->val_lo = pmin;
++            smem->val_hi = pmax;
++            smem->cnt_lo = M + M / 4;
++            smem->cnt_hi = 1;
++            smem->done = 0;
+         }
+-        else
+-        {
+-            smem->val_hi = smem->threshold;
+-            smem->cnt_hi = c;
+-        }
+-    }
+-    __syncthreads();
++        __syncthreads();
+ 
+-    for (int iter = 0; iter < MAX_REFINE_ITERS; iter++)
+-    {
+-        if (smem->done)
+-            break;
+-        if (tid == 0)
++        if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
+         {
+-            float vlo = smem->val_lo, vhi = smem->val_hi;
+-            int clo = smem->cnt_lo, chi = smem->cnt_hi;
+-            int target = TOP_K + SAFETY_MARGIN / 2;
+-            float range = vhi - vlo;
+-            float nv;
+-            if (clo > chi && range > 1e-10f)
+-            {
+-                float f = (float) (clo - target) / (float) (clo - chi);
+-                f = fmaxf(0.05f, fminf(0.95f, f));
+-                if (iter == 0)
+-                    f = fminf(f, 0.50f);
+-                nv = vlo + range * f;
+-            }
+-            else
+-                nv = (vlo + vhi) * 0.5f;
+-            if (nv <= vlo)
+-                nv = vlo + range * 0.05f;
+-            if (nv >= vhi)
+-                nv = vhi - range * 0.05f;
+-            if (nv == vlo || nv == vhi)
+-            {
+-                nv = (vlo + vhi) * 0.5f;
+-                if (nv == vlo || nv == vhi)
++            if (tid == 0)
++                for (int i = 0; i < topK && i < N; i++)
+                 {
+-                    smem->threshold = vlo;
+-                    smem->done = 2;
++                    outputIndices[i] = i;
++                    outputValues[i] = input[i];
+                 }
+-                else
+-                    smem->threshold = nv;
+-            }
+-            else
+-                smem->threshold = nv;
++            return;
+         }
+-        __syncthreads();
+-        if (smem->done)
+-            break;
++
++        // ================================================================
++        // Phase 2 (GVR Guess, part 2) — Secant-interpolation threshold search
++        // ================================================================
++
+         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
++
+         if (tid == 0)
+         {
+             int c = smem->cand_count;
+@@ -419,24 +367,87 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
+             }
+         }
+         __syncthreads();
+-    }
+ 
+-    if (tid == 0 && !smem->done)
+-    {
+-        if (smem->cnt_lo <= MAX_CANDIDATES * 2)
+-            smem->threshold = smem->val_lo;
+-        else
+-            smem->threshold = smem->val_hi;
+-        smem->done = 2;
+-    }
+-    __syncthreads();
++        for (int iter = 0; iter < MAX_REFINE_ITERS; iter++)
++        {
++            if (smem->done)
++                break;
++            if (tid == 0)
++            {
++                float vlo = smem->val_lo, vhi = smem->val_hi;
++                int clo = smem->cnt_lo, chi = smem->cnt_hi;
++                int target = TOP_K + SAFETY_MARGIN / 2;
++                float range = vhi - vlo;
++                float nv;
++                if (clo > chi && range > 1e-10f)
++                {
++                    float f = (float) (clo - target) / (float) (clo - chi);
++                    f = fmaxf(0.05f, fminf(0.95f, f));
++                    if (iter == 0)
++                        f = fminf(f, 0.50f);
++                    nv = vlo + range * f;
++                }
++                else
++                    nv = (vlo + vhi) * 0.5f;
++                if (nv <= vlo)
++                    nv = vlo + range * 0.05f;
++                if (nv >= vhi)
++                    nv = vhi - range * 0.05f;
++                if (nv == vlo || nv == vhi)
++                {
++                    nv = (vlo + vhi) * 0.5f;
++                    if (nv == vlo || nv == vhi)
++                    {
++                        smem->threshold = vlo;
++                        smem->done = 2;
++                    }
++                    else
++                        smem->threshold = nv;
++                }
++                else
++                    smem->threshold = nv;
++            }
++            __syncthreads();
++            if (smem->done)
++                break;
++            blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
++            if (tid == 0)
++            {
++                int c = smem->cand_count;
++                if (c >= TOP_K && c <= MAX_CANDIDATES)
++                    smem->done = 1;
++                else if (c > MAX_CANDIDATES)
++                {
++                    smem->val_lo = smem->threshold;
++                    smem->cnt_lo = c;
++                }
++                else
++                {
++                    smem->val_hi = smem->threshold;
++                    smem->cnt_hi = c;
++                }
++            }
++            __syncthreads();
++        }
++
++        if (tid == 0 && !smem->done)
++        {
++            if (smem->cnt_lo <= MAX_CANDIDATES * 2)
++                smem->threshold = smem->val_lo;
++            else
++                smem->threshold = smem->val_hi;
++            smem->done = 2;
++        }
++        __syncthreads();
++    } // end of P1+P2 scope
+ 
+     // ================================================================
+-    // Phase 3 — Ballot-free collect
++    // Phase 3 (GVR Verify) — Ballot-free candidate collect
+     // ================================================================
+ 
+-    // OPT5: when done==1, Phase 2 already verified count in [TOP_K, MAX_CANDIDATES];
+-    //        skip the redundant full-N blockCountGE re-check entirely.
++    // OPT5: when done==1, Phase 2 already verified count in
++    //        [TOP_K, MAX_CANDIDATES]; skip the redundant full-N
++    //        blockCountGE re-check entirely.
+     if (smem->done != 1)
+     {
+         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
+@@ -533,7 +544,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
+     __syncthreads();
+ 
+     // ================================================================
+-    // Phase 4 — Histogram-based selection + partition
++    // Phase 4 (GVR Refine) — Histogram-based selection + partition
+     // ================================================================
+ 
+     int const cand_count = min(smem->cand_count, MAX_CANDIDATES);
+@@ -668,6 +679,12 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
+             smem->out_count = 0;
+         __syncthreads();
+ 
++        // Opt-M fix: separate gt and eq into two sequential passes so that
++        // strictly-greater values are never dropped in favor of tie-values.
++        // The v0 interleaved version had a correctness bug when ties at the
++        // K-th value cross TOP_K; this fix makes the selection rank-stable.
++
++        // Pass 1: strictly greater than sel_thr
+         for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
+         {
+             int i = base + lane;
+@@ -689,6 +706,14 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
+                     outputIndices[bp + moff] = smem->vals[i];
+                 }
+             }
++        }
++        __syncthreads();
++
++        // Pass 2: equal to sel_thr (fills remaining slots)
++        for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
++        {
++            int i = base + lane;
++            float v = (i < cand_count) ? smem->keys[i] : -FLT_MAX;
+ 
+             bool emit_eq = (i < cand_count) && (v == sel_thr);
+             unsigned mask_eq = __ballot_sync(full_mask, emit_eq);
+@@ -731,17 +756,23 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
+ }
+ 
+ // ============================================================================
+-// Main Kernel (calls heuristicTopKJob as an independently-optimized device fn)
++// gvrTopKKernel — single-row global wrapper (1 CTA, 1 row).
++// Calls gvrTopKJob (independently-optimized device function).
++// For multi-row decode launches, see heuristicTopKMultiRowKernel in
++// heuristicTopKDecode.cu — both share the same micro-kernel job.
+ // ============================================================================
+ 
+ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
+-    heuristicTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
++    gvrTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
+         int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
+ {
+     extern __shared__ unsigned char smem_raw[];
+     auto* smem = reinterpret_cast<KernelSmem*>(smem_raw);
+ 
+-    heuristicTopKJob(input, N, preIdx, M, topK, outputValues, outputIndices, smem);
++    gvrTopKJob(input, N, preIdx, M, topK, outputValues, outputIndices, smem, /*preIdxOffset=*/0);
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    cudaTriggerProgrammaticLaunchCompletion();
++#endif
+ }
+ 
+ // ============================================================================
+@@ -769,12 +800,36 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
+         cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+         if (smemSize > static_cast<size_t>(maxSmem))
+             return cudaErrorInvalidConfiguration;
+-        cudaFuncSetAttribute(
+-            heuristicTopKKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
++        cudaFuncSetAttribute(gvrTopKKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
++    }
++
++    // Use cudaLaunchKernelEx with PDL attribute so the kernel epilogue's
++    // cudaTriggerProgrammaticLaunchCompletion() takes effect on Hopper+. The
++    // attribute is a no-op on pre-Hopper architectures. Honor the standard
++    // TRTLLM_ENABLE_PDL env var (default on; set "0" to disable) without
++    // depending on TRT-LLM common headers, since this launcher is also reused
++    // by the standalone JIT-compiled PyTorch extension under
++    // ablation_study/gvr_phase_timing/.
++    bool enablePDL = true;
++    if (char const* env = std::getenv("TRTLLM_ENABLE_PDL"))
++    {
++        if (env[0] == '0' && env[1] == '\0')
++            enablePDL = false;
+     }
+ 
+-    heuristicTopKKernel<<<1, BLOCK_SIZE, smemSize, stream>>>(
+-        input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
++    cudaLaunchConfig_t config{};
++    config.gridDim = dim3(1);
++    config.blockDim = dim3(BLOCK_SIZE);
++    config.dynamicSmemBytes = smemSize;
++    config.stream = stream;
++
++    cudaLaunchAttribute attrs[1];
++    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attrs[0].val.programmaticStreamSerializationAllowed = enablePDL ? 1 : 0;
++    config.attrs = attrs;
++    config.numAttrs = 1;
++
++    cudaLaunchKernelEx(&config, gvrTopKKernel, input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
+ 
+     return cudaGetLastError();
+ }
+diff --git a/cpp/tensorrt_llm/kernels/indexerTopK.cu b/cpp/tensorrt_llm/kernels/indexerTopK.cu
+index 5d71a36feeb2..6ee80b0886fa 100644
+--- a/cpp/tensorrt_llm/kernels/indexerTopK.cu
++++ b/cpp/tensorrt_llm/kernels/indexerTopK.cu
+@@ -21,9 +21,14 @@
+ #include "tensorrt_llm/common/envUtils.h"
+ #include "tensorrt_llm/kernels/heuristicTopKDecode.h"
+ #include "tensorrt_llm/kernels/noAuxTcKernels.h"
++#include <algorithm>
+ #include <cfloat>
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
+ 
+ namespace cg = cooperative_groups;
+ using namespace tensorrt_llm::common;
+@@ -672,13 +677,139 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
+     int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
+ {
+ 
++    // INVARIANT: kSortingAlgorithmThreshold is the ORIGINAL TRT-LLM Radix-path
++    // internal boundary (Insertion vs Radix-radix). v1.2.X dispatcher leaves it
++    // at 12288 — the GVR Heuristic axis (kSeqSmall, see below) is INDEPENDENT,
++    // so when canUseHeuristic is false (e.g. preIdx missing, BS too large, or
++    // numColumns < kSeqSmall), this function falls back to BYTE-IDENTICAL
++    // original radix dispatcher behavior. Do not touch this constant.
+     constexpr int kSortingAlgorithmThreshold = 12288;
+     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+     constexpr int kNumThreadsPerBlock = 512;
+     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
++
++    // ========================================================================
++    // Scheme X v1.2 (2026-04-25): adds small-N dispatch axis.
++    //
++    // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
++    // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
++    // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
++    // fixed cost dominates and the kernel loses to TRT-LLM's own
++    // insertion-sort/radix path. Empirically (random data, B200 BS=1):
++    //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
++    //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
++    //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
++    //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
++    //
++    // We therefore route N < kSeqSmall to the existing Radix/Insertion path
++    // (which itself splits at kSortingAlgorithmThreshold=12288), giving the
++    // best of both worlds. kSeqSmall is set at the empirical crossover point.
++    //
++    // See ablation_study/gvr_phase_timing/05_scheme_x_production/v1.2_smallN_dispatch/
++    // for the full N-scaling sweep and per-layer validation.
++    //
++    // ========================================================================
++    // Scheme X v1.1 (2026-04-23): architecture-derived BS-threshold dispatch,
++    // now jointly bounded by occupancy AND L2 cache capacity.
++    //
++    // Two physical constraints bound when the per-row heuristic kernel
++    // remains faster than a radix streaming kernel:
++    //
++    //   (A) Occupancy bound — 3·SM − SM/8 (wave geometry + setup margin)
++    //        Each CTA uses ~58 KB SMEM (fixed, independent of N), so B200's
++    //        228 KB dynamic SMEM allows max 3 CTA/SM. Above 3·SM rows per
++    //        launch, tail-wave imbalance causes stragglers. The -SM/8 margin
++    //        (~1/8 wave) covers CTA setup + L2 ingestion overhead.
++    //        On B200(148 SM): 3×148 − 18 = 426.
++    //
++    //   (B) L2 cache bound — 0.9·L2 / (4·N) per-CTA logits fit
++    //        Each CTA streams its row (N×4B) through L2 per Phase-2 iter.
++    //        With num_concurrent_CTAs × N × 4B > L2, eviction dominates.
++    //        On B200(126 MB L2) with N=70K: 0.9·126MB/(4·70690) ≈ 440,
++    //        which is ~ equal to (A)=426 — the two constraints cross over
++    //        near the SWE-Bench data point.
++    //        For N > 73K the L2 bound tightens below (A) and must take
++    //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
++    //
++    // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
++    // queries hardware attrs). For the SWE-Bench scenario (N≈70K) this is
++    // equivalent to Scheme X v1.0 (both produce 426), so v1.1 is a
++    // zero-regression upgrade; for larger N it auto-tightens the threshold.
++    // See ablation_study/gvr_phase_timing/optM_unified/Scheme_X_Report_20260422.md
++    // §9 for the full N-scaling analysis.
++    // ========================================================================
++    // Hardware-attribute cache (sm count, L2 capacity). std::call_once keeps
++    // the first concurrent caller from racing on cudaDeviceGetAttribute and
++    // ensures every later caller observes the populated values without an
++    // atomic compare-exchange of its own.
++    static std::once_flag sHwOnceFlag;
++    static int sCachedSmCount = 0;
++    static int sCachedL2Bytes = 0;
++    std::call_once(sHwOnceFlag,
++        []()
++        {
++            int dev = 0;
++            cudaGetDevice(&dev);
++            cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
++            cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
++        });
++    int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
++    int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
++        ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * 4))
++        : kBsWave;
++    int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
++
++    // v1.2: small-N lower bound — set to kSortingAlgorithmThreshold (12288) so
++    // the Heuristic axis takes over wherever the original Radix-radix branch
++    // would have triggered. Random-data benchmarks suggested 16384, but real
++    // SWE-Bench workloads see Heuristic ~6.3 us faster than random (preIdx-vs-
++    // logits ~99% correlated → P1 stats accurate → P2 secant 1-2 iter), shifting
++    // the real crossover into the [12288, 16384] band. Below 12288 the Insertion
++    // path is still used (canUseHeuristic gating + dispatcher fallback both
++    // route there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
++    static std::once_flag sNMinOnceFlag;
++    static int sCachedNMin = 0;
++    std::call_once(sNMinOnceFlag,
++        []()
++        {
++            constexpr int kSeqSmallDefault = 12288;
++            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
++            if (env != nullptr)
++            {
++                int const v = std::atoi(env);
++                sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
++            }
++            else
++            {
++                sCachedNMin = kSeqSmallDefault;
++            }
++        });
++    int const kSeqSmall = sCachedNMin;
++
+     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
+         && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+-        && heuristicScratch != nullptr;
++        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
++
++    // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
++    {
++        static std::once_flag sDebugOnceFlag;
++        static bool sDebug = false;
++        std::call_once(sDebugOnceFlag,
++            []()
++            {
++                char const* env = std::getenv("TRTLLM_SCHEMEX_DEBUG");
++                sDebug = (env != nullptr && env[0] == '1');
++            });
++        if (sDebug)
++        {
++            fprintf(stderr,
++                "[Scheme X v1.2] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
++                "L2=%dMB -> %s path%s\n",
++                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, sCachedSmCount,
++                sCachedL2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
++                (numColumns < kSeqSmall) ? " (small-N route)" : "");
++        }
++    }
+ 
+     if (canUseHeuristic)
+     {
+diff --git a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+index 6e65a0b92ca8..94146a6a9055 100644
+--- a/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
++++ b/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+@@ -1123,6 +1123,13 @@ def __init__(self,
+             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
+                 dtype=torch.float32, top_k=self.index_topk)
+ 
++        if self._enable_heuristic_topk and layer_idx == 0:
++            # Populate static caches (sm_count, L2 cache size) inside the C++
++            # Scheme X dispatcher before any CUDA Graph capture so the host
++            # attribute queries do not end up frozen into a captured graph.
++            from tensorrt_llm._torch.custom_ops import cpp_custom_ops
++            cpp_custom_ops.warmup_heuristic_topk_decode(top_k=self.index_topk)
++
+     def post_load_weights(self):
+         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
+diff --git a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+index 2cd0889217ea..8f6e9d129efa 100644
+--- a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+@@ -1,4 +1,5 @@
+-from typing import List, Optional, Tuple
++import threading
++from typing import List, Optional, Set, Tuple
+ 
+ import torch
+ 
+@@ -7,6 +8,13 @@
+ from ..._utils import get_sm_version
+ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+ 
++# Idempotency guard for warmup_heuristic_topk_decode — keyed by
++# (device_index, top_k, hint_size, num_cols). Prevents repeated allocations
++# and synchronizations when multiple Indexer modules invoke the warmup with
++# the same parameters during model construction.
++_HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
++_HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
++
+ if IS_CUTLASS_DSL_AVAILABLE:
+     from .cute_dsl_custom_ops import GroupedGemmInputsHelper
+ 
+@@ -1174,3 +1182,47 @@ def _(like: torch.Tensor,
+         out_shape = shape if shape is not None else list(like.shape)
+         dtype = out_dtype if out_dtype is not None else like.dtype
+         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
++
++
++def warmup_heuristic_topk_decode(top_k: int = 2048,
++                                 hint_size: int = 2048,
++                                 num_cols: int = 4096) -> None:
++    """Pre-initialize cached hardware attributes in the C++ Scheme X dispatcher.
++
++    The dispatcher inside ``invokeIndexerTopKDecode`` lazily queries
++    ``cudaDeviceGetAttribute`` for ``MultiProcessorCount`` and
++    ``L2CacheSize`` on its first call. Those host-side queries must not
++    be issued during ``cudaStreamBeginCapture / EndCapture``: the values
++    captured there become frozen into the graph and cannot be refreshed
++    across replays on a different device.
++
++    This warmup issues one small heuristic decode call so the static
++    caches are populated before any CUDA Graph capture begins. Must be
++    called from the Indexer setup hook (``layer_idx == 0``) when
++    ``enable_heuristic_topk`` is true.
++
++    Repeated invocations with the same ``(device, top_k, hint_size,
++    num_cols)`` key are short-circuited so that constructing many Indexer
++    modules in the same process does not re-allocate scratch tensors or
++    issue redundant synchronizations.
++    """
++    key = (torch.cuda.current_device(), top_k, hint_size, num_cols)
++    with _HEURISTIC_TOPK_WARMUP_LOCK:
++        if key in _HEURISTIC_TOPK_WARMUP_DONE:
++            return
++        _HEURISTIC_TOPK_WARMUP_DONE.add(key)
++
++    device = torch.device("cuda")
++    logits = torch.zeros((1, num_cols), dtype=torch.float32, device=device)
++    seq_lens = torch.tensor([num_cols], dtype=torch.int32, device=device)
++    indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
++    pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
++    scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
++    torch.ops.trtllm.indexer_topk_decode(logits,
++                                         seq_lens,
++                                         indices,
++                                         1,
++                                         top_k,
++                                         pre_idx=pre_idx,
++                                         heuristic_scratch=scratch)
++    torch.cuda.synchronize()

@@ -43,7 +43,9 @@ SKILL_NAMES=(
     "humanize-refine-plan"
     "humanize-rlcr"
     "humanize-kernel-agent-loop"
+    "ncu-report"
 )
+KERNEL_KNOWLEDGE_SKILL_NAME="kernel-knowledge"
 
 usage() {
     cat <<'EOF'
@@ -122,14 +124,22 @@ resolve_source_layout() {
 
 resolve_kernelpilot_root() {
     if [[ -n "$KERNELPILOT_ROOT" ]]; then
+        KERNELPILOT_ROOT="$(cd "$KERNELPILOT_ROOT" 2>/dev/null && pwd || true)"
         return 0
     fi
 
     local candidate
     candidate="$(cd "$REPO_ROOT/.." 2>/dev/null && pwd || true)"
-    if [[ -n "$candidate" && -f "$candidate/knowledge/index.json" && -f "$candidate/references/kernel-source-catalog.md" ]]; then
+    if [[ -n "$candidate" && -f "$candidate/knowledge/SKILL.md" && -d "$candidate/knowledge/evidence/pull-bundles" ]]; then
         KERNELPILOT_ROOT="$candidate"
     fi
+}
+
+validate_kernelpilot_root() {
+    [[ -n "$KERNELPILOT_ROOT" ]] || die "KernelPilot root not found; run from the kernel-pilot/humanize checkout or pass --kernelpilot-root PATH"
+    [[ -d "$KERNELPILOT_ROOT" ]] || die "KernelPilot root is not a directory: $KERNELPILOT_ROOT"
+    [[ -f "$KERNELPILOT_ROOT/knowledge/SKILL.md" ]] || die "KernelPilot knowledge skill not found: $KERNELPILOT_ROOT/knowledge/SKILL.md"
+    [[ -d "$KERNELPILOT_ROOT/knowledge/evidence/pull-bundles" ]] || die "KernelPilot PR evidence bundles not found: $KERNELPILOT_ROOT/knowledge/evidence/pull-bundles"
 }
 
 sync_dir() {
@@ -165,6 +175,12 @@ sync_one_skill() {
     local src="$SKILLS_SOURCE_ROOT/$skill"
     local dst="$target_dir/$skill"
     sync_dir "$src" "$dst"
+}
+
+sync_kernel_knowledge_skill() {
+    local target_dir="$1"
+    local dst="$target_dir/$KERNEL_KNOWLEDGE_SKILL_NAME"
+    sync_dir "$KERNELPILOT_ROOT/knowledge" "$dst"
 }
 
 install_runtime_bundle() {
@@ -265,6 +281,8 @@ sync_target() {
         log "syncing [$label] skill: $skill"
         sync_one_skill "$skill" "$target_dir"
     done
+    log "syncing [$label] skill: $KERNEL_KNOWLEDGE_SKILL_NAME"
+    sync_kernel_knowledge_skill "$target_dir"
     install_runtime_bundle "$target_dir"
     hydrate_skill_runtime_root "$target_dir"
     strip_claude_specific_frontmatter "$target_dir"
@@ -470,6 +488,7 @@ done
 
 resolve_source_layout "$REPO_ROOT"
 resolve_kernelpilot_root
+validate_kernelpilot_root
 validate_repo
 
 if [[ -n "$LEGACY_SKILLS_DIR" ]]; then

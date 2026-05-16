@@ -1,0 +1,416 @@
+diff --git a/benchmarks/bench_batch_attention.py b/benchmarks/bench_batch_attention.py
+index 5274688f98..9b0e7546cc 100644
+--- a/benchmarks/bench_batch_attention.py
++++ b/benchmarks/bench_batch_attention.py
+@@ -100,7 +100,7 @@ def synthesize_seq_len_configs() -> List[List[Tuple[int, int]]]:
+         [(8192, 1)] * 128,  # decode-only
+         [(4096, 128)] * 4,  # prefill-only
+         [(600, 1)] * 122 + [(10_000, 17)] * 8,  # hybird
+-        [(8192, 1)] * 127 * 2 + [(2048, 512)] * 1,  # hybrid (chunked-prefill)
++        [(8192, 1)] * 127 * 2 + [(8192, 4096)] * 1,  # hybrid (chunked-prefill)
+     ]
+ 
+     def _rand_case(bsz: int, lo: int, hi: int) -> List[Tuple[int, int]]:
+@@ -196,6 +196,7 @@ def main() -> None:
+         ],
+     )
+     print(df.to_markdown(index=False, floatfmt=".2f"))
++    df.to_csv("bench_batch_attention.csv", index=False)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/csrc/batch_attention.cu b/csrc/batch_attention.cu
+index 86a7fd287f..5544d0abf5 100644
+--- a/csrc/batch_attention.cu
++++ b/csrc/batch_attention.cu
+@@ -68,8 +68,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
+                             at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
+                             std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
+-                            int64_t page_size,
+-                            double sm_scale ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
++                            int64_t page_size, double sm_scale,
++                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
+   HolisticPlanInfo<2> plan_info;
+   plan_info.FromVector(tensor_to_vec(plan_info_vec));
+ 
+@@ -171,7 +171,9 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
+           params[i].v_stride_n = v_stride_n;
+ 
+           params[i].sm_scale = sm_scale;
+-
++          params[i].logits_soft_cap = logits_soft_cap;
++          // NOTE(Wenxuan) directly using the additional_params_decl from generate_additional_params
++          // will be problematic because of the params[i]
+           ADDITIONAL_PARAMS_SETTER
+           PROFILER_PARAMS_SETTER
+         }
+diff --git a/csrc/batch_attention_customize_config.jinja b/csrc/batch_attention_customize_config.jinja
+index 6bc85b0679..941a18bcd3 100644
+--- a/csrc/batch_attention_customize_config.jinja
++++ b/csrc/batch_attention_customize_config.jinja
+@@ -22,16 +22,29 @@ using namespace flashinfer;
+ 
+ {{ variant_decl }}
+ 
++template <bool UseLogitsSoftCap>
+ struct StandardAttention : AttentionVariantBase {
+   float sm_scale_log2;
+-
++  float soft_cap_pre_tanh_scale;
++  static constexpr bool use_logits_soft_cap = UseLogitsSoftCap;
+   PROFILER_CLOSURE_PARAMS_DECL
+ 
+   template <typename Params>
+   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
+                                         uint8_t* smem_ptr) {
+-    sm_scale_log2 = params.sm_scale * math::log2e;
++    if constexpr (UseLogitsSoftCap) {
++      soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
++      sm_scale_log2 = math::log2e * params.logits_soft_cap;
++    }else{
++      sm_scale_log2 = params.sm_scale * math::log2e;
++    }
+   }
++  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    if constexpr (UseLogitsSoftCap) {
++      logits = float(math::tanh(logits * soft_cap_pre_tanh_scale));
++    }
++    return logits;
++  })
+ };
+ 
+ #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, AttentionVariant, Params, ...) \
+@@ -96,7 +109,7 @@ struct PersistentParams {
+   uint32_t v_stride_n;
+ 
+   float sm_scale;
+-
++  double logits_soft_cap;
+   {{ additional_params_decl }}
+ 
+   PROFILER_PARAMS_DECL
+diff --git a/csrc/batch_attention_jit_pybind.cu b/csrc/batch_attention_jit_pybind.cu
+index 5daac62e4a..d2c6f8c150 100644
+--- a/csrc/batch_attention_jit_pybind.cu
++++ b/csrc/batch_attention_jit_pybind.cu
+@@ -28,8 +28,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
+                             at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
+                             std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
+-                            int64_t page_size,
+-                            double sm_scale ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
++                            int64_t page_size, double sm_scale,
++                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
+ 
+ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+   m.def("plan", &BatchPagedAttentionPlan);
+diff --git a/flashinfer/attention.py b/flashinfer/attention.py
+index 23c5b1f849..224403e86d 100644
+--- a/flashinfer/attention.py
++++ b/flashinfer/attention.py
+@@ -74,10 +74,15 @@ def plan(
+         page_size: int,
+         causal: bool = False,
+         sm_scale: float = None,
++        logits_soft_cap: Optional[float] = None,
+         q_data_type: torch.dtype = torch.bfloat16,
+         kv_data_type: torch.dtype = torch.bfloat16,
+         use_profiler: bool = False,
+     ) -> None:
++        if logits_soft_cap is None:
++            logits_soft_cap = 0.0
++        self._logits_soft_cap = logits_soft_cap
++
+         # get jit module
+         get_module_args = (
+             q_data_type,
+@@ -87,6 +92,7 @@ def plan(
+             head_dim_qk,
+             head_dim_vo,
+             PosEncodingMode["NONE"].value,
++            logits_soft_cap > 0.0,
+             use_profiler,  # different compiler path
+         )
+         self.module = get_holistic_attention_module(*get_module_args)
+@@ -130,6 +136,7 @@ def run(
+         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+         out: Optional[torch.Tensor] = None,
+         lse: Optional[torch.Tensor] = None,
++        logits_soft_cap: float = 0.0,
+         profiler_buffer: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         if profiler_buffer is None:
+@@ -137,6 +144,11 @@ def run(
+                 raise ValueError(
+                     "Profiler is enabled, profiler_buffer must be provided"
+                 )
++        if logits_soft_cap > 0.0 and self._logits_soft_cap <= 0.0:
++            raise ValueError(
++                "logits_soft_cap used in kernel run but not provided in plan(). This will cause template deduction error."
++            )
++
+         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
+         if out is None:
+             out = torch.empty_like(q)
+@@ -167,6 +179,9 @@ def run(
+             self._num_kv_heads,
+             self._page_size,
+             self._sm_scale,
++            logits_soft_cap,
++            # ADDITIONAL_FUNC_PARAMS
++            # PROFILER_FUNC_PARAMS
+             *profiler_args,
+         )
+ 
+diff --git a/flashinfer/jit/attention/pytorch.py b/flashinfer/jit/attention/pytorch.py
+index 1e22336793..cb52458928 100644
+--- a/flashinfer/jit/attention/pytorch.py
++++ b/flashinfer/jit/attention/pytorch.py
+@@ -395,6 +395,7 @@ def get_batch_attention_uri(
+     head_dim_qk: int,
+     head_dim_vo: int,
+     pos_encoding_mode: int,
++    use_logits_soft_cap: bool,
+     use_profiler: bool,
+ ) -> str:
+     return (
+@@ -405,6 +406,7 @@ def get_batch_attention_uri(
+         f"head_dim_qk_{head_dim_qk}_"
+         f"head_dim_vo_{head_dim_vo}_"
+         f"posenc_{pos_encoding_mode}_"
++        f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
+         f"use_profiler_{str(use_profiler).lower()}"
+     )
+ 
+@@ -861,6 +863,7 @@ def gen_batch_attention_module(
+     head_dim_qk: int,
+     head_dim_vo: int,
+     pos_encoding_mode: int,
++    use_logits_soft_cap: bool,
+     use_profiler: bool,
+ ):
+     uri = get_batch_attention_uri(
+@@ -871,6 +874,7 @@ def gen_batch_attention_module(
+         head_dim_qk,
+         head_dim_vo,
+         pos_encoding_mode,
++        use_logits_soft_cap,
+         use_profiler,
+     )
+ 
+@@ -878,7 +882,7 @@ def gen_batch_attention_module(
+     additional_tensor_dtypes = []
+     additional_scalar_names = []
+     additional_scalar_dtypes = []
+-    variant_name = f"StandardAttention"
++    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
+     variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+ 
+     return gen_customize_batch_attention_module(
+@@ -896,6 +900,7 @@ def gen_batch_attention_module(
+         variant_name,
+         variant_decl,
+         pos_encoding_mode=pos_encoding_mode,
++        use_logits_soft_cap=use_logits_soft_cap,
+         use_profiler=use_profiler,
+     )
+ 
+@@ -1507,6 +1512,7 @@ def gen_customize_batch_attention_module(
+     variant_name: str,
+     variant_decl: str,
+     pos_encoding_mode: int = 0,
++    use_logits_soft_cap: bool = False,
+     use_profiler: bool = False,
+ ):
+     kwargs = {
+@@ -1519,6 +1525,7 @@ def gen_customize_batch_attention_module(
+         "head_dim_qk": head_dim_qk,
+         "head_dim_vo": head_dim_vo,
+         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
++        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+     }
+     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+     (additional_params_decl, additional_func_params, additional_params_setter) = (
+@@ -1529,7 +1536,6 @@ def gen_customize_batch_attention_module(
+             additional_scalar_dtypes,
+         )
+     )
+-
+     with open(
+         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
+     ) as f:
+diff --git a/include/flashinfer/attention/persistent.cuh b/include/flashinfer/attention/persistent.cuh
+index 8c00aa5791..68a692960f 100644
+--- a/include/flashinfer/attention/persistent.cuh
++++ b/include/flashinfer/attention/persistent.cuh
+@@ -298,6 +298,13 @@ struct BlockBatchPagedAttentionPersistent {
+             __syncthreads();
+ 
+             compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
++            if constexpr (AttentionVariant::use_logits_soft_cap) {
++              logits_transform<KTraits>(
++                  params, variant, /*batch_idx=*/0, qo_packed_idx_base,
++                  kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
++                                 NUM_MMA_KV * 16,
++                  q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
++            }
+             if constexpr (WITH_MASK) {
+               logits_mask<KTraits>(
+                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+@@ -329,6 +336,13 @@ struct BlockBatchPagedAttentionPersistent {
+ #pragma unroll
+       for (; kv_tile_idx >= 0; --kv_tile_idx) {
+         compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
++        if constexpr (AttentionVariant::use_logits_soft_cap) {
++          logits_transform<KTraits>(
++              params, variant, /*batch_idx=*/0, qo_packed_idx_base,
++              kv_start +
++                  (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
++              q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
++        }
+         logits_mask<KTraits>(
+             params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+             kv_start +
+diff --git a/include/flashinfer/attention/prefill.cuh b/include/flashinfer/attention/prefill.cuh
+index 135cee8e30..bdadf8bad7 100644
+--- a/include/flashinfer/attention/prefill.cuh
++++ b/include/flashinfer/attention/prefill.cuh
+@@ -2287,7 +2287,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+ 
+       // compute attention score
+       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+-
+       logits_transform<KTraits>(
+           params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+diff --git a/include/flashinfer/attention/scheduler.cuh b/include/flashinfer/attention/scheduler.cuh
+index aa57d34c6e..aaafa26092 100644
+--- a/include/flashinfer/attention/scheduler.cuh
++++ b/include/flashinfer/attention/scheduler.cuh
+@@ -1145,8 +1145,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+ 
+   // NOTE(Zihao): adjust it later
+-  const int max_total_num_works = 16384;
+-  const int max_packed_qo_lens =
++  const int max_total_num_works = 65536;
++  const int max_num_kv_splits =
+       4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
+ 
+   // calculate kv_len_limit first, considering all workloads
+@@ -1167,7 +1167,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+   }
+ 
+   // used for remapping the output offsets
+-  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
++  // layout [packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
+   int partial_o_nnz = 0;
+   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
+   merge_indptr.push_back(partial_o_nnz);
+@@ -1251,6 +1251,12 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+       work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
+     }
+     int total_num_works = work_indptr_vec.back();
++    if (total_num_works > max_total_num_works) {
++      std::ostringstream err_msg;
++      err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
++              << " exceeds max_total_num_works " << max_total_num_works;
++      FLASHINFER_ERROR(err_msg.str());
++    }
+     auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
+     auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
+     auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
+@@ -1306,10 +1312,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+                            len_kv_chunk_vec);
+   }
+ 
+-  if (partial_o_nnz > max_packed_qo_lens) {
++  if (merge_indptr.size() > max_num_kv_splits) {
+     std::ostringstream err_msg;
+-    err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
+-            << max_packed_qo_lens;
++    err_msg << "Number of kv splits " << merge_indptr.size() << " exceeds max buffer size "
++            << max_num_kv_splits << ". Please increase the threshold.";
+     FLASHINFER_ERROR(err_msg.str());
+   }
+ 
+@@ -1317,9 +1323,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
+   // allocate buffer for state merge function
+   plan_info.merge_indptr_offset =
+-      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_packed_qo_lens, 16, "merge_indptr");
+-  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
+-      sizeof(IdType) * max_packed_qo_lens, 16, "merge_o_indices");
++      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_indptr");
++  plan_info.merge_o_indices_offset =
++      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_o_indices");
+   plan_info.num_qo_len_offset =
+       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
+   // copy data to paged cpu buffer
+@@ -1336,9 +1342,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
+   // Note(Yilong): adjust it later
+   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
+-      2 * max_packed_qo_lens * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
++      2 * max_num_kv_splits * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
+   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
+-      2 * max_packed_qo_lens * sizeof(float), 16, "holistic_partial_lse");
++      2 * max_num_kv_splits * sizeof(float), 16, "holistic_partial_lse");
+ 
+   return cudaSuccess;
+ }
+diff --git a/tests/test_batch_attention.py b/tests/test_batch_attention.py
+index 4d8182f0b5..2915a552e0 100644
+--- a/tests/test_batch_attention.py
++++ b/tests/test_batch_attention.py
+@@ -65,6 +65,7 @@ def _run_attention(
+     head_dim=128,
+     layout="NHD",
+     test_dtype=torch.bfloat16,
++    logits_soft_cap=0.0,
+     device="cuda",
+     causal=True,
+ ):
+@@ -127,6 +128,7 @@ def _run_attention(
+         causal=causal,
+         q_data_type=test_dtype,
+         kv_data_type=test_dtype,
++        logits_soft_cap=logits_soft_cap,
+     )
+     out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
+ 
+@@ -145,8 +147,9 @@ def _run_attention(
+         causal=causal,
+         q_data_type=test_dtype,
+         kv_data_type=test_dtype,
++        logits_soft_cap=logits_soft_cap,
+     )
+-    out_new, lse_new = wrapper.run(q, kv_data)
++    out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
+ 
+     torch.cuda.synchronize()
+     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
+@@ -161,6 +164,7 @@ def _run_attention(
+ @pytest.mark.parametrize("causal", [False, True])
+ @pytest.mark.parametrize("layout", ["HND", "NHD"])
+ @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
+ def test_batch_attention_correctness(
+     seq_len_pairs,
+     page_block_size,
+@@ -170,6 +174,7 @@ def test_batch_attention_correctness(
+     causal,
+     layout,
+     test_dtype,
++    logits_soft_cap,
+ ):
+     num_qo_heads = num_kv_heads * gqa_group_size
+     kv_lens = [p[0] for p in seq_len_pairs]
+@@ -185,5 +190,6 @@ def test_batch_attention_correctness(
+         causal=causal,
+         layout=layout,
+         test_dtype=test_dtype,
++        logits_soft_cap=logits_soft_cap,
+         device="cuda",
+     )

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import yaml
+
+from _kb import iter_pages, parse_markdown
+from _wiki_root import wiki_root
+
+
+PULL_BUNDLE_ROOT = Path("evidence") / "pull-bundles"
+DIFF_NAME = "review.diff"
+UPSTREAM_NAME = "upstream.json"
+ORIGIN_NAME = "ORIGIN.yaml"
+SNAPSHOT_DIR = "source-snapshot"
+
+
+def source_pr_bundle(root: Path, repo: str, number: object, fallback_repo_id: str) -> Path:
+    repo_id = fallback_repo_id.lower()
+    return root / PULL_BUNDLE_ROOT / repo_id / f"gh-{number}"
+
+
+def main() -> int:
+    root = wiki_root()
+    errors: list[str] = []
+    pages = iter_pages(include_queries=True)
+    ids: dict[str, str] = {}
+    for page in pages:
+        if page.relpath.startswith("queries/") and not page.meta:
+            continue
+        if not page.meta:
+            errors.append(f"{page.relpath}: missing YAML frontmatter")
+            continue
+        page_id = page.meta.get("id")
+        if page_id:
+            if page_id in ids:
+                errors.append(f"{page.relpath}: duplicate id {page_id} also in {ids[page_id]}")
+            ids[str(page_id)] = page.relpath
+        elif not page.relpath.startswith("queries/"):
+            errors.append(f"{page.relpath}: missing id")
+        if page.relpath.startswith("wiki/") and page.meta.get("sources"):
+            for source in page.meta.get("sources") or []:
+                if str(source) not in ids:
+                    # A later page may define it; checked again below.
+                    pass
+
+    for page in pages:
+        for source in page.meta.get("sources") or []:
+            if str(source) not in ids:
+                errors.append(f"{page.relpath}: missing source id {source}")
+        for related in page.meta.get("related") or []:
+            if str(related) not in ids:
+                errors.append(f"{page.relpath}: missing related id {related}")
+
+    artifact_errors = 0
+    for bundle in (root / "evidence").rglob("*"):
+        if bundle.is_dir() and any(bundle.iterdir()):
+            if bundle.name.startswith("gh-") and not (bundle / ORIGIN_NAME).exists():
+                artifact_errors += 1
+                errors.append(f"{bundle.relative_to(root)}: missing {ORIGIN_NAME}")
+
+    source_prs = 0
+    complete_source_pr_bundles = 0
+    for source in (root / "sources/prs").glob("*/*.md"):
+        source_prs += 1
+        page = parse_markdown(source)
+        repo = str(page.meta.get("repo", ""))
+        number = page.meta.get("pr")
+        artifact_dir = page.meta.get("artifact_dir")
+        if artifact_dir:
+            bundle = root / artifact_dir
+        else:
+            bundle = source_pr_bundle(root, repo, number, source.parent.name)
+        missing = []
+        for required in (DIFF_NAME, UPSTREAM_NAME, ORIGIN_NAME):
+            if not (bundle / required).is_file():
+                missing.append(required)
+        if not (bundle / SNAPSHOT_DIR).is_dir():
+            missing.append(f"{SNAPSHOT_DIR}/")
+        if missing:
+            errors.append(f"{source.relative_to(root)}: incomplete evidence bundle {bundle.relative_to(root)} missing {', '.join(missing)}")
+        else:
+            complete_source_pr_bundles += 1
+
+    ledgers = list((root / "candidates").glob("*.yaml"))
+    candidate_prs = 0
+    for ledger in ledgers:
+        try:
+            data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{ledger.relative_to(root)}: invalid yaml: {exc}")
+            continue
+        entries = data.get("candidates")
+        if entries is None:
+            entries = data.get("prs", [])
+        for entry in entries or []:
+            candidate_prs += 1
+            number = entry.get("pr", entry.get("number"))
+            label = f"{entry.get('repo', ledger.stem)}#{number}"
+            artifact_dir = entry.get("artifact_dir")
+            if not artifact_dir:
+                continue
+            bundle = root / artifact_dir
+            for required in (DIFF_NAME, ORIGIN_NAME):
+                if not (bundle / required).is_file():
+                    errors.append(f"{artifact_dir}: {label} missing {required}")
+            if not (bundle / SNAPSHOT_DIR).is_dir():
+                errors.append(f"{artifact_dir}: {label} missing {SNAPSHOT_DIR}/")
+
+    summary = {
+        "pages": len(pages),
+        "ids": len(ids),
+        "pull_bundles": len(list((root / PULL_BUNDLE_ROOT).glob("*/*"))),
+        "source_prs": source_prs,
+        "complete_source_pr_bundles": complete_source_pr_bundles,
+        "candidate_prs": candidate_prs,
+        "candidate_ledgers": len(ledgers),
+        "errors": len(errors),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    for error in errors:
+        print(f"ERROR: {error}")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

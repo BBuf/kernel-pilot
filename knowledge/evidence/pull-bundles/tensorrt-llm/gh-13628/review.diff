@@ -1,0 +1,424 @@
+diff --git a/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu b/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+new file mode 100644
+index 000000000000..f1a24f6de17e
+--- /dev/null
++++ b/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+@@ -0,0 +1,196 @@
++/*
++ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Fused 1x128 FP8 quantize + UE8M0 scale packing.
++//
++// Replaces the (scale_1x128_kernel + pack_fp32_into_ue8m0) two-kernel sequence
++// used by SM100 deep_gemm fp8 block-scale GEMMs. Adapted from the SM120 MoE
++// in-kernel packing pattern (`scale_1x128_kernel_sm120` in
++// sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh), specialised for the
++// non-MoE case (single contiguous batch, no token offsets).
++
++#include "fp8_blockscale_quant_packed.h"
++
++#include "tensorrt_llm/common/config.h"
++
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime_api.h>
++
++TRTLLM_NAMESPACE_BEGIN
++
++namespace kernels::fp8_blockscale_gemm
++{
++
++namespace
++{
++
++__device__ __forceinline__ float reciprocal_approximate_ftz_local(float a)
++{
++    float b;
++    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
++    return b;
++}
++
++// Each warp consumes one row × 4 quantization blocks (4 × 128 = 512 K elems).
++// 32 lanes split into 4 lane-groups of 8: each group covers 1 quant block
++// (8 lanes × 16 BF16 elems = 128 elems). After per-block amax, lanes
++// 0/8/16/24 each hold one UE8M0 scale byte; lane 0 packs them into a uint32
++// and stores in the deep_gemm-expected MN-major layout.
++template <int WarpsPerBlock>
++__global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict__ fp8_output,
++    int32_t* __restrict__ packed_scale_output, __nv_bfloat16 const* __restrict__ input, int const m, int const k,
++    int const scale_leading_dim_uint32)
++{
++    int const packed_sf_k_idx = static_cast<int>(blockIdx.x);
++    int const warp_id = static_cast<int>(threadIdx.x) >> 5;
++    int const lane_id = static_cast<int>(threadIdx.x) & 31;
++    int const m_idx = static_cast<int>(blockIdx.y) * WarpsPerBlock + warp_id;
++
++    if (m_idx >= m)
++    {
++        return;
++    }
++
++    int const k_base = packed_sf_k_idx * 512 + lane_id * 16;
++
++    // ---- 1. Load 16 BF16 elements per lane. ----
++    auto const* in_ptr = reinterpret_cast<double4 const*>(input + static_cast<int64_t>(m_idx) * k + k_base);
++    constexpr int kLoadNumElems = sizeof(double4) / sizeof(__nv_bfloat16); // 16
++
++    union LoadTrick
++    {
++        double4 pack;
++        __nv_bfloat16 v[kLoadNumElems];
++    };
++
++    LoadTrick load_trick;
++    bool const k_in_range = (k_base < k);
++    load_trick.pack = k_in_range ? in_ptr[0] : double4{};
++
++    if (k_in_range && k_base + kLoadNumElems > k)
++    {
++        int const valid = k - k_base;
++#pragma unroll
++        for (int i = 0; i < kLoadNumElems; ++i)
++        {
++            if (i >= valid)
++            {
++                load_trick.v[i] = __nv_bfloat16(0.0f);
++            }
++        }
++    }
++
++    // ---- 2. Per-block amax (lanes 0..7 / 8..15 / 16..23 / 24..31 = 4 quant blocks). ----
++    __nv_bfloat16 max_elem = __nv_bfloat16(0.0f);
++#pragma unroll
++    for (int i = 0; i < kLoadNumElems; ++i)
++    {
++        max_elem = __hmax(max_elem, __habs(load_trick.v[i]));
++    }
++    float amax = static_cast<float>(max_elem);
++    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4, 8));
++    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2, 8));
++    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1, 8));
++    amax = fmaxf(amax, 1e-10f);
++
++    // ---- 3. UE8M0 dequant scale. ----
++    float const dequant_scale_raw = amax * reciprocal_approximate_ftz_local(448.0f);
++    __nv_fp8_e8m0 ue8m0_scale;
++    ue8m0_scale.__x = __nv_cvt_float_to_e8m0(dequant_scale_raw, __NV_SATFINITE, cudaRoundPosInf);
++
++    // Recover quant_scale = 1 / 2^(exp - 127) for fp8 conversion.
++    constexpr uint32_t FP32_EXPONENT_BIAS = 127u;
++    float const quant_scale = (ue8m0_scale.__x == 0)
++        ? 1.0f
++        : exp2f(static_cast<float>(FP32_EXPONENT_BIAS) - static_cast<float>(ue8m0_scale.__x));
++
++    // ---- 4. Quantize and store FP8 output. ----
++    constexpr int kStoreNumElems = sizeof(float4) / sizeof(__nv_fp8_e4m3); // 16
++
++    union StoreTrick
++    {
++        float4 pack;
++        __nv_fp8_e4m3 v[kStoreNumElems];
++    };
++
++    StoreTrick store_trick;
++    store_trick.pack = float4{};
++#pragma unroll
++    for (int i = 0; i < kStoreNumElems; ++i)
++    {
++        store_trick.v[i] = __nv_fp8_e4m3(static_cast<float>(load_trick.v[i]) * quant_scale);
++    }
++    auto* out_ptr = reinterpret_cast<float4*>(fp8_output + static_cast<int64_t>(m_idx) * k + k_base);
++    if (k_in_range)
++    {
++        if (k_base + kStoreNumElems > k)
++        {
++            int const valid = k - k_base;
++#pragma unroll
++            for (int i = 0; i < kStoreNumElems; ++i)
++            {
++                if (i >= valid)
++                {
++                    store_trick.v[i] = __nv_fp8_e4m3(0.0f);
++                }
++            }
++        }
++        out_ptr[0] = store_trick.pack;
++    }
++
++    // ---- 5. Pack 4 UE8M0 scales (lanes 0/8/16/24) and store. ----
++    uint32_t const s0 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 0);
++    uint32_t const s1 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 8);
++    uint32_t const s2 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 16);
++    uint32_t const s3 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 24);
++    if (lane_id == 0)
++    {
++        // Mask off scale bytes whose sf_k is past the actual K.
++        int const num_sf_k = (k + 127) / 128;
++        int const sf_k_base = packed_sf_k_idx * 4;
++        uint32_t packed = 0u;
++        if (sf_k_base + 0 < num_sf_k)
++            packed |= s0;
++        if (sf_k_base + 1 < num_sf_k)
++            packed |= (s1 << 8);
++        if (sf_k_base + 2 < num_sf_k)
++            packed |= (s2 << 16);
++        if (sf_k_base + 3 < num_sf_k)
++            packed |= (s3 << 24);
++        // Layout: packed_scale[packed_sf_k_idx, m_idx]
++        packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = packed;
++    }
++}
++
++} // namespace
++
++void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
++    __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, cudaStream_t stream)
++{
++    constexpr int kWarpsPerBlock = 4;
++    int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
++    int const m_blocks = (m + kWarpsPerBlock - 1) / kWarpsPerBlock;
++    dim3 const grid(num_packed_sf_k, m_blocks, 1);
++    dim3 const block(kWarpsPerBlock * 32, 1, 1);
++    fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>
++        <<<grid, block, 0, stream>>>(fp8_output, packed_scale_output, input, m, k, scale_leading_dim_uint32);
++}
++
++} // namespace kernels::fp8_blockscale_gemm
++
++TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h b/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h
+new file mode 100644
+index 000000000000..a4079cd9b054
+--- /dev/null
++++ b/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Host-callable launcher for the fused FP8 1x128 quantize + UE8M0-pack kernel.
++// Kernel implementation lives in fp8_blockscale_quant_packed.cu and is built
++// by nvcc; this header is safe to include from .cpp files compiled by g++.
++
++#pragma once
++
++#include "tensorrt_llm/common/config.h"
++
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime_api.h>
++
++TRTLLM_NAMESPACE_BEGIN
++
++namespace kernels::fp8_blockscale_gemm
++{
++
++// Launches the fused 1x128 FP8 quant + UE8M0 pack kernel.
++//
++// Inputs:
++//   input  : BF16 [m, k] row-major contiguous
++// Outputs:
++//   fp8_output           : E4M3 [m, k] row-major contiguous
++//   packed_scale_output  : uint32 [packed_sf_k, scale_leading_dim_uint32]
++//                          where packed_sf_k = ceil(ceil(k/128)/4)
++//
++// `scale_leading_dim_uint32` is the (uint32) stride between consecutive
++// packed_sf_k rows of the scale tensor; caller is responsible for choosing
++// it (typically aligned to 4 uint32 = 16 bytes for TMA alignment).
++void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
++    __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, cudaStream_t stream);
++
++} // namespace kernels::fp8_blockscale_gemm
++
++TRTLLM_NAMESPACE_END
+diff --git a/cpp/tensorrt_llm/thop/fp8Quantize.cpp b/cpp/tensorrt_llm/thop/fp8Quantize.cpp
+index 9e94e02950f7..a05af0842a39 100644
+--- a/cpp/tensorrt_llm/thop/fp8Quantize.cpp
++++ b/cpp/tensorrt_llm/thop/fp8Quantize.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "tensorrt_llm/common/cudaUtils.h"
+ #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
++#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h"
+ #include "tensorrt_llm/thop/thUtils.h"
+ 
+ #include <ATen/cuda/EmptyTensor.h>
+@@ -141,6 +142,73 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
+ 
+     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
+ }
++
++// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 only).
++//
++// Drop-in replacement for the (fp8_quantize_1x128 → get_mn_major_tma_aligned_packed_ue8m0_tensor)
++// two-kernel sequence used by deep_gemm fp8 block-scale GEMMs.  Returns the
++// packed UE8M0 scale tensor (int32, MN-major, TMA-aligned) directly so
++// deep_gemm's transform_sf_into_required_layout falls through the
++// `(INT, 1, gran_k)` branch and skips its own pack call.
++std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self)
++{
++    CHECK_TH_CUDA(self);
++    CHECK_CONTIGUOUS(self);
++
++    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
++    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
++    TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
++        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100 (Blackwell).");
++
++    auto const m = self.sizes()[0];
++    auto const n = self.sizes()[1];
++
++    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
++    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
++    TORCH_CHECK(n % 16 == 0, "self.sizes()[1] must be a multiple of 16, but got ", n);
++
++    // FP8 output is row-major [m, n] with the same alignment used by the legacy path.
++    // The legacy path pads M to a multiple of 4; replicate that to avoid layout surprises.
++    auto const m_padded = (m + 4 - 1) / 4 * 4;
++
++    at::Tensor valueE4M3 = at::detail::empty_cuda(
++        {m_padded, n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
++
++    // Packed scale physical layout: [num_packed_sf_k, m_aligned] uint32, MN-contiguous in memory.
++    // deep_gemm's get_mn_major_tma_aligned_packed_ue8m0_tensor returns a strided VIEW with
++    // PyTorch shape `[mn, packed_sf_k]` and strides `(1, tma_aligned_mn)`. We build the same
++    // strided view so deep_gemm's transform_sf_into_required_layout falls into the
++    // `(INT, 1, gran_k)` branch and skips its own pack call.
++    auto const num_n_blocks = (n + 127) / 128;
++    auto const num_packed_sf_k = (num_n_blocks + 3) / 4;
++    constexpr int kTmaAlignedUint32Elems = 4; // 16 bytes / sizeof(uint32_t)
++    auto const m_aligned = (m_padded + kTmaAlignedUint32Elems - 1) / kTmaAlignedUint32Elems * kTmaAlignedUint32Elems;
++
++    // Allocate physical buffer [num_packed_sf_k, m_aligned] (K-major in memory).
++    at::Tensor packedBuf = at::detail::empty_cuda(
++        {num_packed_sf_k, m_aligned}, at::ScalarType::Int, self.device(), /* stride */ std::nullopt);
++    // Zero-fill so the [m, m_aligned) tail and out-of-range scale slots are deterministic.
++    packedBuf.zero_();
++
++    auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
++
++    tensorrt_llm::kernels::fp8_blockscale_gemm::launch_fp8_quantize_1x128_packed_bf16_e4m3(
++        reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(packedBuf.data_ptr()),
++        reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(n),
++        static_cast<int>(m_aligned), stream);
++
++    // Wrap the [num_packed_sf_k, m_aligned] memory as a [m, num_packed_sf_k] strided tensor
++    // matching deep_gemm's get_mn_major_tma_aligned_packed_ue8m0_tensor return contract:
++    //   shape  = (m, num_packed_sf_k)
++    //   stride = (1, m_aligned)
++    at::Tensor packedScale = at::from_blob(
++        packedBuf.data_ptr(),
++        /* sizes   */ {m, num_packed_sf_k},
++        /* strides */ {1, m_aligned},
++        /* deleter */ [keep = packedBuf](void*) mutable {}, packedBuf.options());
++
++    return {valueE4M3.slice(0, 0, m), packedScale};
++}
+ } // namespace torch_ext
+ 
+ TRTLLM_NAMESPACE_END
+@@ -149,10 +217,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
+ {
+     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
+     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
++    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input) -> (Tensor, Tensor)");
+ }
+ 
+ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+ {
+     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
+     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
++    m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
+ }
+diff --git a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+index 606fea822fc2..fa866c7e86ed 100644
+--- a/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+@@ -592,6 +592,17 @@ def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
+         scale_out = pe.new_empty((M, 1), dtype=torch.float32)
+         return fp8_out, scale_out
+ 
++    @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
++    def _(input: torch.Tensor):
++        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
++        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
++        m, k = input.shape[0], input.shape[1]
++        num_n_blocks = (k + 127) // 128
++        num_packed_sf_k = (num_n_blocks + 3) // 4
++        return torch.empty_like(input,
++                                dtype=torch.float8_e4m3fn), input.new_empty(
++                                    (m, num_packed_sf_k), dtype=torch.int32)
++
+     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+     def _(
+         x: torch.Tensor,
+diff --git a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+index f451f7b25aa0..4f07922c5a88 100644
+--- a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+@@ -1,3 +1,4 @@
++import os
+ import threading
+ from functools import lru_cache
+ from typing import ClassVar, List, Mapping, Optional, Tuple, Union
+@@ -1452,14 +1453,30 @@ def _(
+ 
+ # deep_gemm_gen_tuning_buckets is imported from ..utils
+ 
++_USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
++                                           "0") == "1"
++
+ 
+ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
+-    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
++    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
++
++    When the CUDA path is selected on SM100 and ``TRTLLM_FUSED_FP8_QUANT_PACK=1``
++    is set, the fused ``fp8_quantize_1x128_packed_ue8m0`` op is used and the
++    follow-on ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped:
++    the new op writes packed-UE8M0 (int32) scales directly in the layout
++    deep_gemm expects, so deep_gemm's internal layout transform falls into the
++    pre-packed branch and skips its own pack kernel as well.
++    """
+     TACTIC_TRITON = 1
+     if tactic == TACTIC_TRITON:
+         a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
+-    else:
+-        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
++        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
++            a_sf.transpose(0, 1))
++        return a, a_sf
++    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
++        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
++        return a, a_sf
++    a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+         a_sf.transpose(0, 1))
+     return a, a_sf
