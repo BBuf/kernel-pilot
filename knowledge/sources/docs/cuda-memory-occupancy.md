@@ -1,15 +1,15 @@
 ---
-id: doc-ako4all-cuda-memory-occupancy
-title: "AKO4ALL CUDA Memory Hierarchy and Occupancy Notes"
-url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references/ako4all/cuda-cpp/vendored-docs
+id: doc-cuda-memory-occupancy
+title: "CUDA Memory Hierarchy and Occupancy Notes"
+url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references
 source_category: community-note
 architectures: [sm90, sm100, sm120]
 tags: [memory-hierarchy, l2-cache, shared-memory, occupancy, register-budgeting, coalescing, bank-conflicts]
 retrieved_at: 2026-05-16
-description: "Distilled CUDA memory and occupancy notes from the previous vendored AKO4ALL doc cache."
+description: "Distilled CUDA memory and occupancy notes from the previous local reference cache."
 ---
 
-# AKO4ALL CUDA Memory Hierarchy and Occupancy Notes
+# CUDA Memory Hierarchy and Occupancy Notes
 
 This page distills only the kernel-relevant memory/occupancy pieces from the
 old vendored CUDA docs. It is intentionally compact.

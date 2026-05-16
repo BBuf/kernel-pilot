@@ -1,15 +1,15 @@
 ---
-id: doc-ako4all-sm90-guide
-title: "AKO4ALL SM90 Hopper Optimization Guide"
-url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references/ako4all/architectures
+id: doc-sm90-guide
+title: "SM90 Hopper Optimization Guide"
+url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references
 source_category: community-note
 architectures: [sm90, sm90a]
 tags: [tma, wgmma, cluster, mbarrier, fp8, shared-memory-optimization, vectorized-loads]
 retrieved_at: 2026-05-16
-description: "Distilled Hopper tuning notes from the previous AKO4ALL reference tree."
+description: "Distilled Hopper tuning notes from the previous local reference tree."
 ---
 
-# AKO4ALL SM90 Hopper Optimization Guide
+# SM90 Hopper Optimization Guide
 
 Hopper is the main comparison point for Blackwell migration.
 

@@ -1,16 +1,16 @@
 ---
-id: doc-ako4all-cuda-kernel-reference
-title: "AKO4ALL CUDA C++ and PTX Kernel Reference"
-url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references/ako4all
+id: doc-cuda-kernel-reference
+title: "CUDA C++ and PTX Kernel Reference"
+url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references
 source_category: community-note
 architectures: [sm90, sm100, sm120]
 tags: [cuda-cpp, ptx, coalescing, vectorized-loads, shared-memory-optimization, bank-conflicts, tma, wgmma, tcgen05]
 languages: [cuda-cpp, ptx]
 retrieved_at: 2026-05-16
-description: "Distilled CUDA C++/PTX workflow notes from the previous AKO4ALL reference tree."
+description: "Distilled CUDA C++/PTX workflow notes from the previous local reference tree."
 ---
 
-# AKO4ALL CUDA C++ and PTX Kernel Reference
+# CUDA C++ and PTX Kernel Reference
 
 Use this page as background for handwritten CUDA C++/PTX kernels. It is a
 workflow source, not a replacement for PR-diff evidence.

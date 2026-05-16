@@ -23,7 +23,7 @@
 | `contest-gpumode-p2` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-2-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-2-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 2: NVFP4 GEMM |
 | `contest-gpumode-p3` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-3-gated-dual-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-3-gated-dual-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 3: Gated Dual GEMM |
 | `contest-gpumode-p4` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-4-grouped-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-4-grouped-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 4: Grouped GEMM |
-| `doc-ako4all-cuda-kernel-reference` | community-note | [`sources/docs/ako4all-cuda-kernel-reference.md`](../sources/docs/ako4all-cuda-kernel-reference.md) | AKO4ALL CUDA C++ and PTX Kernel Reference |
+| `doc-cuda-kernel-reference` | community-note | [`sources/docs/cuda-kernel-reference.md`](../sources/docs/cuda-kernel-reference.md) | CUDA C++ and PTX Kernel Reference |
 | `pr-cccl-cub-1973` | upstream-code | [`sources/prs/cccl-cub/PR-1973.md`](../sources/prs/cccl-cub/PR-1973.md) | Experimental Python cooperative algorithms |
 | `pr-cccl-cub-2944` | upstream-code | [`sources/prs/cccl-cub/PR-2944.md`](../sources/prs/cccl-cub/PR-2944.md) | fix thread-reduce performance regression |
 | `pr-cccl-cub-3218` | upstream-code | [`sources/prs/cccl-cub/PR-3218.md`](../sources/prs/cccl-cub/PR-3218.md) | cuda.parallel: Support structured types as algorithm inputs |
@@ -1799,7 +1799,7 @@
 | `contest-gpumode-p2` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-2-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-2-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 2: NVFP4 GEMM |
 | `contest-gpumode-p3` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-3-gated-dual-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-3-gated-dual-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 3: Gated Dual GEMM |
 | `contest-gpumode-p4` | contest-report | [`sources/contests/gpu-mode-nvfp4/problem-4-grouped-gemm.md`](../sources/contests/gpu-mode-nvfp4/problem-4-grouped-gemm.md) | GPU Mode NVFP4 Hackathon - Problem 4: Grouped GEMM |
-| `doc-ako4all-cuda-kernel-reference` | community-note | [`sources/docs/ako4all-cuda-kernel-reference.md`](../sources/docs/ako4all-cuda-kernel-reference.md) | AKO4ALL CUDA C++ and PTX Kernel Reference |
+| `doc-cuda-kernel-reference` | community-note | [`sources/docs/cuda-kernel-reference.md`](../sources/docs/cuda-kernel-reference.md) | CUDA C++ and PTX Kernel Reference |
 | `pr-cccl-cub-3568` | upstream-code | [`sources/prs/cccl-cub/PR-3568.md`](../sources/prs/cccl-cub/PR-3568.md) | PTX: Update generated files with Blackwell instructions  |
 | `pr-cccl-cub-3624` | upstream-code | [`sources/prs/cccl-cub/PR-3624.md`](../sources/prs/cccl-cub/PR-3624.md) | Backport to 2.8: PTX support for Blackwell |
 | `pr-cccl-cub-3671` | upstream-code | [`sources/prs/cccl-cub/PR-3671.md`](../sources/prs/cccl-cub/PR-3671.md) | [libcudacxx] Stable abstraction for Blackwell work-stealing (PTX try_cancel) |

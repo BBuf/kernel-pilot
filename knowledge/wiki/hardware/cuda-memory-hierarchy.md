@@ -6,7 +6,7 @@ architectures: [sm90, sm100, sm120]
 tags: [memory-hierarchy, l2-cache, shared-memory, tma, tmem, mbarrier, coalescing, bank-conflicts, cache-policy]
 confidence: source-reported
 related: [technique-vectorized-loads, technique-cache-policy, technique-swizzling, pattern-memory-bound, hw-tma, hw-tmem]
-sources: [doc-ako4all-cuda-memory-occupancy, doc-ako4all-cuda-kernel-reference, doc-nvidia-tuning-guide, blog-lei-mao-cuda-gemm, blog-simon-boehm-sgemm, blog-veitner-cuda-cute]
+sources: [doc-cuda-memory-occupancy, doc-cuda-kernel-reference, doc-nvidia-tuning-guide, blog-lei-mao-cuda-gemm, blog-simon-boehm-sgemm, blog-veitner-cuda-cute]
 aliases: ["CUDA memory hierarchy", "memory hierarchy", "global shared register memory"]
 blackwell_relevance: "B200's high HBM bandwidth and large L2 make memory-bound kernels less forgiving of uncoalesced traffic, while TMEM changes accumulator pressure for tensor-core kernels."
 ---

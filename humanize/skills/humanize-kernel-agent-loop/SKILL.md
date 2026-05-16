@@ -142,7 +142,6 @@ python3 scripts/query.py "Blackwell memory hierarchy" --type hardware --limit 10
 python3 scripts/query.py --type technique --tag pipeline-stages --compact
 python3 scripts/query.py "tail effect persistent scheduling" --type pattern --compact
 python3 scripts/query.py "PTX cache policy" --type language --compact
-python3 scripts/get_page.py technique-profiling-debugging-loop --follow-sources
 
 # Source docs and blogs. Source pages use source_category values as --type.
 python3 scripts/query.py "tcgen05 tmem tuning guide" --type official-doc --limit 10

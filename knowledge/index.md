@@ -50,7 +50,6 @@ See [references/examples.md](references/examples.md) for 10 worked query pattern
 - [technique-fine-grained-quant](wiki/techniques/fine-grained-quantization.md) — Fine-grained FP8/FP4 quantization
 - [technique-vectorized-loads](wiki/techniques/vectorized-loads.md) — Wide vectorized loads and cache policies
 - [technique-cuda-gemm-optimization-ladder](wiki/techniques/cuda-gemm-optimization-ladder.md) — CUDA GEMM coalescing/tiling/buffering ladder
-- [technique-profiling-debugging-loop](wiki/techniques/profiling-debugging-loop.md) — Profiler-to-next-edit loop
 
 ## Kernel Case Studies
 

@@ -1,17 +1,17 @@
 ---
-id: doc-ako4all-sm100-guide
-title: "AKO4ALL SM100 Blackwell Datacenter Optimization Guide"
-url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references/ako4all/cuda-cpp
+id: doc-sm100-guide
+title: "SM100 Blackwell Datacenter Optimization Guide"
+url: https://github.com/BBuf/kernel-pilot/tree/main/knowledge/references
 source_category: community-note
 architectures: [sm100, sm100a]
 tags: [tcgen05, tmem, tma, clc, 2sm-cooperative, nvfp4, fp8, fp4, block-scale, memory-hierarchy]
 retrieved_at: 2026-05-16
-description: "Distilled Blackwell datacenter tuning notes from the previous AKO4ALL reference tree."
+description: "Distilled Blackwell datacenter tuning notes from the previous local reference tree."
 ---
 
-# AKO4ALL SM100 Blackwell Datacenter Optimization Guide
+# SM100 Blackwell Datacenter Optimization Guide
 
-This page keeps the Blackwell architecture notes from the previous AKO4ALL tree.
+This page keeps the Blackwell architecture notes from the previous local tree.
 Use official docs and PR evidence for final claims.
 
 ## Keep These Facts

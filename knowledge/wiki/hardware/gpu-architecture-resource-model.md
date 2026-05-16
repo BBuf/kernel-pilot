@@ -6,7 +6,7 @@ architectures: [sm90, sm100, sm120]
 tags: [memory-hierarchy, tma, wgmma, tcgen05, tmem, nvfp4, fp8, fp4, cluster, occupancy]
 confidence: source-reported
 related: [hw-tcgen05-mma, hw-tmem, hw-tma, hw-clc, migration-wgmma-to-tcgen05, migration-register-to-tmem]
-sources: [doc-ako4all-nvidia-architecture-reference, doc-ako4all-sm90-guide, doc-ako4all-sm100-guide, doc-nvidia-tuning-guide, blog-blackwell-microbenchmarking]
+sources: [doc-nvidia-architecture-reference, doc-sm90-guide, doc-sm100-guide, doc-nvidia-tuning-guide, blog-blackwell-microbenchmarking]
 aliases: ["architecture resource model", "SM resource model", "Hopper vs Blackwell resources"]
 blackwell_relevance: "This page explains which Hopper assumptions can carry to Blackwell and which must be re-validated for SM100/SM120."
 ---
