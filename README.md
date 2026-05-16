@@ -286,6 +286,10 @@ cd humanize
 tests/run-all-tests.sh
 ```
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=BBuf/kernel-pilot&type=Date)](https://www.star-history.com/#BBuf/kernel-pilot&Date)
+
 ## Related
 
 - [Humanize](https://github.com/PolyArch/humanize): the RLCR runtime that
