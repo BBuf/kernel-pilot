@@ -83,41 +83,6 @@ flowchart TD
 The writer agent is not hardcoded. In Codex it can be Codex; in Claude Code it
 can be Claude. The review backend and model come from Humanize configuration.
 
-## Standalone Repo Shape
-
-Every kernel run gets its own clean git repo. The source framework checkout is
-kept read-only unless the user explicitly asks for an in-place patch.
-
-```text
-<standalone-kernel-repo>/
-|-- .humanize/kernel-agent/refined-plan.md
-|-- README.md
-|-- src/<task_name>/
-|-- bindings/
-|-- tests/
-|-- benchmarks/
-|-- ledgers/
-|   |-- attempt-ledger.md
-|   |-- optimization-ledger.md
-|   `-- lineage.jsonl
-`-- profile-artifacts/
-    |-- README.md
-    `-- <version>/
-        |-- report.ncu-rep
-        |-- raw.csv
-        |-- details.txt
-        |-- source.csv
-        |-- sampling.csv
-        |-- kernel.ptx
-        |-- kernel.sass
-        `-- digest.md
-```
-
-`attempt-ledger.md` records every version. `optimization-ledger.md` records only
-correct versions with measured speedup. `lineage.jsonl` records parent version,
-mutation, motivation, influential source or PR evidence when it directly affects
-code, result, and selection status.
-
 ## Knowledge Base
 
 The knowledge base lives in [`knowledge/`](knowledge/). It is a local skill root
@@ -279,25 +244,13 @@ UI before relying on review-gated loop exits.
 Baseline-derived optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Optimize SGLang's H100 int8_scaled_mm kernel on H100. Use the existing SGLang/CUTLASS kernel as the baseline and starting point. Work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge autonomously, and profile with ncu-report when evidence is needed.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100. Use the existing SGLang/CUTLASS kernel as the baseline and starting point. Work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge autonomously, and profile with ncu-report when evidence is needed.
 ```
 
 From-scratch optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Optimize SGLang's H100 int8_scaled_mm kernel on H100. Implement the candidate kernel from scratch and use the existing SGLang/CUTLASS kernel only as the correctness, benchmark, profiler, and API comparison baseline. Work in a clean standalone repo with ledgers, lineage, benchmarks, and ncu-report profile digests.
-```
-
-Architecture-specific prior-art search:
-
-```text
-[$kernel-knowledge] Find Blackwell and Hopper PR evidence for persistent GEMM, tcgen05, TMA pipeline staging, tail effects, and profiler symptoms related to long scoreboard or tensor pipe underuse.
-```
-
-Profile digest:
-
-```text
-[$ncu-report] Compare profile-artifacts/v001_candidate/raw.csv with profile-artifacts/v000_baseline/raw.csv, inspect source counters and PTX/SASS if available, and produce a digest with one next kernel edit.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100. Implement the candidate kernel from scratch and use the existing SGLang/CUTLASS kernel only as the correctness, benchmark, profiler, and API comparison baseline. Work in a clean standalone repo with ledgers, lineage, benchmarks, and ncu-report profile digests.
 ```
 
 ## Maintenance
