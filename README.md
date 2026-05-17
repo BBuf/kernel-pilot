@@ -266,11 +266,27 @@ UI before relying on review-gated loop exits.
 Kernel optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, keep the work in a clean standalone repo, compare against the current SGLang baseline, and beat it by at least 10%.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100 for M=64, N=2048, K=2048, out_dtype=fp16, bias=true. Keep the work in a clean standalone repo, compare correctness and latency against the current SGLang baseline, and beat that baseline by at least 10% p50 latency on this focused case.
 ```
 
 Keep the prompt focused on the target kernel, environment, correctness checks,
 benchmark, and performance target.
+
+Example result from this shape:
+
+| Shape | Candidate | SGLang baseline | Result |
+| --- | ---: | ---: | ---: |
+| `M=64, N=2048, K=2048, fp16+bias` | `0.015184 ms` p50 | `0.017888 ms` p50 | `15.12%` faster |
+
+The stop hook summary should make the round outcome and review decision easy to
+inspect:
+
+![Humanize stop hook summary](docs/assets/humanize-stop-hook-summary.png)
+
+The optimization ledger should make selected versions and rejected follow-ups
+easy to scan:
+
+![KernelPilot optimization ledger](docs/assets/kernelpilot-optimization-ledger.png)
 
 ## Maintenance
 
