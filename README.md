@@ -2,9 +2,9 @@
 
 # KernelPilot
 
-**A Humanize-powered GPU kernel optimization loop with a local PR-driven
-CUDA knowledge base, Nsight Compute report skills, and clean standalone
-benchmark repos.**
+**An autonomous Humanize-powered GPU kernel optimization loop with a local
+PR-driven CUDA knowledge base, Nsight Compute report skills, and clean
+standalone benchmark repos.**
 
 [![GitHub stars](https://img.shields.io/github/stars/BBuf/kernel-pilot?style=social)](https://github.com/BBuf/kernel-pilot/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/BBuf/kernel-pilot?style=social)](https://github.com/BBuf/kernel-pilot/forks)
@@ -24,7 +24,7 @@ The project packages three cooperating skills:
 
 | Skill | Role |
 | --- | --- |
-| [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) | Turns a one-sentence kernel target into a plan, refined acceptance criteria, a standalone optimization repo, Humanize RLCR, correctness tests, benchmarks, profiles, ledgers, and review-gated iteration. |
+| [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) | Turns a kernel task and target into a plan, refined acceptance criteria, a standalone optimization repo, autonomous implementation/research/profiling decisions, correctness tests, benchmarks, ledgers, and review-gated iteration. |
 | [`kernel-knowledge`](knowledge/SKILL.md) | A local PR-diff-first CUDA kernel evidence corpus. It routes by architecture, repo, topic, technique, profile symptom, operator, and DSL, then opens PR diffs, source snapshots, wiki pages, docs, and blogs as needed. |
 | [`ncu-report`](humanize/skills/ncu-report/) | Converts Nsight Compute reports into a reproducible profile digest: metrics, source counters, PM sampling, PTX/SASS hotspots, bottleneck diagnosis, and exactly one next kernel edit. |
 
@@ -49,8 +49,9 @@ owns the rest.
   with bindings, tests, benchmarks, ledgers, lineage, and profile artifacts.
   The standalone repo is where implementation artifacts, provenance, and
   measurements live.
-- **Profile-first decisions.** `ncu-report` pushes the agent from vague labels
-  like "memory-bound" toward measured bottlenecks and one concrete next edit.
+- **Evidence-driven profiling.** The loop decides when `ncu-report` is worth
+  running, then uses it to move from vague labels like "memory-bound" toward
+  measured bottlenecks and one concrete next edit.
 - **Knowledge-backed edits.** The agent can read PRs, wiki pages, official
   docs, blog/code notes, and profiler examples when they help explain a
   benchmark result, profile symptom, regression, plateau, or next edit.
@@ -62,21 +63,24 @@ owns the rest.
 
 ```mermaid
 flowchart TD
-    A[One-sentence kernel goal] --> B[Humanize Kernel Agent Loop]
+    A[Kernel task and target] --> B[Humanize Kernel Agent Loop]
     B --> C[Generate plan]
     C --> D[Refine acceptance criteria]
     D --> E[Create standalone optimization repo]
     E --> F[Bindings, tests, benchmarks]
     F --> G[Baseline correctness and latency]
-    G --> H[Baseline ncu-report digest]
-    H --> I[Candidate edit]
+    G --> H{Next evidence?}
+    H -->|Profiler needed| L[ncu-report]
+    H -->|Prior art, DSL, hardware, source evidence| M[kernel-knowledge]
+    H -->|Enough evidence| I[Candidate edit]
     I --> J[Compile, test, benchmark]
     J --> K{Evidence needed?}
     K -->|Profile symptom, plateau, regression, surprise| L[ncu-report]
     K -->|Prior art, DSL, hardware, source evidence| M[kernel-knowledge]
-    L --> N[One concrete next edit]
+    K -->|Ready for review| O[Attempt, optimization, lineage, profile artifacts]
+    L --> N[Record digest and next edit]
     M --> N
-    N --> O[Attempt, optimization, lineage, profile artifacts]
+    N --> I
     O --> P[Humanize RLCR Stop hook review]
     P -->|blocked| I
     P -->|accepted| Q[Final kernel, dispatcher, tuning decisions]
@@ -262,7 +266,7 @@ UI before relying on review-gated loop exits.
 Kernel optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge and ncu-report when evidence is needed, and beat the current baseline by at least 10%.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, keep the work in a clean standalone repo, compare against the current SGLang baseline, and beat it by at least 10%.
 ```
 
 Keep the prompt focused on the target kernel, environment, correctness checks,
