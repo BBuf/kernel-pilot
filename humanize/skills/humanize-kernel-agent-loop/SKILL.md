@@ -1,6 +1,6 @@
 ---
 name: humanize-kernel-agent-loop
-description: "Run an autonomous Humanize Kernel Agent Loop for GPU kernel optimization: plan, refine, create a clean standalone repo, choose implementation strategies, query kernel-knowledge, benchmark/profile with Nsight Compute when useful, maintain lineage/ledgers, and start RLCR."
+description: "Run an autonomous Humanize Kernel Agent Loop for GPU kernel optimization: plan/refine K/R/W into task-acceptance pairs, create a clean standalone repo, research with kernel-knowledge, iterate with benchmark/profile evidence, autotune across the workload distribution, emit kernels/dispatcher/tuning decisions, maintain ledgers, and start RLCR."
 type: flow
 ---
 
@@ -12,21 +12,46 @@ Humanize RLCR.
 
 ## Algorithm Mapping
 
-This skill follows the Humanize kernel loop architecture without pinning the
-writer agent or review model:
+This skill follows the paper-style Humanize kernel loop architecture in a
+KernelPilot standalone-repo variant. The input contract is:
 
-- Planning: the current writer agent turns the one-sentence kernel goal into a
-  kernel-specific plan, refines it, and records acceptance criteria.
-- Execution: the current writer agent edits the standalone repo, compiles,
-  tests, benchmarks, chooses implementation strategies, profiles with
-  `ncu-report`/Nsight Compute when evidence is needed, and queries
-  `kernel-knowledge` whenever prior art or hardware evidence can guide the next
-  edit.
-- Review: Humanize's native Stop hook uses the configured review backend and
-  model to review evidence; after implementation is accepted, the review phase
-  runs the configured branch-diff review.
-- Feedback loop: if review blocks exit, the current writer agent applies the
-  feedback and reruns the inspect/edit/compile/test/benchmark/profile loop.
+```text
+Require: kernel definition K, correctness reference R, workload distribution W
+Ensure: kernel implementation K_hat that passes correctness checks on W and
+        minimizes latency, plus dispatcher and tuning decisions when W contains
+        multiple regimes.
+```
+
+The loop has three stages:
+
+- Research: inspect the target kernel contract, baseline/reference behavior,
+  workload distribution, repository context, and `kernel-knowledge` evidence.
+  Extract implementation recipes, profile hypotheses, and benchmark priorities.
+- Iterate: write candidate kernels in the standalone repo, compile, test,
+  benchmark, profile with `ncu-report`/Nsight Compute when useful, query
+  `kernel-knowledge` when prior art or hardware evidence can guide the next
+  edit, and record every lineage decision.
+- Autotune: scan the target workload distribution, benchmark selected variants
+  or configurations, build a performance map, and emit a shape-aware dispatcher
+  instead of forcing all shapes through one monolithic kernel.
+
+Planning decomposes the work into task-acceptance pairs `P = {(t_i, ac_i)}`.
+Each pair is executed until the review gate accepts the evidence:
+
+```text
+for each (t_i, ac_i) in P:
+    done = false
+    while not done:
+        writer executes t_i in the standalone repo
+        # inspect/edit code, compile, test, benchmark, profile, query KernelWiki
+        verdict, feedback = reviewer checks evidence against ac_i
+        if verdict == pass:
+            done = true
+        else:
+            writer refines the kernel using feedback
+            # if blocked, consult reviewer/tool evidence; ask human only if still unresolved
+return final kernels, dispatcher, and tuning decisions
+```
 
 In diagrams or papers that say "Claude executes, Codex reviews", read "Claude"
 as "the current writer agent". In a Claude Code session that may be Claude; in
@@ -48,18 +73,23 @@ If `{{KERNELPILOT_ROOT}}` was not hydrated, locate a repository containing
 Run the Humanize steps inside this skill. Do not ask the user to run separate
 `gen-plan`, `refine-plan`, or `humanize-rlcr` commands.
 
-Given a kernel task and target, you must:
+Given a kernel task and target, you must recover or define `K`, `R`, and `W`,
+then:
 
-1. Build the kernel-specific plan yourself.
+1. Build the kernel-specific task-acceptance plan yourself.
 2. Refine it yourself.
 3. Create or enter a clean standalone optimization repo.
-4. Choose the implementation stack, research cadence, profiling cadence,
-   benchmark coverage, and next edits autonomously from evidence.
-5. Start Humanize RLCR on the refined plan.
-6. Execute the current round until the Stop hook takes over.
+4. Record the workload distribution `W` and benchmark/correctness contract.
+5. Encode Stage 1 research, Stage 2 iteration, and Stage 3 autotuning as
+   task-acceptance pairs in the refined plan.
+6. Start Humanize RLCR on the refined plan.
+7. Execute the current round until the Stop hook takes over. The current and
+   later rounds run the research, implementation, profiling, benchmark,
+   autotuning, dispatcher, and review tasks until accepted.
 
-Ask the user only if the target kernel, target GPU, comparison target, or hard
-scope constraint is missing and cannot be inferred safely.
+Ask the user only if the kernel definition `K`, correctness reference `R`,
+workload distribution `W`, target GPU, comparison target, or hard scope
+constraint is missing and cannot be inferred safely.
 After those inputs exist, do not ask the user to approve each implementation
 strategy, knowledge query, profiling run, benchmark expansion, or lineage reset.
 The loop owns those tactical decisions and records the evidence behind them.
@@ -74,6 +104,11 @@ The loop owns those tactical decisions and records the evidence behind them.
   system most likely to reach the stated correctness and performance target
   from local context, available baselines, prior art, benchmarks, and profiler
   evidence.
+- Treat `W` as a workload distribution, not just a smoke test. If the user gives
+  explicit benchmark cases, those cases define `W`. If the user gives a model,
+  trace, or serving scenario, derive representative cases and record how they
+  were sampled. If only one focused shape exists, record that `W` is a single
+  regime and make the dispatcher/tuning decision trivial.
 - Treat `kernel-knowledge` and `ncu-report`/Nsight Compute as autonomous tools
   for deciding what to try next. The user should not need to tell the loop when
   to research, profile, or switch implementation strategy.
@@ -90,6 +125,10 @@ The loop owns those tactical decisions and records the evidence behind them.
   artifacts.
 - Every correct candidate attempt gets an attempt-ledger row. Only correct
   candidates that improve performance get an optimization-ledger row.
+- Stage 1 research must leave a concise recipe/evidence artifact before the
+  first serious optimization lineage. It should record source/baseline findings,
+  candidate implementation routes, expected bottlenecks, and initial benchmark
+  priorities. It is not a proof-of-reading ledger; it is the first decision map.
 - Prefer collecting one baseline `ncu-report` digest for a representative case
   after baseline correctness/benchmark succeeds. Skip it when Nsight Compute is
   unavailable or when a cheaper measurement is sufficient for the current round,
@@ -98,8 +137,8 @@ The loop owns those tactical decisions and records the evidence behind them.
   to explain a regression, plateau, surprising win, bottleneck shift, or next
   implementation edit.
 - The loop remains incomplete while correctness, benchmark, provenance, lineage,
-  or evidence gaps prevent a trustworthy autonomous next decision or final
-  claim.
+  workload coverage, dispatcher/tuning, or evidence gaps prevent a trustworthy
+  autonomous next decision or final claim.
 
 ## Required Files In The Standalone Repo
 
@@ -109,13 +148,18 @@ Create these before starting RLCR, then keep them updated during the loop:
 .gitignore
 .humanize/kernel-agent/refined-plan.md
 README.md
+workloads/
 src/<task_name>/
 bindings/
 tests/
 benchmarks/
+dispatch/
 ledgers/attempt-ledger.md
 ledgers/optimization-ledger.md
 ledgers/lineage.jsonl
+ledgers/research-digest.md
+ledgers/tuning-decisions.md
+benchmarks/performance-map.json
 profile-artifacts/README.md
 ```
 
@@ -205,10 +249,16 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - If external source seeds any candidate, provenance, license/notice,
   copied/adapted files, and the first optimization delta are recorded before
   further mutation.
-- Correctness tests cover representative shapes, dtypes, edge cases, and
-  baseline parity.
-- Benchmark harness records per-shape timing, geomean, best/worst cases, and
-  environment metadata.
+- `K`, `R`, and `W` are explicit: the kernel semantics, correctness oracle,
+  target workload distribution, target GPU, comparison baseline, and hard scope
+  exclusions are recorded before the first candidate is selected.
+- Correctness tests cover `W`, representative edge cases, dtype/layout/mode
+  boundaries, and baseline/reference parity.
+- Benchmark harness records per-shape timing, geomean, best/worst cases,
+  workload coverage, and environment metadata.
+- Stage 1 research digest records baseline/source findings, KernelWiki evidence
+  that materially affects the plan, candidate implementation routes, suspected
+  bottlenecks, and first benchmark/profile priorities.
 - A baseline profile decision is recorded after baseline benchmark succeeds:
   either capture a representative `ncu-report` digest or explain why the loop is
   using cheaper evidence first.
@@ -221,6 +271,13 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - Optimization ledger records only correct versions with measured improvement.
 - Lineage records parent version, mutation/motivation, influential source or PR
   evidence when it directly affects code, result, and selected/rejected status.
+- Stage 3 autotuning builds a performance map over `W`, tests selected variants
+  or configurations across all required regimes, and emits dispatcher/tuning
+  decisions. If `W` is a single focused case, record why a trivial dispatcher is
+  sufficient.
+- The final answer and ledgers identify final kernels, fallback paths if any,
+  dispatcher policy, tuning decisions, correctness matrix, benchmark matrix, and
+  remaining unsupported regimes.
 - When progress stalls, expand PR research with unread PR bundles, changed
   kernel files, linked tests, benchmarks, and profiler notes, guided by the
   current task context and existing attempt/lineage notes.

@@ -24,7 +24,7 @@ The project packages three cooperating skills:
 
 | Skill | Role |
 | --- | --- |
-| [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) | Turns a kernel task and target into a plan, refined acceptance criteria, a standalone optimization repo, autonomous implementation/research/profiling decisions, correctness tests, benchmarks, ledgers, and review-gated iteration. |
+| [`humanize-kernel-agent-loop`](humanize/skills/humanize-kernel-agent-loop/) | Turns kernel definition `K`, reference `R`, and workload distribution `W` into task-acceptance pairs, a standalone optimization repo, autonomous research/iteration/autotuning, correctness tests, benchmarks, ledgers, dispatcher, tuning decisions, and review-gated iteration. |
 | [`kernel-knowledge`](knowledge/SKILL.md) | A local PR-diff-first CUDA kernel evidence corpus. It routes by architecture, repo, topic, technique, profile symptom, operator, and DSL, then opens PR diffs, source snapshots, wiki pages, docs, and blogs as needed. |
 | [`ncu-report`](humanize/skills/ncu-report/) | Converts Nsight Compute reports into a reproducible profile digest: metrics, source counters, PM sampling, PTX/SASS hotspots, bottleneck diagnosis, and exactly one next kernel edit. |
 
@@ -35,9 +35,9 @@ Together they make an optimization loop that can work from a simple request:
 ```
 
 The loop decides how to plan, when to query knowledge, what to profile, how to
-record lineage, and when to ask the Humanize review gate whether another round
-is needed. The human should specify the target when it is ambiguous; the loop
-owns the rest.
+record lineage, how to scan the workload distribution, and when to ask the
+Humanize review gate whether another round is needed. The human should specify
+the target when it is ambiguous; the loop owns the rest.
 
 ## Why Use It
 
@@ -58,43 +58,63 @@ owns the rest.
 - **Review-gated iteration.** Humanize RLCR keeps the loop from declaring
   victory too early; default loop budget is 84 iterations unless configured
   otherwise.
+- **Shape-aware tuning.** The loop treats benchmark cases as a workload
+  distribution, builds a performance map, and emits dispatcher/tuning decisions
+  when different regimes need different kernels or configurations.
 
 ## Kernel Agent Loop
 
 ```mermaid
-flowchart TD
-    A[Kernel task and target] --> B[Humanize Kernel Agent Loop]
-    B --> C[Generate plan]
-    C --> D[Refine acceptance criteria]
-    D --> E[Create standalone optimization repo]
-    E --> F[Bindings, tests, benchmarks]
-    F --> G[Baseline correctness and latency]
-    G --> H{Next evidence?}
-    H -->|Profiler needed| L[ncu-report]
-    H -->|Prior art, DSL, hardware, source evidence| M[kernel-knowledge]
-    H -->|Enough evidence| I[Candidate edit]
-    I --> J[Compile, test, benchmark]
-    J --> K{Evidence needed?}
-    K -->|Profile symptom, plateau, regression, surprise| L[ncu-report]
-    K -->|Prior art, DSL, hardware, source evidence| M[kernel-knowledge]
-    K -->|Ready for review| O[Attempt, optimization, lineage, profile artifacts]
-    L --> N[Record digest and next edit]
-    M --> N
-    N --> I
-    O --> P[Humanize RLCR Stop hook review]
-    P -->|blocked| I
-    P -->|accepted| Q[Final kernel, dispatcher, tuning decisions]
+flowchart LR
+    K[Kernel definition K] --> P[Plan P = task and AC pairs]
+    R[Correctness reference R] --> P
+    W[Workload distribution W] --> P
+    P --> S[Clean standalone repo]
+
+    subgraph R0[Stage 1: Research]
+        KW[kernel-knowledge / KernelWiki]
+        B[Baseline and repo inspection]
+        RD[Research digest and recipes]
+        KW --> RD
+        B --> RD
+    end
+
+    subgraph I0[Stage 2: Iterate]
+        T[Writer executes task t_i]
+        E[Inspect, edit, compile, test, benchmark, profile]
+        V{Reviewer checks evidence vs ac_i}
+        T --> E --> V
+        V -->|blocked feedback| T
+    end
+
+    subgraph A0[Stage 3: Autotune]
+        PM[Performance map over W]
+        D[Shape-aware dispatcher]
+        TD[Tuning decisions]
+        PM --> D --> TD
+    end
+
+    S --> RD --> T
+    V -->|pass| PM
+    E -->|profile evidence needed| NCU[ncu-report / Nsight Compute]
+    NCU --> T
+    E -->|prior art needed| KW
+    TD --> O[Final kernels, dispatcher, correctness matrix, benchmark matrix]
 ```
 
 The writer agent is not hardcoded. In Codex it can be Codex; in Claude Code it
 can be Claude. The review backend and model come from Humanize configuration.
+Unlike the paper's in-repository version, KernelPilot keeps implementation
+artifacts in a clean standalone repo unless the user explicitly asks for an
+in-place framework patch.
 
 ## Kernel Requests
 
-A useful request names the operator, target hardware, scope, correctness checks,
-benchmark method, and performance target. KernelPilot turns that into a plan,
-an isolated implementation workspace, repeatable measurements, profiler
-evidence, lineage, and Humanize review rounds.
+A useful request names the kernel definition, correctness reference, workload
+distribution, target hardware, scope, benchmark method, and performance target.
+KernelPilot turns that into a task-acceptance plan, an isolated implementation
+workspace, repeatable measurements, profiler evidence, lineage, performance
+map, dispatcher/tuning decisions, and Humanize review rounds.
 
 Existing implementations, PR diffs, docs, blogs, and profile reports are working
 materials for the loop. When external source or design evidence materially
