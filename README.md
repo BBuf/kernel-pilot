@@ -47,8 +47,7 @@ owns the rest.
 - **Standalone by default.** Candidate kernels do not pollute SGLang, vLLM,
   PyTorch, or other large framework repos. The loop creates an isolated repo
   with bindings, tests, benchmarks, ledgers, lineage, and profile artifacts.
-  Standalone is a repo/runtime boundary, not a clean-room rule: public baseline
-  code may seed the candidate when license and provenance allow.
+  Standalone is an isolation boundary, not a prescribed source-use strategy.
 - **Profile-first decisions.** `ncu-report` pushes the agent from vague labels
   like "memory-bound" toward measured bottlenecks and one concrete next edit.
 - **Autonomous knowledge use.** The agent can read PRs, wiki pages, official
@@ -85,15 +84,19 @@ flowchart TD
 The writer agent is not hardcoded. In Codex it can be Codex; in Claude Code it
 can be Claude. The review backend and model come from Humanize configuration.
 
-## Source Use Policy
+## Strategy Autonomy
 
-Every kernel run still uses a clean standalone optimization repo. In that
-context, standalone means repo/runtime isolation, not clean-room authorship.
-When the user names a high-performance baseline and does not explicitly ask for
-a from-scratch implementation, public baseline source may be copied, ported, or
-specialized into the standalone repo. The source framework checkout stays
-read-only, and the ledgers must record source URL/path, version or commit,
-license/notice, copied files, and optimization deltas.
+KernelPilot is goal-driven. The user should specify the operator, hardware,
+allowed implementation stack, correctness checks, benchmark method, and
+performance target. The loop should not ask the user to choose whether the
+agent starts from a baseline implementation or writes a new kernel unless that
+choice is an actual task requirement or a license/access blocker.
+
+The agent may study, copy, port, adapt, or ignore public baseline and prior-art
+source as needed to reach the goal. If source influences code, the standalone
+repo must record provenance, license/notice, copied or adapted files, and
+optimization deltas. Review gates judge measurable progress toward the final
+target, not whether the route fits a baseline-derived or from-scratch label.
 
 ## Knowledge Base
 
@@ -151,11 +154,9 @@ blogs, contests, and query indices are still first-class support material for
 hardware contracts, DSL semantics, profile interpretation, and technique
 selection.
 
-For a named baseline, source evidence wins over summaries. Inspect the baseline
-implementation, helper code, layout descriptors, tests, benchmarks, and
-provenance before inventing a replacement from scratch. Summaries are routing
-and explanation tools; copied or ported implementation choices should be
-grounded in source snapshots or installed source files.
+Knowledge use is autonomous. Source snapshots, installed source, wiki pages,
+docs, blogs, and profiler digests are tools for choosing the next edit; they do
+not impose a fixed implementation route by themselves.
 
 ## Query Examples
 
@@ -257,43 +258,16 @@ ncu-report
 If Humanize reports that hooks need review, approve the Stop hook in the client
 UI before relying on review-gated loop exits.
 
-## Prompt Cards
+## Prompt Card
 
-Baseline-derived optimization:
-
-```text
-[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100. Use the existing SGLang/CUTLASS kernel as the baseline and starting point. Work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge autonomously, and profile with ncu-report when evidence is needed.
-```
-
-Implicit baseline-derived optimization:
+Goal-driven optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Implement a standalone CUDA/CUTLASS/CuTe forward attention kernel on B200 using public FlashAttention-4 as the main baseline, and beat FA4 by 5% geomean. Because this does not say from scratch, the loop may copy, port, or specialize public FA4/CUTLASS/CuTe source into the standalone repo with provenance.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge autonomously, profile with ncu-report when evidence is needed, and beat the current baseline by at least 10%.
 ```
 
-From-scratch optimization:
-
-```text
-[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100. Implement the candidate kernel from scratch and use the existing SGLang/CUTLASS kernel only as the correctness, benchmark, profiler, and API comparison baseline. Work in a clean standalone repo with ledgers, lineage, benchmarks, and ncu-report profile digests.
-```
-
-Progress gate:
-
-```text
-If the correct candidate is still more than 10x slower than the named baseline and NCU shows a different bottleneck class, stop same-lineage micro-tuning. Switch to a baseline-derived parent or write a design reset with the missing descriptor/layout/synchronization details before more coding.
-```
-
-Architecture-specific prior-art search:
-
-```text
-[$kernel-knowledge] Find Blackwell and Hopper PR evidence for persistent GEMM, tcgen05, TMA pipeline staging, tail effects, and profiler symptoms related to long scoreboard or tensor pipe underuse.
-```
-
-Profile digest:
-
-```text
-[$ncu-report] Compare profile-artifacts/v001_candidate/raw.csv with profile-artifacts/v000_baseline/raw.csv, inspect source counters and PTX/SASS if available, and produce a digest with one next kernel edit.
-```
+Do not add source-use wording unless it is a real requirement. The loop owns
+whether to start from existing source, port prior art, or write a new candidate.
 
 ## Maintenance
 
