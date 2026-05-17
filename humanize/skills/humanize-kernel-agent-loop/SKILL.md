@@ -57,32 +57,22 @@ Given a one-sentence kernel request, you must:
 Ask the user only if the target kernel, target GPU, comparison target, or hard
 scope constraint is missing and cannot be inferred safely.
 
-## Hard Rules
+## Loop Defaults
 
 - Candidate implementation language is user-directed. If the user specifies
   CUDA C++/PTX, Triton, CuTe DSL, TileLang, CUTLASS/CuTe, ThunderKittens,
   torch.compile/Inductor, or another kernel stack, use that stack.
 - If the user does not specify a language, choose the implementation system most
-  likely to reach the stated correctness and performance target, using the
-  baseline framework as one available signal rather than a required route.
+  likely to reach the stated correctness and performance target from the local
+  context, available baselines, prior art, and profiler evidence.
 - Treat "standalone" as a repository, build, benchmark, and runtime boundary.
-  It does not prescribe whether the implementation starts from public source,
-  prior art, generated code, or a new kernel design. The candidate must live in
-  the isolated optimization repo and must not call the baseline package as its
-  runtime implementation.
-- The writer agent owns the implementation route. It may copy, port, adapt,
-  study, or ignore public baseline/prior-art source when that choice is
-  compatible with the user request, license, and attribution requirements.
-  Humanize should not ask the user to choose baseline-derived versus
-  from-scratch unless there is a concrete ambiguity that blocks safe execution.
-- If public source directly affects code, record the exact source path/URL,
-  commit or version, license/notice, copied/adapted files, and delta in the
-  attempt ledger or lineage. If no source is copied, still record influential
-  profile or knowledge evidence that drove the route.
+  The candidate implementation, tests, benchmark harness, profile artifacts,
+  and ledgers live in the isolated optimization repo.
+- If external source directly affects code, record the exact source path/URL,
+  commit or version, license/notice, copied/adapted files, and optimization
+  delta in the attempt ledger or lineage.
 - Keep the source framework checkout itself read-only for standalone work unless
-  the user explicitly asks for an in-place framework patch. The standalone repo
-  may contain copied/adapted public source and subsequent mutations when the
-  agent chooses that route.
+  the user explicitly asks for an in-place framework patch.
 - Run optimization work in a fresh standalone git repo with its own PyTorch
   binding, correctness tests, benchmark harness, ledgers, lineage, and profile
   artifacts.
@@ -92,10 +82,10 @@ scope constraint is missing and cannot be inferred safely.
   baseline correctness/benchmark succeeds. Skip it only when Nsight Compute
   cannot run, and record the reason.
 - Use `ncu-report` again for regressions, plateaus, surprising wins, or
-  profile-driven edits. Do not run full NCU for every tiny iteration unless the
-  benchmark result is hard to explain.
-- Do not declare the loop complete while relevant NCU/profile acceptance
-  criteria are unmet.
+  profile-driven edits. Full NCU is most useful when the benchmark result needs
+  explanation or the next edit is unclear.
+- The loop remains incomplete while relevant NCU/profile acceptance criteria
+  are unmet.
 
 ## Required Files In The Standalone Repo
 
@@ -120,10 +110,8 @@ tracking local loop state.
 
 ## Knowledge Evidence
 
-KernelPilot provides a PR-driven evidence corpus, and Humanize owns when, how,
-and how much to use it. Knowledge lookup is part of the autonomous optimization
-loop: the writer agent queries PR artifacts whenever they help the current
-plan, implementation choice, benchmark result, profile digest,
+KernelPilot provides a PR-driven evidence corpus. Use it whenever it helps the
+current plan, implementation choice, benchmark result, profile digest,
 plateau/regression explanation, reviewer question, or next kernel edit.
 PR diffs and materialized source snapshots are the primary evidence, while
 wiki syntheses, docs, blogs, contest notes, and query indices are supporting
@@ -171,7 +159,7 @@ knowledge/evidence/pull-bundles/<repo-id>/gh-<number>/
 Each bundle should contain `review.diff`, `ORIGIN.yaml`, `upstream.json`,
 and key changed source/test/benchmark files under `source-snapshot/`.
 
-Autonomous query order:
+Typical query flow:
 
 1. Use `scripts/query.py` for broad routing by architecture, repo, tag,
    operator, bottleneck, or exact instruction/feature term.
@@ -186,10 +174,9 @@ Autonomous query order:
    performance claims; then ground implementation choices back in PR/source
    evidence when code is borrowed or adapted.
 
-Knowledge lookup should remain autonomous. Do not create a separate reading
-ledger just to prove that pages were opened. When a source directly affects
-code, record the actionable provenance in the relevant attempt row, lineage
-entry, or profile digest.
+A separate reading ledger is unnecessary just to prove that pages were opened.
+When a source directly affects code, record the actionable provenance in the
+relevant attempt row, lineage entry, or profile digest.
 
 ## Plan Requirements
 
@@ -200,15 +187,10 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - Baseline framework checkout is protected from accidental edits unless the
   user asks for an in-place patch.
 - Candidate implementation language is documented and follows the user request
-  or the agent's selected strategy.
-- Implementation strategy is selected by the writer agent and tied directly to
-  the performance/correctness target. The plan must not create a pending user
-  decision merely to choose baseline-derived versus from-scratch.
-- If public baseline or prior-art code seeds any candidate, provenance,
-  license/notice, copied/adapted files, and the first optimization delta are
-  recorded before further mutation.
-- If no public source is copied or adapted, the plan and lineage still record
-  the profile, knowledge, or engineering reason for that route.
+  or the selected strategy.
+- If external source seeds any candidate, provenance, license/notice,
+  copied/adapted files, and the first optimization delta are recorded before
+  further mutation.
 - Correctness tests cover representative shapes, dtypes, edge cases, and
   baseline parity.
 - Benchmark harness records per-shape timing, geomean, best/worst cases, and
@@ -223,15 +205,15 @@ use the Humanize gen-plan schema and include these acceptance criteria:
 - Optimization ledger records only correct versions with measured improvement.
 - Lineage records parent version, mutation/motivation, influential source or PR
   evidence when it directly affects code, result, and selected/rejected status.
-- When progress stalls, Humanize expands PR research autonomously. Prefer unread
-  PR bundles, changed kernel files, linked tests, benchmarks, and profiler
-  notes, guided by the current task context and existing attempt/lineage notes.
+- When progress stalls, expand PR research with unread PR bundles, changed
+  kernel files, linked tests, benchmarks, and profiler notes, guided by the
+  current task context and existing attempt/lineage notes.
 - When profiling shows a candidate is far below the target or in a different
-  bottleneck class than the baseline, do not keep spending rounds on the same
-  lineage's local micro-tuning unless `ncu-report` names a concrete edit with
-  plausible target-scale impact. The next round must change strategy, produce a
-  design reset, or justify the current route with new evidence.
-- Experimental GPU kernels that can hang must have timeout-bounded bring-up
+  bottleneck class than the baseline, use the profile evidence to reassess the
+  lineage. A useful next round either tests a concrete profile-driven edit,
+  creates a smaller executable milestone, or records new evidence for
+  continuing the current route.
+- Experimental GPU kernels that can hang should use timeout-bounded bring-up
   milestones. A timeout marks that lineage rejected until a minimal executable
   tile validates the suspected protocol, descriptor, layout, memory, and
   synchronization semantics.
@@ -239,32 +221,14 @@ use the Humanize gen-plan schema and include these acceptance criteria:
   already beyond 85% of the relevant peak and no low-effort implementation edit
   remains.
 
-## Implementation Strategy Autonomy
-
-Use this policy when refining kernel plans and writing round contracts:
-
-- The user should define the operator, scope, hardware, allowed implementation
-  stack, correctness checks, benchmark method, and performance target.
-- The agent chooses the implementation route needed to satisfy those goals. It
-  may start from existing code, port helpers, write a fresh kernel, combine
-  approaches, or abandon a route when evidence says it will not converge.
-- Do not split prompts, plans, or pending decisions into "baseline-derived" and
-  "from-scratch" tracks unless the user explicitly makes that distinction part
-  of the task.
-- Reviewers judge whether the current route is advancing the main objective,
-  not whether it matches a preferred source-use style.
-- Source use is a provenance and license concern, not a separate product
-  requirement. Record it rigorously when it happens; do not block progress just
-  to ask whether it is allowed when the user has not prohibited it.
-
-## Progress And Timeout Gates
+## Progress And Timeout Checks
 
 - If an attempt times out or hangs, reproduce the failure with the smallest
   shape/tile under a hard timeout before any target-size benchmark. Record the
   rejected lineage and the suspected root-cause surface.
-- If two consecutive reviews identify the same mainline blocker, the next
-  round must be a strategy-reset round with a narrower executable milestone,
-  not another broad implementation pass.
+- If repeated reviews identify the same mainline blocker, narrow the next
+  round to an executable milestone or design reset that can falsify the current
+  hypothesis.
 - If a candidate remains orders of magnitude below the target after a correct
   tensor-core-class attempt, treat further same-lineage tuning as evidence
   maintenance unless `ncu-report` names a specific low-risk edit with plausible

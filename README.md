@@ -47,12 +47,13 @@ owns the rest.
 - **Standalone by default.** Candidate kernels do not pollute SGLang, vLLM,
   PyTorch, or other large framework repos. The loop creates an isolated repo
   with bindings, tests, benchmarks, ledgers, lineage, and profile artifacts.
-  Standalone is an isolation boundary, not a prescribed source-use strategy.
+  The standalone repo is where implementation artifacts, provenance, and
+  measurements live.
 - **Profile-first decisions.** `ncu-report` pushes the agent from vague labels
   like "memory-bound" toward measured bottlenecks and one concrete next edit.
-- **Autonomous knowledge use.** The agent can read PRs, wiki pages, official
-  docs, blog/code notes, and profiler examples when they help the current
-  plan, profile, regression, plateau, or next implementation choice.
+- **Knowledge-backed edits.** The agent can read PRs, wiki pages, official
+  docs, blog/code notes, and profiler examples when they help explain a
+  benchmark result, profile symptom, regression, plateau, or next edit.
 - **Review-gated iteration.** Humanize RLCR keeps the loop from declaring
   victory too early; default loop budget is 84 iterations unless configured
   otherwise.
@@ -84,19 +85,17 @@ flowchart TD
 The writer agent is not hardcoded. In Codex it can be Codex; in Claude Code it
 can be Claude. The review backend and model come from Humanize configuration.
 
-## Strategy Autonomy
+## Kernel Requests
 
-KernelPilot is goal-driven. The user should specify the operator, hardware,
-allowed implementation stack, correctness checks, benchmark method, and
-performance target. The loop should not ask the user to choose whether the
-agent starts from a baseline implementation or writes a new kernel unless that
-choice is an actual task requirement or a license/access blocker.
+A useful request names the operator, target hardware, scope, correctness checks,
+benchmark method, and performance target. KernelPilot turns that into a plan,
+an isolated implementation workspace, repeatable measurements, profiler
+evidence, lineage, and Humanize review rounds.
 
-The agent may study, copy, port, adapt, or ignore public baseline and prior-art
-source as needed to reach the goal. If source influences code, the standalone
-repo must record provenance, license/notice, copied or adapted files, and
-optimization deltas. Review gates judge measurable progress toward the final
-target, not whether the route fits a baseline-derived or from-scratch label.
+Existing implementations, PR diffs, docs, blogs, and profile reports are working
+materials for the loop. When external source or design evidence materially
+influences a candidate, the standalone repo records the provenance, license or
+notice requirements, and the optimization delta.
 
 ## Knowledge Base
 
@@ -154,9 +153,9 @@ blogs, contests, and query indices are still first-class support material for
 hardware contracts, DSL semantics, profile interpretation, and technique
 selection.
 
-Knowledge use is autonomous. Source snapshots, installed source, wiki pages,
-docs, blogs, and profiler digests are tools for choosing the next edit; they do
-not impose a fixed implementation route by themselves.
+Knowledge artifacts are available throughout the loop. Record the material
+source or profile evidence in lineage, ledgers, or profile digests when it
+changes the candidate or the next edit.
 
 ## Query Examples
 
@@ -260,14 +259,14 @@ UI before relying on review-gated loop exits.
 
 ## Prompt Card
 
-Goal-driven optimization:
+Kernel optimization:
 
 ```text
-[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge autonomously, profile with ncu-report when evidence is needed, and beat the current baseline by at least 10%.
+[$humanize-kernel-agent-loop] Optimize SGLang's int8_scaled_mm kernel on H100, work in a clean standalone repo, keep ledgers and lineage, use kernel knowledge and ncu-report when evidence is needed, and beat the current baseline by at least 10%.
 ```
 
-Do not add source-use wording unless it is a real requirement. The loop owns
-whether to start from existing source, port prior art, or write a new candidate.
+Keep the prompt focused on the target kernel, environment, correctness checks,
+benchmark, and performance target.
 
 ## Maintenance
 
